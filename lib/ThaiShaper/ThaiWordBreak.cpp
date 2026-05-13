@@ -84,8 +84,13 @@ std::vector<std::string> ThaiWordBreak::segmentWords(const char* text) {
   // pointer's memory. Using a static buffer ensures the source data is
   // protected from heap fragmentation issues.
   if (textLen >= MAX_SEGMENT_TEXT_SIZE) {
-    // Text too long for static buffer - truncate to prevent overflow
+    // Text too long for static buffer - truncate to prevent overflow.
+    // Walk back to the last complete UTF-8 codepoint so we don't hand a
+    // broken lead + partial continuation tail to nextClusterBoundary.
     textLen = MAX_SEGMENT_TEXT_SIZE - 1;
+    while (textLen > 0 && (static_cast<unsigned char>(text[textLen]) & 0xC0) == 0x80) {
+      textLen--;
+    }
   }
   memcpy(s_segmentTextBuffer, text, textLen);
   s_segmentTextBuffer[textLen] = '\0';

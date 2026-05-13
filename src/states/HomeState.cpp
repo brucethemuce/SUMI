@@ -5,6 +5,7 @@
 #include <CoverHelpers.h>
 #include <GfxRenderer.h>
 #include <SDCardManager.h>
+#include <Utf8.h>
 #include <esp_system.h>
 
 #include <algorithm>
@@ -13,6 +14,7 @@
 #include "../config.h"
 #include "../core/BootMode.h"
 #include "../core/Core.h"
+#include "../core/InputDrainGuard.h"
 #include "../content/LibraryIndex.h"
 #include "../content/RecentBooks.h"
 #include "Battery.h"
@@ -28,6 +30,9 @@ HomeState::HomeState(GfxRenderer& renderer) : renderer_(renderer) {}
 HomeState::~HomeState() = default;
 
 void HomeState::enter(Core& core) {
+  // Drain queued button events so a power-button wake doesn't trigger actions
+  InputDrainGuard::drain(core);
+
   Serial.println("[HOME] Entering");
   core_ = &core;  // Store for theme loading
 
@@ -85,8 +90,7 @@ void HomeState::loadLastBook(Core& core) {
   RecentBooks::Entry recentEntry;
   if (RecentBooks::getMostRecent(core, recentEntry) && strcmp(recentEntry.path, savedPath) == 0) {
     view_.setBook(recentEntry.title, recentEntry.author, savedPath);
-    strncpy(core.buf.path, savedPath, sizeof(core.buf.path) - 1);
-    core.buf.path[sizeof(core.buf.path) - 1] = '\0';
+    utf8SafeCopy(core.buf.path, savedPath, sizeof(core.buf.path));
     
     // Use persisted thumbnail path from RecentBooks (no hash re-derivation)
     uint32_t hash = LibraryIndex::hashPath(savedPath);
@@ -109,13 +113,29 @@ void HomeState::loadLastBook(Core& core) {
     return;
   }
   
-  // Fallback: Open content to get metadata (slower, uses more memory)
+  // Fallback: Open content to get metadata (slower, uses more memory).
+  // Skip when heap is fragmented — a large EPUB like Les Misérables can
+  // trigger std::bad_alloc inside ContentOpfParser which ESP-IDF can't
+  // unwind, crashing the device. Better to show the path without
+  // title/cover than to risk a boot-loop. RecentBooks will pick up
+  // metadata the first time the user actually opens the book.
+  if (ESP.getMaxAllocHeap() < 16384) {
+    Serial.printf("[HOME] Heap too tight (largest=%u) for EPUB pre-load, showing path only\n",
+                  ESP.getMaxAllocHeap());
+    const char* filename = strrchr(savedPath, '/');
+    filename = filename ? filename + 1 : savedPath;
+    view_.setBook(filename, "", savedPath);
+    utf8SafeCopy(core.buf.path, savedPath, sizeof(core.buf.path));
+    currentBookHash_ = LibraryIndex::hashPath(savedPath);
+    view_.hasCoverBmp = false;
+    return;
+  }
+
   auto result = core.content.open(savedPath, SUMI_CACHE_DIR);
   if (result.ok()) {
     const auto& meta = core.content.metadata();
     view_.setBook(meta.title, meta.author, savedPath);
-    strncpy(core.buf.path, savedPath, sizeof(core.buf.path) - 1);
-    core.buf.path[sizeof(core.buf.path) - 1] = '\0';
+    utf8SafeCopy(core.buf.path, savedPath, sizeof(core.buf.path));
     currentBookHash_ = LibraryIndex::hashPath(savedPath);
 
     if (core.settings.showImages) {
@@ -162,11 +182,9 @@ void HomeState::loadRecentBooks(Core& core) {
 void HomeState::openSelectedBook(Core& core) {
   const char* path = view_.getSelectedPath();
   if (path && path[0] != '\0') {
-    strncpy(core.buf.path, path, sizeof(core.buf.path) - 1);
-    core.buf.path[sizeof(core.buf.path) - 1] = '\0';
+    utf8SafeCopy(core.buf.path, path, sizeof(core.buf.path));
     // Save lastBookPath for "continue reading" on next cold boot
-    strncpy(core.settings.lastBookPath, core.buf.path, sizeof(core.settings.lastBookPath) - 1);
-    core.settings.lastBookPath[sizeof(core.settings.lastBookPath) - 1] = '\0';
+    utf8SafeCopy(core.settings.lastBookPath, core.buf.path, sizeof(core.settings.lastBookPath));
     core.settings.transitionReturnTo = 0;  // ReturnTo::HOME
     core.settings.saveToFile();
     pendingOpen_ = true;
@@ -186,9 +204,13 @@ void HomeState::updateSelectedBook(Core& core) {
     Serial.println("[HOME] Selected current book - reloading");
     loadLastBook(core);
   } else {
-    // Selected a recent book - copy its info
+    // Selected a recent book - copy its info. selectedBookIndex is
+    // bounded by selectNextBook/selectPrevBook's modular arithmetic
+    // (always [0, recentBookCount]), but a stale value e.g. after a
+    // recentBookCount shrink could leave recentIdx negative or past
+    // the array — explicit lower bound + range check on both ends.
     int recentIdx = view_.selectedBookIndex - 1;
-    if (recentIdx < view_.recentBookCount) {
+    if (recentIdx >= 0 && recentIdx < view_.recentBookCount) {
       const auto& recent = view_.recentBooks[recentIdx];
       Serial.printf("[HOME] Selected recent book %d: %s\n", recentIdx, recent.title);
       
@@ -232,10 +254,10 @@ StateTransition HomeState::update(Core& core) {
       case EventType::ButtonPress:
         switch (e.button) {
           case Button::Back:
-            // Back: Continue reading if book is open
-            if (view_.hasBook) {
-              openSelectedBook(core);
-            }
+            // Back on Home is a no-op. Previous behavior resumed the
+            // current book, which duplicated Center and confused users
+            // ("Back button opens the book?!"). To reach the book just
+            // press Center like every other "open" in SUMI.
             break;
 
           case Button::Center:
@@ -245,17 +267,17 @@ StateTransition HomeState::update(Core& core) {
             } else if (view_.selectedBookIndex > 0 && view_.selectedBookIndex <= view_.recentBookCount) {
               // Open a recent book
               const char* path = view_.getSelectedPath();
-              strncpy(core.buf.path, path, sizeof(core.buf.path) - 1);
+              utf8SafeCopy(core.buf.path, path, sizeof(core.buf.path));
               openSelectedBook(core);
             }
             break;
 
           case Button::Left:
-            // btn2: Files
+            // Open the file browser.
             return StateTransition::to(StateId::FileList);
 
           case Button::Right:
-            // btn4: Settings
+            // Open settings / menu.
             return StateTransition::to(StateId::Settings);
 
           case Button::Up:
@@ -302,7 +324,7 @@ StateTransition HomeState::update(Core& core) {
 void HomeState::drawBackground(Core& core) {
   const char* themeName = core.settings.homeArtTheme;
   Serial.printf("[HOME] drawBackground - theme setting: '%s'\n", themeName);
-  
+
   // Check if using default built-in PROGMEM art
   if (strcmp(themeName, "default") == 0 || themeName[0] == '\0') {
     Serial.println("[HOME] Using default PROGMEM theme");
@@ -314,6 +336,23 @@ void HomeState::drawBackground(Core& core) {
   } else {
     // Load theme from SD card
     drawBackgroundFromSD(themeName);
+  }
+
+  // The sumi-e art + SD themes are authored for a light background. In dark
+  // mode the theme clears to black and renders white text, but the artwork
+  // itself comes through unchanged — which was leaving users with white
+  // text on a white-art background and nothing visible (user feedback:
+  // "the text on the book carousel and the progress bar render as white
+  // like dark mode but it is still a white background"). Invert the
+  // framebuffer after the art lands so the art flips to a dark style and
+  // the white text stays readable.
+  if (THEME.backgroundColor == 0x00) {
+    uint8_t* fb = renderer_.getFrameBuffer();
+    if (fb) {
+      // Runtime buffer size handles both X4 (48000) and X3 (52272).
+      const size_t sz = renderer_.getBufferSize();
+      for (size_t i = 0; i < sz; ++i) fb[i] = static_cast<uint8_t>(~fb[i]);
+    }
   }
 }
 

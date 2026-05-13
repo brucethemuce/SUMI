@@ -8,10 +8,12 @@
  * and forwards init/draw/handleInput/update to Lua functions.
  *
  * Memory strategy:
- *  - MemoryArena is released before creating the Lua VM (frees 80KB)
- *  - Custom allocator caps total Lua memory at LUA_MEM_LIMIT
- *  - Instruction count hook prevents infinite loops
- *  - On cleanup, Lua VM is destroyed and MemoryArena reclaimed
+ *  - Custom allocator caps total Lua memory at LUA_MEM_LIMIT (40 KB) out of
+ *    the heap that remains after the .bss MemoryArena and NimBLE pools.
+ *  - Allocator handles grow/shrink/free explicitly with positive arithmetic
+ *    on each direction (the v0.6.0 audit's #1 finding fixed the underflow
+ *    on shrink that crashed the VM during routine GC compactions).
+ *  - Instruction count hook prevents infinite loops.
  */
 
 #include "../config.h"

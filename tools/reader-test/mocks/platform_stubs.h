@@ -4,6 +4,7 @@
 #include <cstdarg>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 
 #include "Print.h"
@@ -12,8 +13,16 @@
 #ifndef MALLOC_CAP_8BIT
 #define MALLOC_CAP_8BIT 0x01
 #endif
+#ifndef MALLOC_CAP_INTERNAL
+#define MALLOC_CAP_INTERNAL 0x02
+#endif
+#ifndef MALLOC_CAP_DEFAULT
+#define MALLOC_CAP_DEFAULT 0x04
+#endif
 inline size_t heap_caps_get_largest_free_block(uint32_t) { return 200000; }
 inline size_t heap_caps_get_free_size(uint32_t) { return 200000; }
+inline void* heap_caps_malloc(size_t sz, uint32_t) { return malloc(sz); }
+inline void heap_caps_free(void* p) { free(p); }
 
 // PROGMEM / pgm_read helpers
 #ifndef PROGMEM
@@ -92,6 +101,7 @@ struct MockESP {
   uint32_t getFreeHeap() { return 100000; }
   uint32_t getHeapSize() { return 320000; }
   uint32_t getMinFreeHeap() { return 80000; }
+  uint32_t getMaxAllocHeap() { return 100000; }
 };
 
 extern MockESP ESP;

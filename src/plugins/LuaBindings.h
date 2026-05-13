@@ -20,6 +20,12 @@ extern "C" {
 #include <lauxlib.h>
 }
 
+#include <SDCardManager.h>
+#include <SumiClock.h>
+
+#include "../Battery.h"
+#include "../ThemeManager.h"
+#include "../core/Core.h"
 #include "PluginRenderer.h"
 #include "PluginHelpers.h"
 
@@ -315,6 +321,239 @@ static int l_drawGameOver(lua_State* L) {
 }
 
 // ---------------------------------------------------------------------------
+// File I/O helpers (sandboxed)
+// ---------------------------------------------------------------------------
+
+// Maximum file size a Lua plugin may read or write (heap protection)
+static constexpr size_t LUA_FILE_MAX = 64 * 1024;
+
+// Retrieve the sandbox directory from the Lua registry.
+// Returns empty string if not set.
+static inline const char* getSandboxDir(lua_State* L) {
+  lua_getfield(L, LUA_REGISTRYINDEX, "sumi_plugin_dir");
+  const char* dir = lua_tostring(L, -1);
+  lua_pop(L, 1);
+  return dir ? dir : "";
+}
+
+// Validate a relative path and resolve it under the sandbox directory.
+// Returns true and writes the full path into `out` on success.
+// Rejects absolute paths, ".." traversals, and paths with backslashes.
+static bool resolveSandboxPath(lua_State* L, const char* relPath,
+                               char* out, size_t outSize) {
+  if (!relPath || relPath[0] == '\0') return false;
+  // Reject absolute paths
+  if (relPath[0] == '/' || relPath[0] == '\\') return false;
+  // Reject parent-directory traversals
+  if (strstr(relPath, "..")) return false;
+  // Reject backslashes
+  if (strchr(relPath, '\\')) return false;
+
+  const char* dir = getSandboxDir(L);
+  if (dir[0] == '\0') return false;
+
+  int written = snprintf(out, outSize, "%s%s", dir, relPath);
+  return written > 0 && (size_t)written < outSize;
+}
+
+// ---------------------------------------------------------------------------
+// File I/O bindings
+// ---------------------------------------------------------------------------
+
+// sumi.readFile(path) -> string or nil
+static int l_readFile(lua_State* L) {
+  const char* relPath = luaL_checkstring(L, 1);
+  char fullPath[128];
+  if (!resolveSandboxPath(L, relPath, fullPath, sizeof(fullPath))) {
+    lua_pushnil(L);
+    return 1;
+  }
+
+  FsFile f;
+  if (!SdMan.openFileForRead("LuaIO", fullPath, f)) {
+    lua_pushnil(L);
+    return 1;
+  }
+
+  size_t fileSize = f.size();
+  if (fileSize > LUA_FILE_MAX) {
+    f.close();
+    lua_pushnil(L);
+    return 1;
+  }
+
+  char* buf = static_cast<char*>(malloc(fileSize + 1));
+  if (!buf) {
+    f.close();
+    lua_pushnil(L);
+    return 1;
+  }
+
+  const int rawRead = f.read(reinterpret_cast<uint8_t*>(buf), fileSize);
+  f.close();
+  if (rawRead <= 0) {
+    free(buf);
+    lua_pushnil(L);
+    return 1;
+  }
+  const size_t bytesRead = static_cast<size_t>(rawRead);
+  buf[bytesRead] = '\0';
+
+  lua_pushlstring(L, buf, bytesRead);
+  free(buf);
+  return 1;
+}
+
+// sumi.writeFile(path, data) -> true/false
+static int l_writeFile(lua_State* L) {
+  const char* relPath = luaL_checkstring(L, 1);
+  size_t dataLen = 0;
+  const char* data = luaL_checklstring(L, 2, &dataLen);
+
+  char fullPath[128];
+  if (!resolveSandboxPath(L, relPath, fullPath, sizeof(fullPath))) {
+    lua_pushboolean(L, 0);
+    return 1;
+  }
+
+  if (dataLen > LUA_FILE_MAX) {
+    lua_pushboolean(L, 0);
+    return 1;
+  }
+
+  // Auto-create the sandbox directory on first write
+  const char* dir = getSandboxDir(L);
+  if (!SdMan.exists(dir)) {
+    SdMan.ensureDirectoryExists(dir);
+  }
+
+  // Atomic — Lua plugins (Snake, Tetris-clone, etc.) save high scores
+  // and game state through this. pre-audit a brownout between
+  // O_TRUNC and the rewrite landed left the save file empty and the
+  // user lost all progress. atomicOpenWrite + atomicCommit closes the
+  // window so a partial write preserves the previous save instead.
+  FsFile f;
+  if (!SdMan.atomicOpenWrite("LuaIO", fullPath, f)) {
+    lua_pushboolean(L, 0);
+    return 1;
+  }
+
+  size_t written = f.write(reinterpret_cast<const uint8_t*>(data), dataLen);
+  if (!SdMan.atomicCommit(f, fullPath)) {
+    SdMan.atomicAbort(f, fullPath);
+    lua_pushboolean(L, 0);
+    return 1;
+  }
+
+  lua_pushboolean(L, written == dataLen ? 1 : 0);
+  return 1;
+}
+
+// sumi.fileExists(path) -> true/false
+static int l_fileExists(lua_State* L) {
+  const char* relPath = luaL_checkstring(L, 1);
+  char fullPath[128];
+  if (!resolveSandboxPath(L, relPath, fullPath, sizeof(fullPath))) {
+    lua_pushboolean(L, 0);
+    return 1;
+  }
+  lua_pushboolean(L, SdMan.exists(fullPath) ? 1 : 0);
+  return 1;
+}
+
+// sumi.listDir(path) -> table of filenames, or empty table
+static int l_listDir(lua_State* L) {
+  const char* relPath = luaL_optstring(L, 1, "");
+  char fullPath[128];
+
+  // Empty string means root of sandbox
+  if (relPath[0] == '\0') {
+    const char* dir = getSandboxDir(L);
+    snprintf(fullPath, sizeof(fullPath), "%s", dir);
+  } else {
+    if (!resolveSandboxPath(L, relPath, fullPath, sizeof(fullPath))) {
+      lua_newtable(L);
+      return 1;
+    }
+  }
+
+  auto files = SdMan.listFiles(fullPath, 100);
+
+  lua_newtable(L);
+  for (size_t i = 0; i < files.size(); i++) {
+    lua_pushstring(L, files[i].c_str());
+    lua_rawseti(L, -2, (int)(i + 1));
+  }
+  return 1;
+}
+
+// ---------------------------------------------------------------------------
+// Time bindings
+// ---------------------------------------------------------------------------
+
+// sumi.getTime() -> epoch seconds (0 if not synced)
+static int l_getTime(lua_State* L) {
+  lua_pushinteger(L, (lua_Integer)sumi::SumiClock::getEpoch());
+  return 1;
+}
+
+// sumi.getTimeStr() -> "HH:MM" or ""
+static int l_getTimeStr(lua_State* L) {
+  char buf[16];
+  sumi::SumiClock::getTimeStr(buf, sizeof(buf));
+  lua_pushstring(L, buf);
+  return 1;
+}
+
+// sumi.getDateStr() -> "YYYY-MM-DD" or ""
+static int l_getDateStr(lua_State* L) {
+  char buf[16];
+  sumi::SumiClock::getDateStr(buf, sizeof(buf));
+  lua_pushstring(L, buf);
+  return 1;
+}
+
+// ---------------------------------------------------------------------------
+// Battery bindings
+// ---------------------------------------------------------------------------
+
+// sumi.getBattery() -> percentage 0-100, or -1 if unavailable
+static int l_getBattery(lua_State* L) {
+  int pct = batteryMonitor.readPercentage();
+  lua_pushinteger(L, pct);
+  return 1;
+}
+
+// sumi.getBatteryMv() -> millivolts
+static int l_getBatteryMv(lua_State* L) {
+  int mv = batteryMonitor.readMillivolts();
+  lua_pushinteger(L, mv);
+  return 1;
+}
+
+// ---------------------------------------------------------------------------
+// Settings bindings (read-only)
+// ---------------------------------------------------------------------------
+
+// sumi.getOrientation() -> 0-3
+static int l_getOrientation(lua_State* L) {
+  lua_pushinteger(L, sumi::core.settings.orientation);
+  return 1;
+}
+
+// sumi.isDarkMode() -> true/false (based on active theme's invertedMode)
+static int l_isDarkMode(lua_State* L) {
+  lua_pushboolean(L, THEME.invertedMode ? 1 : 0);
+  return 1;
+}
+
+// sumi.getFontSize() -> 0-3
+static int l_getFontSize(lua_State* L) {
+  lua_pushinteger(L, sumi::core.settings.fontSize);
+  return 1;
+}
+
+// ---------------------------------------------------------------------------
 // Utilities
 // ---------------------------------------------------------------------------
 static int l_millis(lua_State* L) {
@@ -388,6 +627,22 @@ static void registerAll(lua_State* L) {
     {"millis",           l_millis},
     {"random",           l_random},
     {"delay",            l_delay},
+    // File I/O (sandboxed)
+    {"readFile",         l_readFile},
+    {"writeFile",        l_writeFile},
+    {"fileExists",       l_fileExists},
+    {"listDir",          l_listDir},
+    // Time
+    {"getTime",          l_getTime},
+    {"getTimeStr",       l_getTimeStr},
+    {"getDateStr",       l_getDateStr},
+    // Battery
+    {"getBattery",       l_getBattery},
+    {"getBatteryMv",     l_getBatteryMv},
+    // Settings (read-only)
+    {"getOrientation",   l_getOrientation},
+    {"isDarkMode",       l_isDarkMode},
+    {"getFontSize",      l_getFontSize},
     {nullptr, nullptr}
   };
 
@@ -414,18 +669,53 @@ static void registerAll(lua_State* L) {
   lua_pushinteger(L, PLUGIN_MARGIN);   lua_setglobal(L, "MARGIN");
 }
 
-// Remove dangerous globals from the base library
+// Remove dangerous globals from the base library.
+//
+// LuaPlugin::init() calls luaL_openlibs(L) which loads EVERY standard Lua
+// library including io/os/debug/package. Without this sweep a malicious
+// /custom/foo.lua could:
+//   - io.open("/.sumi/settings.bin", "w") — overwrite firmware settings
+//   - io.open("/books/anything.epub", "rb") — read outside its sandbox
+//   - os.remove("/.sumi/reading_stats.bin") — wipe the user's stats
+//   - os.rename(a, b) — move files arbitrarily
+//   - os.execute(...) / io.popen(...) — call shell (no-op on ESP32 but
+//     still wasted cycles)
+//   - package.loadlib(...) — load a native library
+//   - debug.getregistry().sumi_renderer — bypass readFile's sandbox
+//     path check by grabbing the renderer pointer directly
+//
+// Our own sumi-bound readFile/writeFile path through resolveSandboxPath
+// which enforces the /custom/<plugin>_data/ prefix. Nuking the stock
+// io/os/debug/package globals keeps plugins inside that fence.
 static void sandboxGlobals(lua_State* L) {
-  // Remove functions that could be dangerous in embedded context
   const char* blocked[] = {
+    // loaders that bypass our instruction + memory caps
     "dofile", "loadfile", "load", "loadstring",
+    // raw accessors bypass metatables (not strictly escape, but hostile)
     "rawget", "rawset", "rawequal", "rawlen",
+    // GC control can mask the memory cap
     "collectgarbage",
     nullptr
   };
   for (int i = 0; blocked[i]; i++) {
     lua_pushnil(L);
     lua_setglobal(L, blocked[i]);
+  }
+
+  // Nuke entire library tables that expose unsandboxed file/OS/debug
+  // access. Plugins that want I/O must go through the sandboxed
+  // readFile/writeFile/fileExists/listDir globals (which enforce the
+  // /custom/<plugin>_data/ prefix in resolveSandboxPath).
+  const char* blockedLibs[] = {
+    "io",       // io.open escapes the plugin sandbox entirely
+    "os",       // os.remove, os.rename, os.execute, os.getenv
+    "debug",    // debug.getregistry reaches into the C++ state
+    "package",  // package.loadlib can load a native .so
+    nullptr
+  };
+  for (int i = 0; blockedLibs[i]; i++) {
+    lua_pushnil(L);
+    lua_setglobal(L, blockedLibs[i]);
   }
 }
 

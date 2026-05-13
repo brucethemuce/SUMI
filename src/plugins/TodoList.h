@@ -15,6 +15,7 @@
 
 #include <Arduino.h>
 #include <SDCardManager.h>
+#include <Utf8.h>
 #include <cstring>
 
 #include "PluginHelpers.h"
@@ -160,14 +161,20 @@ class TodoApp : public PluginInterface {
 
     FsFile f;
     if (!SdMan.openFileForRead("TODO", "/data/todo.txt", f)) {
-      // Create sample file — the tasks themselves walk you through setup
+      // Create sample file — the tasks themselves walk you through setup.
+      // Atomic for consistency with toggleCurrent() so a brownout during
+      // first-run sample creation can't leave a partial file (e.g. just
+      // the first line) which the next boot would read as a real
+      // 1-item todo list.
       FsFile wf;
-      if (SdMan.openFileForWrite("TODO", "/data/todo.txt", wf)) {
+      if (SdMan.atomicOpenWrite("TODO", "/data/todo.txt", wf)) {
         wf.println("- Open SD card on your computer");
         wf.println("- Open /data/todo.txt in a text editor");
         wf.println("- Replace these with your own tasks");
         wf.println("X Press OK to check off like this");
-        wf.close();
+        if (!SdMan.atomicCommit(wf, "/data/todo.txt")) {
+          SdMan.atomicAbort(wf, "/data/todo.txt");
+        }
       }
       if (!SdMan.openFileForRead("TODO", "/data/todo.txt", f)) return;
     }
@@ -203,8 +210,8 @@ class TodoApp : public PluginInterface {
       if (line >= start && visibleCount_ < maxVisible) {
         done_[visibleCount_] = (buf[0] == 'X' || buf[0] == 'x');
         const char* text = buf + 2;
-        strncpy(texts_[visibleCount_], text, MAX_TEXT - 1);
-        texts_[visibleCount_][MAX_TEXT - 1] = '\0';
+        // UTF-8 safe so CJK todo items don't end in a broken codepoint.
+        utf8SafeCopy(texts_[visibleCount_], text, MAX_TEXT);
         visibleCount_++;
       }
       line++;
@@ -237,10 +244,16 @@ class TodoApp : public PluginInterface {
       lines[targetLine][0] = done_[idx] ? 'X' : '-';
     }
 
+    // Atomic — read-modify-rewrite is the textbook power-loss footgun:
+    // a brownout between O_TRUNC and the rewrite empties /data/todo.txt
+    // and the user's todo list is gone. atomicOpenWrite + atomicCommit
+    // closes the window the same way the canonical /.sumi/* writers do.
     FsFile wf;
-    if (SdMan.openFileForWrite("TODO", "/data/todo.txt", wf)) {
+    if (SdMan.atomicOpenWrite("TODO", "/data/todo.txt", wf)) {
       for (int i = 0; i < lineCount; i++) wf.println(lines[i]);
-      wf.close();
+      if (!SdMan.atomicCommit(wf, "/data/todo.txt")) {
+        SdMan.atomicAbort(wf, "/data/todo.txt");
+      }
     }
   }
 };

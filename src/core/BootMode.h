@@ -1,13 +1,15 @@
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 
 namespace sumi {
 
 // Boot modes for memory optimization
 enum class BootMode : uint8_t {
-  UI,     // Full UI mode: all states, all fonts, theme cache
-  READER  // Minimal reader mode: ReaderState only, single font size
+  UI,        // Full UI mode: all states, all fonts, theme cache
+  READER,    // Minimal reader mode: ReaderState only, single font size
+  EMULATOR   // Minimal emulator mode: SumiBoy + ROM only, no fonts/plugins
 };
 
 // Where to return when exiting reader mode
@@ -41,6 +43,17 @@ void saveTransition(BootMode mode, const char* bookPath = nullptr, ReturnTo retu
 
 // Clear transition data (called after reading to prevent stale data on next boot)
 void clearTransition();
+
+// Peek at transition.bin without modifying it. Returns true iff a pending
+// EMULATOR transition is recorded; on success, writes the ROM path into
+// outPath (NUL-terminated, truncated to outSize). Used by main.cpp's
+// pre-init emu-detection path so the SD-side check goes through the
+// dedicated transition file rather than reading core.settings.
+//
+// The caller is responsible for calling clearTransition() once it has
+// handed control off to initEmulator (or determined the transition is
+// no longer wanted).
+bool peekEmulatorTransition(char* outPath, size_t outSize);
 
 // Show a notification message on display before restart
 // The e-ink display will retain this message during the reboot

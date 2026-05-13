@@ -41,10 +41,18 @@ static bool mkdirRecursive(const std::string& path) {
   for (size_t i = 0; i < path.size(); i++) {
     current += path[i];
     if (path[i] == '/' && i > 0) {
+#ifdef _WIN32
+      mkdir(current.c_str());
+#else
       mkdir(current.c_str(), 0755);
+#endif
     }
   }
+#ifdef _WIN32
+  mkdir(path.c_str());
+#else
   mkdir(path.c_str(), 0755);
+#endif
   return true;
 }
 
@@ -57,7 +65,7 @@ static void dumpPages(PageCache& cache) {
       if (elem->getTag() == TAG_PageLine) {
         auto& tb = static_cast<PageLine*>(elem.get())->getTextBlock();
         for (auto& wd : tb.getWords()) {
-          printf("%s ", wd.word.c_str());
+          printf("%s ", wd.text.c_str());
         }
         printf("\n");
       }

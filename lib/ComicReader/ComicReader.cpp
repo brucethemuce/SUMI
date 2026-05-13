@@ -48,6 +48,17 @@ bool ComicReader::open(const char* path) {
     return false;
   }
 
+  // Sanity cap on pageCount_ to prevent OOM on corrupt headers. The on-disk
+  // field is uint16_t so an untrusted value could reach 65535, which would
+  // reserve ~520 KB of PageEntry storage — far more than the ESP32-C3's
+  // 380 KB of heap. Real comics top out in the low thousands of pages.
+  constexpr uint16_t kMaxComicPages = 4096;
+  if (pageCount_ > kMaxComicPages) {
+    Serial.printf("[COMIC] Implausible pageCount %u (max %u), rejecting\n", pageCount_, kMaxComicPages);
+    file_.close();
+    return false;
+  }
+
   // Read page index (6 bytes per entry)
   index_.resize(pageCount_);
   for (int i = 0; i < pageCount_; i++) {

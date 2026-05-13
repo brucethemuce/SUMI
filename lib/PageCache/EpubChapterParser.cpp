@@ -109,7 +109,11 @@ bool EpubChapterParser::parsePages(const std::function<void(std::unique_ptr<Page
     // Reuse frame buffer (48KB) as ZIP decompression dict (32KB) — safe because
     // the background task owns the renderer and display isn't active during parsing
     success = epub_->readItemContentsToStream(localPath, tmpHtml, 1024, renderer_.getFrameBuffer());
-    tmpHtml.close();
+    // syncAndClose — the tmpHtml file is immediately handed to the
+    // HTML5 normalizer which reads it fresh. Without sync SdFat can
+    // drop the last sectors and Expat later returns a mid-tag parse
+    // error, leaving the chapter with missing content.
+    SdMan.syncAndClose(tmpHtml);
 
     if (!success && SdMan.exists(tmpHtmlPath_.c_str())) {
       SdMan.remove(tmpHtmlPath_.c_str());
@@ -140,10 +144,16 @@ bool EpubChapterParser::parsePages(const std::function<void(std::unique_ptr<Page
   pagesCreated_ = 0;
   hitMaxPages_ = false;
 
-  // Create the parser with a callback that references our member state
+  // Create the parser with a callback that references our member state.
+  //
+  // Returning false used to mean "drop this page and stop now," but that
+  // truncated paragraphs when maxPages was hit mid-block (lines already
+  // extracted from the text block were destroyed by startNewTextBlock).
+  // The new contract: the page is ALWAYS emitted; false is a soft-stop
+  // signal asking the parser to suspend at the next clean (block-end)
+  // boundary. The parser may emit a few overflow pages before suspending,
+  // which the cache happily accepts. See paragraph-truncation bug report.
   auto wrappedCallback = [this](std::unique_ptr<Page> page) -> bool {
-    if (hitMaxPages_) return false;
-
     onPageComplete_(std::move(page));
     pagesCreated_++;
 

@@ -54,8 +54,16 @@ std::unique_ptr<TextBlock> TextBlock::deserialize(FsFile& file) {
     return nullptr;
   }
 
-  // Sanity check: prevent allocation of unreasonably large vectors (max 10000 words per block)
-  if (wc > 10000) {
+  // Sanity check: prevent allocation of unreasonably large vectors.
+  // Previously capped at 10000 which is way more than any realistic
+  // paragraph contains. Each word costs ~40 bytes (std::string + xpos
+  // uint16 + style + decoration byte), so 10000 words = ~400 KB of
+  // transient allocation during deserialize — larger than the 380 KB
+  // total ESP32-C3 heap. Tighten to 2000 which still covers any
+  // plausible text block (longest paragraph in Les Misérables is
+  // under 1500 words) while staying well inside heap budgets even
+  // under memory pressure.
+  if (wc > 2000) {
     Serial.printf("[%lu] [TXB] Deserialization failed: word count %u exceeds maximum\n", millis(), wc);
     return nullptr;
   }

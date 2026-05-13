@@ -447,13 +447,22 @@ bool bmpTo2BitBmpScaled(const char* srcPath, const char* dstPath, int targetMaxW
 
   writeBmpHeader2bit(dstFile, outWidth, outHeight);
 
-  // Create 2-bit ditherer — use arena ditherRegion when available
+  // Create 2-bit ditherer — use arena ditherRegion when available.
+  // nothrow keeps heap-exhausted dither alloc from aborting the device.
   AtkinsonDitherer* ditherer;
   if (sumi::MemoryArena::isInitialized() && sumi::MemoryArena::ditherRegion) {
-    ditherer = new AtkinsonDitherer(outWidth, sumi::MemoryArena::ditherRegion,
-                                    sumi::MemoryArena::DITHER_REGION_SIZE);
+    ditherer = new (std::nothrow) AtkinsonDitherer(
+        outWidth, sumi::MemoryArena::ditherRegion,
+        sumi::MemoryArena::DITHER_REGION_SIZE);
   } else {
-    ditherer = new AtkinsonDitherer(outWidth);
+    ditherer = new (std::nothrow) AtkinsonDitherer(outWidth);
+  }
+  if (!ditherer) {
+    Serial.printf("[%lu] [BMP] AtkinsonDitherer alloc failed\n", millis());
+    if (!usesArena) { free(srcRows); free(outRow); }
+    srcFile.close();
+    dstFile.close();
+    return false;
   }
 
   // Seek to pixel data
@@ -553,9 +562,9 @@ bool bmpTo2BitBmpScaled(const char* srcPath, const char* dstPath, int targetMaxW
 
   if (!usesArena) { free(srcRows); free(outRow); }
   delete ditherer;
-  srcFile.close();
-  dstFile.close();
-
+  srcFile.close();                 // reader
+  SdMan.syncAndClose(dstFile);     // thumbnail is re-read by Home on
+                                    // every boot — tail drop = corrupted cover
   Serial.printf("[%lu] [BMP] Successfully created thumbnail: %s\n", millis(), dstPath);
   return true;
 }

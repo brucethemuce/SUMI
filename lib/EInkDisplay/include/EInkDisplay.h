@@ -23,14 +23,35 @@ class EInkDisplay {
     FAST_REFRESH   // Fast refresh using custom LUT
   };
 
+  // Set X3 panel geometry and mode. MUST be called before begin().
+  // When not called, the driver defaults to X4 (800x480).
+  void setDisplayX3();
+
   // Initialize the display hardware and driver
   void begin();
 
-  // Display dimensions
+  // Display dimensions — X4 (default) compile-time constants.
+  // Legacy callers still reference DISPLAY_WIDTH/HEIGHT/BUFFER_SIZE directly.
+  // New code should prefer the runtime getters (getDisplayWidth etc.) so it
+  // works for both X4 and X3 panels.
   static constexpr uint16_t DISPLAY_WIDTH = 800;
   static constexpr uint16_t DISPLAY_HEIGHT = 480;
   static constexpr uint16_t DISPLAY_WIDTH_BYTES = DISPLAY_WIDTH / 8;
   static constexpr uint32_t BUFFER_SIZE = DISPLAY_WIDTH_BYTES * DISPLAY_HEIGHT;
+  static constexpr uint16_t X3_DISPLAY_WIDTH = 792;
+  static constexpr uint16_t X3_DISPLAY_HEIGHT = 528;
+  static constexpr uint16_t X3_DISPLAY_WIDTH_BYTES = X3_DISPLAY_WIDTH / 8;
+  static constexpr uint32_t X3_BUFFER_SIZE = X3_DISPLAY_WIDTH_BYTES * X3_DISPLAY_HEIGHT;
+  // Framebuffer is sized for the larger of the two panels so one binary works
+  // on both. max(800*480, 792*528)/8 = max(48000, 52272) = 52272 bytes.
+  static constexpr uint32_t MAX_BUFFER_SIZE = 52272;
+
+  // Runtime dimension getters — prefer these over the constexpr above.
+  uint16_t getDisplayWidth() const { return displayWidth; }
+  uint16_t getDisplayHeight() const { return displayHeight; }
+  uint16_t getDisplayWidthBytes() const { return displayWidthBytes; }
+  uint32_t getBufferSize() const { return bufferSize; }
+  bool isX3Mode() const { return _x3Mode; }
 
   // Frame buffer operations (waitForRefresh guards against RED RAM race)
   void clearScreen(uint8_t color = 0xFF);
@@ -57,6 +78,12 @@ class EInkDisplay {
   void displayGrayBuffer(bool turnOffScreen = false);
 
   void refreshDisplay(RefreshMode mode = FAST_REFRESH, bool turnOffScreen = false);
+
+  // Hint the X3 policy to run a one-shot full resync on the next update.
+  // `settlePasses` controls how many forced conditioning passes to run
+  // before the normal update resumes. No-op on X4.
+  // Ported from Crosspoint's open-x4-sdk X3 support.
+  void requestResync(uint8_t settlePasses = 0);
 
   // debug function
   void grayscaleRevert();
@@ -86,11 +113,35 @@ class EInkDisplay {
   // Pin configuration
   int8_t _sclk, _mosi, _cs, _dc, _rst, _busy;
 
-  // Frame buffer (statically allocated)
-  uint8_t frameBuffer0[BUFFER_SIZE];
+  // Runtime display geometry (defaults to X4, flipped by setDisplayX3()).
+  // Naming matches Crosspoint's open-x4-sdk so X3 code can be dropped in.
+  uint16_t displayWidth = DISPLAY_WIDTH;
+  uint16_t displayHeight = DISPLAY_HEIGHT;
+  uint16_t displayWidthBytes = DISPLAY_WIDTH_BYTES;
+  uint32_t bufferSize = BUFFER_SIZE;
+  bool _x3Mode = false;
+
+  // X3-specific state tracking (ported from Crosspoint). Unused on X4.
+  bool _x3RedRamSynced = false;
+  struct X3GrayState {
+    bool lastBaseWasPartial = false;
+    bool lsbValid = false;
+  };
+  X3GrayState _x3GrayState;
+  uint8_t _x3InitialFullSyncsRemaining = 0;
+  bool _x3ForceFullSyncNext = false;
+  uint8_t _x3ForcedConditionPassesNext = 0;
+
+  // Internal geometry setter used by setDisplayX3().
+  void setDisplayDimensions(uint16_t width, uint16_t height);
+
+  // Frame buffer sized for the LARGER of X4/X3 panels so one binary works on
+  // both. Only the first `bufferSize_` bytes are used — the rest is unused
+  // padding on X4 (4272 extra bytes, but keeps the code simple).
+  uint8_t frameBuffer0[MAX_BUFFER_SIZE];
   uint8_t* frameBuffer;
 #ifndef EINK_DISPLAY_SINGLE_BUFFER_MODE
-  uint8_t frameBuffer1[BUFFER_SIZE];
+  uint8_t frameBuffer1[MAX_BUFFER_SIZE];
   uint8_t* frameBufferActive;
 #endif
 

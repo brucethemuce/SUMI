@@ -2,9 +2,12 @@
 
 #include <GfxRenderer.h>
 #include <Theme.h>
+#include <Utf8.h>
 
+#include <algorithm>
 #include <cstdint>
 #include <cstring>
+#include <vector>
 
 #include "../Elements.h"
 
@@ -17,7 +20,13 @@ namespace ui {
 struct ReaderStatusView {
   int16_t currentPage = 1;
   int16_t totalPages = 1;
-  int8_t progressPercent = 0;
+  // Widened from int8_t in Batch 7. The setPage math (`current * 100 /
+  // total`) can momentarily exceed 100 right after a chapter boundary
+  // crossing where currentPage briefly leads totalPages from a stale
+  // cache view; the int8_t cast wrapped negative and the status bar
+  // flickered "-56%". Wider type + clamp keeps the displayed percent
+  // sane during the brief window. Audit #35.
+  int16_t progressPercent = 0;
   bool showProgress = true;
   bool needsRender = true;
 
@@ -25,7 +34,8 @@ struct ReaderStatusView {
     currentPage = static_cast<int16_t>(current);
     totalPages = static_cast<int16_t>(total);
     if (totalPages > 0) {
-      progressPercent = static_cast<int8_t>((current * 100) / total);
+      const int pct = (current * 100) / total;
+      progressPercent = static_cast<int16_t>(pct < 0 ? 0 : (pct > 100 ? 100 : pct));
     }
     needsRender = true;
   }
@@ -63,14 +73,14 @@ struct CoverPageView {
   }
 
   void setTitle(const char* t) {
-    strncpy(title, t, MAX_TITLE_LEN - 1);
-    title[MAX_TITLE_LEN - 1] = '\0';
+    // UTF-8 safe so the reader cover page doesn't render '?' at the
+    // break for long CJK titles.
+    utf8SafeCopy(title, t, MAX_TITLE_LEN);
     needsRender = true;
   }
 
   void setAuthor(const char* a) {
-    strncpy(author, a, MAX_AUTHOR_LEN - 1);
-    author[MAX_AUTHOR_LEN - 1] = '\0';
+    utf8SafeCopy(author, a, MAX_AUTHOR_LEN);
     needsRender = true;
   }
 };
@@ -154,5 +164,88 @@ struct JumpToPageView {
 };
 
 void render(const GfxRenderer& r, const Theme& t, const JumpToPageView& v);
+
+// ============================================================================
+// BookmarkListView - Scrollable list of bookmarks for the current book
+// ============================================================================
+
+struct BookmarkListView {
+  static constexpr int MAX_VISIBLE = 12;
+
+  std::vector<uint32_t> pages;  // sorted page numbers
+  int totalBookPages = 1;       // for "page X of Y" display
+  int selectedIndex = 0;
+  int scrollOffset = 0;
+  bool needsRender = true;
+
+  void moveUp() {
+    if (pages.empty()) return;
+    selectedIndex = (selectedIndex == 0) ? static_cast<int>(pages.size()) - 1 : selectedIndex - 1;
+    ensureVisible();
+    needsRender = true;
+  }
+
+  void moveDown() {
+    if (pages.empty()) return;
+    selectedIndex = (selectedIndex + 1) % static_cast<int>(pages.size());
+    ensureVisible();
+    needsRender = true;
+  }
+
+  uint32_t selectedPage() const {
+    if (selectedIndex >= 0 && selectedIndex < static_cast<int>(pages.size())) {
+      return pages[selectedIndex];
+    }
+    return 0;
+  }
+
+  void ensureVisible() {
+    if (selectedIndex < scrollOffset) scrollOffset = selectedIndex;
+    if (selectedIndex >= scrollOffset + MAX_VISIBLE) scrollOffset = selectedIndex - MAX_VISIBLE + 1;
+  }
+};
+
+void render(const GfxRenderer& r, const Theme& t, const BookmarkListView& v);
+
+// ============================================================================
+// GlobalBookmarkListView - Cross-book bookmark index viewer
+// ============================================================================
+
+struct GlobalBookmarkListView {
+  static constexpr int MAX_VISIBLE = 10;
+  static constexpr int MAX_ENTRIES = 200;
+
+  struct DisplayEntry {
+    char bookTitle[48];
+    char snippet[60];
+    uint32_t page;
+  };
+
+  std::vector<DisplayEntry> entries;
+  int selectedIndex = 0;
+  int scrollOffset = 0;
+  bool needsRender = true;
+
+  void moveUp() {
+    if (entries.empty()) return;
+    selectedIndex = (selectedIndex == 0) ? static_cast<int>(entries.size()) - 1 : selectedIndex - 1;
+    ensureVisible();
+    needsRender = true;
+  }
+
+  void moveDown() {
+    if (entries.empty()) return;
+    selectedIndex = (selectedIndex + 1) % static_cast<int>(entries.size());
+    ensureVisible();
+    needsRender = true;
+  }
+
+  void ensureVisible() {
+    if (selectedIndex < scrollOffset) scrollOffset = selectedIndex;
+    if (selectedIndex >= scrollOffset + MAX_VISIBLE) scrollOffset = selectedIndex - MAX_VISIBLE + 1;
+  }
+};
+
+void render(const GfxRenderer& r, const Theme& t, const GlobalBookmarkListView& v);
 
 }  // namespace ui

@@ -4,6 +4,14 @@
 
 class FsHelpers {
  public:
+  // Collapse "." and ".." components in a path. Returns a RELATIVE
+  // path: a leading `/` on the input is silently dropped (the function
+  // splits on `/`, drops empties, joins with `/`). Today this is fine
+  // because the only callers feed it ZIP-internal paths from EPUB
+  // parsing, where leading slashes aren't expected. If you call this
+  // on a filesystem path expecting an absolute result back, you'll
+  // get a relative path and SD operations will fail. Audit #45.
+  // TODO: rename to normaliseRelative() to make the contract loud.
   static std::string normalisePath(const std::string& path);
 
   // Check if a filename should be hidden from file browsers

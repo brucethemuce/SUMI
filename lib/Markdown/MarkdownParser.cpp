@@ -11,9 +11,11 @@
 #include <Epub/Page.h>
 #include <Epub/ParsedText.h>
 #include <Epub/blocks/TextBlock.h>
+#include <Epub/hyphenation/Hyphenator.h>
 #include <GfxRenderer.h>
 #include <HardwareSerial.h>
 #include <SDCardManager.h>
+#include <Utf8.h>
 #include <esp_heap_caps.h>
 
 #include <utility>
@@ -159,21 +161,32 @@ bool MarkdownParser::tokenCallback(const md_token_t* token, void* userData) {
 
   switch (token->type) {
     case MD_TEXT: {
-      // Process text character by character to split into words
+      // Process text byte-by-byte to split into words. ASCII whitespace
+      // flushes the buffer; Unicode whitespace (NBSP, narrow NBSP,
+      // EN/EM/thin spaces, ideographic space) also flushes so French
+      // and CJK text tokenize into proper word boundaries. See
+      // lib/Utf8 utf8UnicodeWhitespaceBytes() for the full list.
       for (uint16_t i = 0; i < token->length; i++) {
-        char c = token->text[i];
+        const char c = token->text[i];
         if (isWhitespaceChar(c)) {
           self->flushWordBuffer(ctx);
-        } else {
-          if (ctx.wordBufferIndex >= MAX_WORD_SIZE) {
-            ctx.wordBuffer[ctx.wordBufferIndex] = '\0';
-            if (ctx.textBlock) {
-              ctx.textBlock->addWord(ctx.wordBuffer, static_cast<EpdFontFamily::Style>(self->getCurrentFontStyle(ctx)));
-            }
-            ctx.wordBufferIndex = 0;
-          }
-          ctx.wordBuffer[ctx.wordBufferIndex++] = c;
+          continue;
         }
+        const int skip =
+            utf8UnicodeWhitespaceBytes(token->text + i, static_cast<int>(token->length - i));
+        if (skip > 0) {
+          self->flushWordBuffer(ctx);
+          i += static_cast<uint16_t>(skip - 1);  // loop increments
+          continue;
+        }
+        if (ctx.wordBufferIndex >= MAX_WORD_SIZE) {
+          ctx.wordBuffer[ctx.wordBufferIndex] = '\0';
+          if (ctx.textBlock) {
+            ctx.textBlock->addWord(ctx.wordBuffer, static_cast<EpdFontFamily::Style>(self->getCurrentFontStyle(ctx)));
+          }
+          ctx.wordBufferIndex = 0;
+        }
+        ctx.wordBuffer[ctx.wordBufferIndex++] = c;
       }
       break;
     }
@@ -322,6 +335,12 @@ bool MarkdownParser::tokenCallback(const md_token_t* token, void* userData) {
 
 bool MarkdownParser::parsePages(const std::function<void(std::unique_ptr<Page>)>& onPageComplete, uint16_t maxPages,
                                 const AbortCallback& shouldAbort) {
+  // See PlainTextParser::parsePages — the Hyphenator static language
+  // preference is sticky across books, so opening a French EPUB then a
+  // .md file would apply French hyphenation to the Markdown content.
+  // Clear it so language-agnostic fallback hyphenation kicks in.
+  Hyphenator::setPreferredLanguage("");
+
   FsFile file;
   if (!SdMan.openFileForRead("MD", filepath_, file)) {
     Serial.printf("[MD] Failed to open file: %s\n", filepath_.c_str());

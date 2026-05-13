@@ -6,9 +6,12 @@
 
 #include <Arduino.h>
 #include <GfxRenderer.h>
+#include <I18n.h>
 #include <SDCardManager.h>
+#include <Utf8.h>
 
 #include <cstring>
+#include <string>
 
 #include "../core/Core.h"
 #include "../plugins/LuaPlugin.h"
@@ -21,7 +24,7 @@ int PluginListState::pluginCount = 0;
 PluginEntry PluginListState::plugins[PluginListState::MAX_PLUGINS] = {};
 
 // Lua plugin static storage
-char PluginListState::luaPaths_[MAX_LUA_PLUGINS][64] = {};
+char PluginListState::luaPaths_[MAX_LUA_PLUGINS][96] = {};  // audit #53
 char PluginListState::luaNames_[MAX_LUA_PLUGINS][24] = {};
 int PluginListState::luaPluginCount_ = 0;
 PluginRenderer* PluginListState::luaRenderer_ = nullptr;
@@ -35,15 +38,18 @@ bool PluginListState::registerPlugin(const char* name, const char* category, Plu
 }
 
 // Factory functions for each Lua plugin slot (up to 8)
-// These are plain function pointers — no captures — using static index storage
-static sumi::PluginInterface* luaFactory0() { return new sumi::LuaPlugin(*sumi::PluginListState::luaRenderer_, sumi::PluginListState::luaPaths_[0]); }
-static sumi::PluginInterface* luaFactory1() { return new sumi::LuaPlugin(*sumi::PluginListState::luaRenderer_, sumi::PluginListState::luaPaths_[1]); }
-static sumi::PluginInterface* luaFactory2() { return new sumi::LuaPlugin(*sumi::PluginListState::luaRenderer_, sumi::PluginListState::luaPaths_[2]); }
-static sumi::PluginInterface* luaFactory3() { return new sumi::LuaPlugin(*sumi::PluginListState::luaRenderer_, sumi::PluginListState::luaPaths_[3]); }
-static sumi::PluginInterface* luaFactory4() { return new sumi::LuaPlugin(*sumi::PluginListState::luaRenderer_, sumi::PluginListState::luaPaths_[4]); }
-static sumi::PluginInterface* luaFactory5() { return new sumi::LuaPlugin(*sumi::PluginListState::luaRenderer_, sumi::PluginListState::luaPaths_[5]); }
-static sumi::PluginInterface* luaFactory6() { return new sumi::LuaPlugin(*sumi::PluginListState::luaRenderer_, sumi::PluginListState::luaPaths_[6]); }
-static sumi::PluginInterface* luaFactory7() { return new sumi::LuaPlugin(*sumi::PluginListState::luaRenderer_, sumi::PluginListState::luaPaths_[7]); }
+// These are plain function pointers — no captures — using static index storage.
+// nothrow matches the built-in plugin factories in main.cpp: PluginHostState
+// already null-checks, so heap-exhausted Lua plugin instantiation falls back
+// to Home with a log instead of aborting the device.
+static sumi::PluginInterface* luaFactory0() { return new (std::nothrow) sumi::LuaPlugin(*sumi::PluginListState::luaRenderer_, sumi::PluginListState::luaPaths_[0]); }
+static sumi::PluginInterface* luaFactory1() { return new (std::nothrow) sumi::LuaPlugin(*sumi::PluginListState::luaRenderer_, sumi::PluginListState::luaPaths_[1]); }
+static sumi::PluginInterface* luaFactory2() { return new (std::nothrow) sumi::LuaPlugin(*sumi::PluginListState::luaRenderer_, sumi::PluginListState::luaPaths_[2]); }
+static sumi::PluginInterface* luaFactory3() { return new (std::nothrow) sumi::LuaPlugin(*sumi::PluginListState::luaRenderer_, sumi::PluginListState::luaPaths_[3]); }
+static sumi::PluginInterface* luaFactory4() { return new (std::nothrow) sumi::LuaPlugin(*sumi::PluginListState::luaRenderer_, sumi::PluginListState::luaPaths_[4]); }
+static sumi::PluginInterface* luaFactory5() { return new (std::nothrow) sumi::LuaPlugin(*sumi::PluginListState::luaRenderer_, sumi::PluginListState::luaPaths_[5]); }
+static sumi::PluginInterface* luaFactory6() { return new (std::nothrow) sumi::LuaPlugin(*sumi::PluginListState::luaRenderer_, sumi::PluginListState::luaPaths_[6]); }
+static sumi::PluginInterface* luaFactory7() { return new (std::nothrow) sumi::LuaPlugin(*sumi::PluginListState::luaRenderer_, sumi::PluginListState::luaPaths_[7]); }
 
 static sumi::PluginFactory luaFactories[sumi::PluginListState::MAX_LUA_PLUGINS] = {
   luaFactory0, luaFactory1, luaFactory2, luaFactory3,
@@ -80,15 +86,16 @@ void PluginListState::scanLuaPlugins(PluginRenderer& renderer) {
     snprintf(luaPaths_[luaPluginCount_], sizeof(luaPaths_[0]),
              "%s/%s", PLUGINS_CUSTOM_DIR, fname);
 
-    // Derive display name from filename
-    const char* base = fname;
-    size_t nameLen = len - 4;  // strip .lua
-    if (nameLen >= sizeof(luaNames_[0])) nameLen = sizeof(luaNames_[0]) - 1;
-    memcpy(luaNames_[luaPluginCount_], base, nameLen);
-    luaNames_[luaPluginCount_][nameLen] = '\0';
+    // Derive display name from filename. Walk through std::string so
+    // utf8SafeCopy can truncate a long CJK name at a codepoint boundary
+    // instead of mid-sequence.
+    const std::string baseStr(fname, len - 4);  // strip .lua
+    utf8SafeCopy(luaNames_[luaPluginCount_], baseStr.c_str(), sizeof(luaNames_[0]));
 
-    // Replace underscores with spaces, capitalize first char
-    for (size_t i = 0; i < nameLen; i++) {
+    // Replace underscores with spaces (ASCII fast path), capitalize first char.
+    // Byte-wise underscore-replacement is safe because '_' (0x5F) never appears
+    // inside a UTF-8 continuation byte.
+    for (size_t i = 0; luaNames_[luaPluginCount_][i] != '\0'; i++) {
       if (luaNames_[luaPluginCount_][i] == '_')
         luaNames_[luaPluginCount_][i] = ' ';
     }
@@ -115,11 +122,77 @@ PluginListState::PluginListState(GfxRenderer& renderer) : renderer_(renderer) {
 
 void PluginListState::buildVisibleList(const Settings& settings) {
   visiblePluginCount_ = 0;
+  displayCount_ = 0;
+
+  // First pass: collect visible plugins
   for (int i = 0; i < pluginCount && visiblePluginCount_ < MAX_PLUGINS; i++) {
     if (!settings.isPluginHidden(i)) {
       visiblePlugins_[visiblePluginCount_++] = static_cast<int8_t>(i);
     }
   }
+
+  // Second pass: build display list grouped by category.
+  // Walk unique categories in registration order, emit a header + entries for each.
+  // Size the registry to MAX_PLUGINS because every plugin could theoretically
+  // define its own category. Previously this was fixed at 8; once a user
+  // installed Lua plugins that bumped the unique-category count past 8, the
+  // "already emitted" registry stopped being updated and every subsequent
+  // plugin in any new category re-emitted a duplicate header + entries on
+  // each visit.
+  const char* emittedCategories[MAX_PLUGINS] = {};
+  int categoryCount = 0;
+
+  for (int i = 0; i < visiblePluginCount_; i++) {
+    int idx = visiblePlugins_[i];
+    const char* cat = plugins[idx].category;
+
+    // Check if we already emitted this category
+    bool found = false;
+    for (int c = 0; c < categoryCount; c++) {
+      if (strcmp(emittedCategories[c], cat) == 0) { found = true; break; }
+    }
+    if (found) continue;
+
+    // Emit category header
+    if (categoryCount < static_cast<int>(sizeof(emittedCategories) / sizeof(emittedCategories[0]))) {
+      emittedCategories[categoryCount++] = cat;
+    }
+    if (displayCount_ < static_cast<int>(sizeof(displayList_) / sizeof(displayList_[0]))) {
+      displayList_[displayCount_++] = {-1, cat};
+    }
+
+    // Emit all visible plugins in this category
+    for (int j = 0; j < visiblePluginCount_; j++) {
+      int jIdx = visiblePlugins_[j];
+      if (strcmp(plugins[jIdx].category, cat) == 0) {
+        if (displayCount_ < static_cast<int>(sizeof(displayList_) / sizeof(displayList_[0]))) {
+          displayList_[displayCount_++] = {static_cast<int8_t>(jIdx), nullptr};
+        }
+      }
+    }
+  }
+}
+
+void PluginListState::moveSelection(int direction) {
+  if (displayCount_ == 0) return;
+  int attempts = 0;
+  do {
+    selected_ += direction;
+    if (selected_ < 0) selected_ = displayCount_ - 1;
+    if (selected_ >= displayCount_) selected_ = 0;
+    attempts++;
+  } while (displayList_[selected_].pluginIndex == -1 && attempts < displayCount_);
+
+  // Ensure visible
+  int vis = visibleCount();
+  if (selected_ < scrollOffset_) scrollOffset_ = selected_;
+  if (selected_ >= scrollOffset_ + vis) scrollOffset_ = selected_ - vis + 1;
+  // If header is at scroll top, show it
+  if (scrollOffset_ > 0 && displayList_[scrollOffset_].pluginIndex == -1 &&
+      scrollOffset_ > 0) {
+    // Keep header visible by not scrolling past it
+  }
+  needsRender_ = true;
 }
 
 void PluginListState::enter(Core& core) {
@@ -130,8 +203,11 @@ void PluginListState::enter(Core& core) {
   // Build filtered list based on visibility settings
   buildVisibleList(core.settings);
 
-  if (selected_ >= visiblePluginCount_ && visiblePluginCount_ > 0) selected_ = visiblePluginCount_ - 1;
-  if (selected_ < 0) selected_ = 0;
+  // Ensure selection is on a selectable entry (not a category header)
+  if (selected_ >= displayCount_) selected_ = 0;
+  if (displayCount_ > 0 && displayList_[selected_].pluginIndex == -1) {
+    moveSelection(+1);  // skip to first plugin
+  }
 }
 
 void PluginListState::exit(Core& core) {}
@@ -152,25 +228,11 @@ StateTransition PluginListState::update(Core& core) {
 
     switch (e.button) {
       case Button::Up:
-        if (visiblePluginCount_ > 0) {
-          selected_ = (selected_ == 0) ? visiblePluginCount_ - 1 : selected_ - 1;
-          if (selected_ < scrollOffset_) scrollOffset_ = selected_;
-          // Wrap: if jumped to bottom, adjust scroll
-          int vis2 = visibleCount();
-          if (selected_ >= scrollOffset_ + vis2) scrollOffset_ = selected_ - vis2 + 1;
-          needsRender_ = true;
-        }
+        moveSelection(-1);
         break;
 
       case Button::Down:
-        if (visiblePluginCount_ > 0) {
-          selected_ = (selected_ + 1) % visiblePluginCount_;
-          int vis = visibleCount();
-          if (selected_ >= scrollOffset_ + vis) scrollOffset_ = selected_ - vis + 1;
-          // Wrap: if jumped to top, reset scroll
-          if (selected_ == 0) scrollOffset_ = 0;
-          needsRender_ = true;
-        }
+        moveSelection(+1);
         break;
 
       case Button::Left:
@@ -180,7 +242,10 @@ StateTransition PluginListState::update(Core& core) {
 
       case Button::Center:
       case Button::Right:
-        if (visiblePluginCount_ > 0 && selected_ < visiblePluginCount_) launchPlugin_ = true;
+        if (selected_ >= 0 && selected_ < displayCount_ &&
+            displayList_[selected_].pluginIndex >= 0) {
+          launchPlugin_ = true;
+        }
         break;
 
       case Button::Power:
@@ -198,10 +263,11 @@ StateTransition PluginListState::update(Core& core) {
 
   if (launchPlugin_ && hostState_) {
     launchPlugin_ = false;
-    // Map from visible index to actual plugin index
-    int actualIdx = visiblePlugins_[selected_];
-    hostState_->setPluginFactory(plugins[actualIdx].factory);
-    return StateTransition::to(StateId::PluginHost);
+    if (selected_ >= 0 && selected_ < displayCount_ && displayList_[selected_].pluginIndex >= 0) {
+      int actualIdx = displayList_[selected_].pluginIndex;
+      hostState_->setPluginFactory(plugins[actualIdx].factory);
+      return StateTransition::to(StateId::PluginHost);
+    }
   }
 
   return StateTransition::stay(StateId::PluginList);
@@ -220,38 +286,54 @@ void PluginListState::drawList() const {
 
   renderer_.clearScreen(t.backgroundColor);
 
-  // Header - same as Settings
-  ui::title(renderer_, t, t.screenMarginTop, "Apps");
+  // Header
+  ui::title(renderer_, t, t.screenMarginTop, _tr(PLUGINS_TITLE));
 
-  // Items - using standard menuItem (matches Settings menu exactly)
-  // Now iterates over the filtered visiblePlugins_ array
   const int startY = 60;
+  const int itemH = t.menuItemHeight + t.itemSpacing;
   int vis = visibleCount();
+  const int W = renderer_.getScreenWidth();
 
-  for (int i = scrollOffset_; i < visiblePluginCount_ && i < scrollOffset_ + vis; i++) {
-    int actualIdx = visiblePlugins_[i];
-    const int y = startY + (i - scrollOffset_) * (t.menuItemHeight + t.itemSpacing);
-    ui::menuItem(renderer_, t, y, plugins[actualIdx].name, i == selected_);
+  for (int i = scrollOffset_; i < displayCount_ && i < scrollOffset_ + vis; i++) {
+    const int y = startY + (i - scrollOffset_) * itemH;
+    const auto& entry = displayList_[i];
 
-    // Show "Continue" right-aligned for games with saved progress
-    if (plugins[actualIdx].savePath && SdMan.exists(plugins[actualIdx].savePath)) {
-      const int h = t.menuItemHeight;
-      const int textY = y + (h - renderer_.getLineHeight(t.smallFontId)) / 2;
-      const int rightEdge = renderer_.getScreenWidth() - t.screenMarginSide - t.itemPaddingX;
-      const int tw = renderer_.getTextWidth(t.smallFontId, "Continue");
-      bool black = (i == selected_) ? t.selectionTextBlack : t.secondaryTextBlack;
-      renderer_.drawText(t.smallFontId, rightEdge - tw, textY, "Continue", black);
+    if (entry.pluginIndex == -1) {
+      // Category header: draw as a subtle separator with the category name
+      const int lineY = y + t.menuItemHeight / 2;
+      const int textW = renderer_.getTextWidth(t.smallFontId, entry.categoryName);
+      const int textX = t.screenMarginSide + 8;
+      const int lineStart = textX + textW + 8;
+      const int lineEnd = W - t.screenMarginSide;
+
+      renderer_.drawText(t.smallFontId, textX, y + 4, entry.categoryName, t.secondaryTextBlack);
+      if (lineStart < lineEnd) {
+        renderer_.drawLine(lineStart, lineY, lineEnd, lineY, t.secondaryTextBlack);
+      }
+    } else {
+      // Plugin entry: indented menuItem
+      int actualIdx = entry.pluginIndex;
+      ui::menuItem(renderer_, t, y, plugins[actualIdx].name, i == selected_);
+
+      // "Continue" indicator for games with saved progress
+      if (plugins[actualIdx].savePath && SdMan.exists(plugins[actualIdx].savePath)) {
+        const int h = t.menuItemHeight;
+        const int textY2 = y + (h - renderer_.getLineHeight(t.smallFontId)) / 2;
+        const int rightEdge = W - t.screenMarginSide - t.itemPaddingX;
+        const int tw = renderer_.getTextWidth(t.smallFontId, "Continue");
+        bool black = (i == selected_) ? t.selectionTextBlack : t.secondaryTextBlack;
+        renderer_.drawText(t.smallFontId, rightEdge - tw, textY2, "Continue", black);
+      }
     }
   }
 
   // Scroll indicators
-  const int W = renderer_.getScreenWidth();
   if (scrollOffset_ > 0) {
     int cx = W / 2;
     renderer_.drawLine(cx, startY - 6, cx - 6, startY - 1, true);
     renderer_.drawLine(cx, startY - 6, cx + 6, startY - 1, true);
   }
-  if (scrollOffset_ + vis < visiblePluginCount_) {
+  if (scrollOffset_ + vis < displayCount_) {
     int cx = W / 2;
     int ay = renderer_.getScreenHeight() - 38;
     renderer_.drawLine(cx, ay, cx - 6, ay - 6, true);

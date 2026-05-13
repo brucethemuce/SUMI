@@ -6,6 +6,7 @@
 
 #include <Arduino.h>
 #include <SDCardManager.h>
+#include <Utf8.h>
 #include "PluginHelpers.h"
 #include "PluginInterface.h"
 #include "PluginRenderer.h"
@@ -202,8 +203,8 @@ void NotesApp::scanNotes() {
 
     int len = strlen(fname);
     if (len > 4 && strcasecmp(fname + len - 4, ".txt") == 0) {
-      strncpy(notes_[noteCount_], fname, MAX_NAME_LEN - 1);
-      notes_[noteCount_][MAX_NAME_LEN - 1] = '\0';
+      // UTF-8 safe so CJK note filenames aren't sliced mid-codepoint.
+      utf8SafeCopy(notes_[noteCount_], fname, MAX_NAME_LEN);
       noteCount_++;
     }
     entry.close();
@@ -226,8 +227,25 @@ int NotesApp::countLines() const {
   if (bufLen_ == 0) return 1;
   int lines = 1;
   int col = 0;
-  for (int i = 0; i < bufLen_; i++) {
-    if (buf_[i] == '\n') { lines++; col = 0; continue; }
+  // Walk by UTF-8 codepoint so a CJK note isn't counted as 3x its real
+  // column width. Previously every continuation byte (0x80..0xBF) of a
+  // 3-byte character incremented col, so a Japanese note with CJK text
+  // wrapped far earlier than its visible width and the footer "lines"
+  // counter was off by a factor of ~3.
+  for (int i = 0; i < bufLen_;) {
+    const unsigned char c = static_cast<unsigned char>(buf_[i]);
+    if (c == '\n') {
+      lines++;
+      col = 0;
+      i++;
+      continue;
+    }
+    // Advance past the full codepoint
+    int step = 1;
+    if ((c & 0xE0) == 0xC0) step = 2;
+    else if ((c & 0xF0) == 0xE0) step = 3;
+    else if ((c & 0xF8) == 0xF0) step = 4;
+    i += step;
     col++;
     if (col >= charsPerLine_) { lines++; col = 0; }
   }
@@ -252,9 +270,20 @@ void NotesApp::insertChar(char c) {
 
 void NotesApp::deleteCharBack() {
   if (cursorPos_ <= 0) return;
-  cursorPos_--;
-  memmove(buf_ + cursorPos_, buf_ + cursorPos_ + 1, bufLen_ - cursorPos_ - 1);
-  bufLen_--;
+  // Walk back past any trailing UTF-8 continuation bytes so the delete
+  // removes a whole codepoint at once. This is only relevant when a note
+  // was loaded with CJK/accented content from an existing .txt file (the
+  // on-screen keyboard only enters ASCII). Without this, backspacing
+  // through CJK would strip one byte at a time and leave a broken
+  // half-character rendered as '?'.
+  int del = 1;
+  while (del < cursorPos_
+         && (static_cast<unsigned char>(buf_[cursorPos_ - del]) & 0xC0) == 0x80) {
+    del++;
+  }
+  cursorPos_ -= del;
+  memmove(buf_ + cursorPos_, buf_ + cursorPos_ + del, bufLen_ - cursorPos_ - del);
+  bufLen_ -= del;
   buf_[bufLen_] = '\0';
   modified_ = true;
   lastKeystroke_ = millis();
@@ -263,8 +292,18 @@ void NotesApp::deleteCharBack() {
 
 void NotesApp::deleteCharForward() {
   if (cursorPos_ >= bufLen_) return;
-  memmove(buf_ + cursorPos_, buf_ + cursorPos_ + 1, bufLen_ - cursorPos_ - 1);
-  bufLen_--;
+  // Same rationale as deleteCharBack: step forward past the whole
+  // codepoint rather than one byte so CJK content edits cleanly.
+  int del = 1;
+  const unsigned char lead = static_cast<unsigned char>(buf_[cursorPos_]);
+  if (lead >= 0xC0) {
+    if ((lead & 0xE0) == 0xC0) del = 2;
+    else if ((lead & 0xF0) == 0xE0) del = 3;
+    else if ((lead & 0xF8) == 0xF0) del = 4;
+  }
+  if (cursorPos_ + del > bufLen_) del = bufLen_ - cursorPos_;
+  memmove(buf_ + cursorPos_, buf_ + cursorPos_ + del, bufLen_ - cursorPos_ - del);
+  bufLen_ -= del;
   buf_[bufLen_] = '\0';
   modified_ = true;
   lastKeystroke_ = millis();
@@ -289,10 +328,22 @@ void NotesApp::moveCursorDown() {
   }
 }
 
+// Helper: length in bytes of the UTF-8 codepoint starting at buf[pos].
+// Returns 1 for ASCII or invalid lead bytes so callers always make progress.
+static int notesCodepointLen(const char* buf, int pos) {
+  const unsigned char c = static_cast<unsigned char>(buf[pos]);
+  if ((c & 0xE0) == 0xC0) return 2;
+  if ((c & 0xF0) == 0xE0) return 3;
+  if ((c & 0xF8) == 0xF0) return 4;
+  return 1;
+}
+
 int NotesApp::cursorToLine() const {
   int line = 0, col = 0;
-  for (int i = 0; i < cursorPos_ && i < bufLen_; i++) {
-    if (buf_[i] == '\n') { line++; col = 0; continue; }
+  int i = 0;
+  while (i < cursorPos_ && i < bufLen_) {
+    if (buf_[i] == '\n') { line++; col = 0; i++; continue; }
+    i += notesCodepointLen(buf_, i);
     col++;
     if (col >= charsPerLine_) { line++; col = 0; }
   }
@@ -300,9 +351,13 @@ int NotesApp::cursorToLine() const {
 }
 
 int NotesApp::cursorToCol() const {
+  // Find the start of the current line, then walk forward counting codepoints.
+  int lineStart = cursorPos_;
+  while (lineStart > 0 && buf_[lineStart - 1] != '\n') lineStart--;
   int col = 0;
-  for (int i = cursorPos_ - 1; i >= 0; i--) {
-    if (buf_[i] == '\n') break;
+  int i = lineStart;
+  while (i < cursorPos_) {
+    i += notesCodepointLen(buf_, i);
     col++;
     if (col >= charsPerLine_) break;
   }
@@ -313,15 +368,15 @@ int NotesApp::lineColToPos(int targetLine, int targetCol) const {
   int line = 0, col = 0, pos = 0;
   while (pos < bufLen_ && line < targetLine) {
     if (buf_[pos] == '\n') { line++; col = 0; pos++; continue; }
+    pos += notesCodepointLen(buf_, pos);
     col++;
-    pos++;
     if (col >= charsPerLine_) { line++; col = 0; }
   }
   // Advance to targetCol within this line
   while (pos < bufLen_ && col < targetCol) {
     if (buf_[pos] == '\n') break;
+    pos += notesCodepointLen(buf_, pos);
     col++;
-    pos++;
     if (col >= charsPerLine_) break;
   }
   return pos;
@@ -365,8 +420,16 @@ void NotesApp::openNote(int idx) {
 void NotesApp::createNote(const char* noteName) {
   snprintf(currentFile_, sizeof(currentFile_), "/notes/%s.txt", noteName);
 
-  FsFile f = SdMan.open(currentFile_, (O_WRONLY | O_CREAT | O_TRUNC));
-  if (f) f.close();
+  // Touch an empty file atomically so an interrupted createNote doesn't
+  // leave a half-existent path. The recovery scan in
+  // SDCardManager::recoverAtomicWrites covers /notes at level 0 since
+  // the post-Batch-9 audit pass.
+  FsFile f;
+  if (SdMan.atomicOpenWrite("NOTES", currentFile_, f)) {
+    if (!SdMan.atomicCommit(f, currentFile_)) {
+      SdMan.atomicAbort(f, currentFile_);
+    }
+  }
 
   bufLen_ = 0;
   buf_[0] = '\0';
@@ -383,13 +446,18 @@ void NotesApp::createNote(const char* noteName) {
 void NotesApp::saveNote() {
   if (currentFile_[0] == '\0') return;
 
-  FsFile f = SdMan.open(currentFile_, (O_WRONLY | O_CREAT | O_TRUNC));
-  if (f) {
-    f.write((uint8_t*)buf_, bufLen_);
-    f.close();
-    modified_ = false;
-    Serial.printf("[NOTES] Saved %s (%d bytes)\n", currentFile_, bufLen_);
+  // Atomic — power loss mid-save would otherwise truncate the user's
+  // note to empty. Notes are user-typed content; this is one of the
+  // highest-stakes plugin save paths. See docs/ATOMIC_WRITE_DESIGN.md.
+  FsFile f;
+  if (!SdMan.atomicOpenWrite("NOTES", currentFile_, f)) return;
+  f.write((uint8_t*)buf_, bufLen_);
+  if (!SdMan.atomicCommit(f, currentFile_)) {
+    SdMan.atomicAbort(f, currentFile_);
+    return;
   }
+  modified_ = false;
+  Serial.printf("[NOTES] Saved %s (%d bytes)\n", currentFile_, bufLen_);
 }
 
 // =============================================================================
@@ -486,11 +554,30 @@ bool NotesApp::handleInput(PluginButton btn) {
       case PluginButton::Up:    moveCursorUp(); return true;
       case PluginButton::Down:  moveCursorDown(); return true;
       case PluginButton::Left: {
-        if (cursorPos_ > 0) { cursorPos_--; ensureCursorVisible(); }
+        // Step left by a full codepoint so the cursor doesn't land inside
+        // a multi-byte UTF-8 sequence in a pre-existing CJK note.
+        if (cursorPos_ > 0) {
+          cursorPos_--;
+          while (cursorPos_ > 0
+                 && (static_cast<unsigned char>(buf_[cursorPos_]) & 0xC0) == 0x80) {
+            cursorPos_--;
+          }
+          ensureCursorVisible();
+        }
         return true;
       }
       case PluginButton::Right: {
-        if (cursorPos_ < bufLen_) { cursorPos_++; ensureCursorVisible(); }
+        // Step right past the current codepoint's continuation bytes.
+        if (cursorPos_ < bufLen_) {
+          const unsigned char lead = static_cast<unsigned char>(buf_[cursorPos_]);
+          int step = 1;
+          if ((lead & 0xE0) == 0xC0) step = 2;
+          else if ((lead & 0xF0) == 0xE0) step = 3;
+          else if ((lead & 0xF8) == 0xF0) step = 4;
+          cursorPos_ += step;
+          if (cursorPos_ > bufLen_) cursorPos_ = bufLen_;
+          ensureCursorVisible();
+        }
         return true;
       }
       case PluginButton::Back:
@@ -615,8 +702,7 @@ void NotesApp::drawFileList() {
       d_.print("+ New Note");
     } else {
       char display[MAX_NAME_LEN];
-      strncpy(display, notes_[i], MAX_NAME_LEN - 1);
-      display[MAX_NAME_LEN - 1] = '\0';
+      utf8SafeCopy(display, notes_[i], sizeof(display));
       int len = strlen(display);
       if (len > 4 && strcasecmp(display + len - 4, ".txt") == 0) {
         display[len - 4] = '\0';
@@ -641,8 +727,7 @@ void NotesApp::drawEditor() {
   const char* fname = strrchr(currentFile_, '/');
   fname = fname ? fname + 1 : currentFile_;
   char titleBuf[48];
-  strncpy(titleBuf, fname, sizeof(titleBuf) - 1);
-  titleBuf[sizeof(titleBuf) - 1] = '\0';
+  utf8SafeCopy(titleBuf, fname, sizeof(titleBuf));
   int tlen = strlen(titleBuf);
   if (tlen > 4 && strcasecmp(titleBuf + tlen - 4, ".txt") == 0) {
     titleBuf[tlen - 4] = '\0';
@@ -661,7 +746,14 @@ void NotesApp::drawEditor() {
   int col = 0;
   int cursorScreenX = -1, cursorScreenY = -1;
 
-  for (int i = 0; i <= bufLen_; i++) {
+  // Walk UTF-8 codepoint-by-codepoint. The editor column grid was built
+  // for fixed-width ASCII (charW_ per cell), so CJK still won't align
+  // perfectly, but at least each codepoint renders as the correct glyph
+  // via print(const char*) instead of the previous per-byte
+  // print(char c) which shipped each continuation byte through the '?'
+  // glyph fallback.
+  int i = 0;
+  while (i <= bufLen_) {
     if (i == cursorPos_) {
       if (line >= viewScrollLine_ && line < viewScrollLine_ + linesVisible_) {
         cursorScreenX = x + col * charW_;
@@ -670,13 +762,24 @@ void NotesApp::drawEditor() {
     }
 
     if (i >= bufLen_) break;
-    char c = buf_[i];
+    const unsigned char lead = static_cast<unsigned char>(buf_[i]);
 
-    if (c == '\n') {
+    if (lead == '\n') {
       line++;
       col = 0;
+      i++;
       continue;
     }
+
+    // Determine codepoint length and assemble as a null-terminated string.
+    int cpLen = 1;
+    if ((lead & 0xE0) == 0xC0) cpLen = 2;
+    else if ((lead & 0xF0) == 0xE0) cpLen = 3;
+    else if ((lead & 0xF8) == 0xF0) cpLen = 4;
+    if (i + cpLen > bufLen_) cpLen = 1;  // defensive: don't read past end
+
+    char cpBuf[5] = {};
+    for (int b = 0; b < cpLen; b++) cpBuf[b] = buf_[i + b];
 
     if (line >= viewScrollLine_ && line < viewScrollLine_ + linesVisible_) {
       int screenY = y + (line - viewScrollLine_) * lineH_;
@@ -684,10 +787,11 @@ void NotesApp::drawEditor() {
 
       if (screenY < editBottom_) {
         d_.setCursor(screenX, screenY + lineH_ - 4);
-        d_.print(c);
+        d_.print(cpBuf);
       }
     }
 
+    i += cpLen;
     col++;
     if (col >= charsPerLine_) {
       line++;

@@ -165,12 +165,12 @@ long ZipFile::getDataOffset(const FileStatSlim& fileStat) {
   const uint64_t fileOffset = fileStat.localHeaderOffset;
 
   file.seek(fileOffset);
-  const size_t read = file.read(pLocalHeader, localHeaderSize);
+  const int read = file.read(pLocalHeader, localHeaderSize);
   if (!wasOpen) {
     close();
   }
 
-  if (read != localHeaderSize) {
+  if (read < 0 || read != localHeaderSize) {
     Serial.printf("[%lu] [ZIP] Something went wrong reading the local header\n", millis());
     return -1;
   }
@@ -249,7 +249,14 @@ bool ZipFile::loadZipDetails() {
   // Sanity check: central directory offset must be within the file
   // and totalEntries must be reasonable. A truncated/corrupt zip can have
   // random bytes that match the EOCD signature, giving garbage values.
-  if (zipDetails.centralDirOffset >= fileSize || zipDetails.totalEntries > 65000) {
+  //
+  // Entry cap tightened to 8192 (previously 65000) because downstream
+  // `fileStatSlimCache.reserve(totalEntries)` allocates ~32 bytes per
+  // entry in an unordered_map, so even a valid 65000-entry value would
+  // reserve ~2 MB — larger than ESP32-C3's 380 KB total heap. Real
+  // EPUBs have at most a few thousand entries (typically 50-500);
+  // 8192 is still well beyond the largest legitimate book.
+  if (zipDetails.centralDirOffset >= fileSize || zipDetails.totalEntries > 8192) {
     Serial.printf("[%lu] [ZIP] EOCD values invalid (offset=%lu, entries=%u, fileSize=%u) — corrupt zip?\n",
                   millis(), (unsigned long)zipDetails.centralDirOffset, zipDetails.totalEntries, (unsigned)fileSize);
     free(buffer);
@@ -500,12 +507,12 @@ uint8_t* ZipFile::readFileToMemory(const char* filename, size_t* size, const boo
 
   if (fileStat.method == 0) {  // MZ_NO_COMPRESSION = 0
     // no deflation, just read content
-    const size_t dataRead = file.read(data, inflatedDataSize);
+    const int dataRead = file.read(data, inflatedDataSize);
     if (!wasOpen) {
       close();
     }
 
-    if (dataRead != inflatedDataSize) {
+    if (dataRead < 0 || static_cast<size_t>(dataRead) != inflatedDataSize) {
       Serial.printf("[%lu] [ZIP] Failed to read data\n", millis());
       free(data);
       return nullptr;
@@ -523,12 +530,12 @@ uint8_t* ZipFile::readFileToMemory(const char* filename, size_t* size, const boo
       return nullptr;
     }
 
-    const size_t dataRead = file.read(deflatedData, deflatedDataSize);
+    const int dataRead = file.read(deflatedData, deflatedDataSize);
     if (!wasOpen) {
       close();
     }
 
-    if (dataRead != deflatedDataSize) {
+    if (dataRead < 0 || static_cast<size_t>(dataRead) != deflatedDataSize) {
       Serial.printf("[%lu] [ZIP] Failed to read data, expected %d got %d\n", millis(), deflatedDataSize, dataRead);
       free(deflatedData);
       free(data);
@@ -594,8 +601,13 @@ bool ZipFile::readFileToStream(const char* filename, Print& out, const size_t ch
 
     size_t remaining = inflatedDataSize;
     while (remaining > 0) {
-      const size_t dataRead = file.read(buffer, remaining < chunkSize ? remaining : chunkSize);
-      if (dataRead == 0) {
+      const int rawRead = file.read(buffer, remaining < chunkSize ? remaining : chunkSize);
+      if (rawRead <= 0) {
+        // 0 == premature EOF, <0 == I/O error. Both are fatal for this
+        // stream. Previously we stored the result in size_t and compared
+        // against 0 only — a -1 error return became SIZE_MAX, bypassed
+        // the check, got fed to out.write() as a bogus length, and then
+        // overflowed `remaining` on the subtraction.
         Serial.printf("[%lu] [ZIP] Could not read more bytes\n", millis());
         free(buffer);
         if (!wasOpen) {
@@ -603,6 +615,7 @@ bool ZipFile::readFileToStream(const char* filename, Print& out, const size_t ch
         }
         return false;
       }
+      const size_t dataRead = static_cast<size_t>(rawRead);
 
       out.write(buffer, dataRead);
       remaining -= dataRead;
@@ -657,15 +670,16 @@ bool ZipFile::readFileToStream(const char* filename, Print& out, const size_t ch
           break;  // EOF
         }
 
-        fileReadBufferFilledBytes =
+        const int rawFillRead =
             file.read(fileReadBuffer, fileRemainingBytes < chunkSize ? fileRemainingBytes : chunkSize);
+        if (rawFillRead <= 0) {
+          // 0 == premature EOF, <0 == I/O error — both fatal.
+          // Previously stored into size_t, turning -1 into SIZE_MAX.
+          break;  // EOF / error
+        }
+        fileReadBufferFilledBytes = static_cast<size_t>(rawFillRead);
         fileRemainingBytes -= fileReadBufferFilledBytes;
         fileReadBufferCursor = 0;
-
-        if (fileReadBufferFilledBytes == 0) {
-          // Bad read
-          break;  // EOF
-        }
       }
 
       // Available bytes in fileReadBuffer to process

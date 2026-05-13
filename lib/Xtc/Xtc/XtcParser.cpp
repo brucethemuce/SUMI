@@ -88,8 +88,12 @@ void XtcParser::close() {
 
 XtcError XtcParser::readHeader() {
   // Read first 56 bytes of header
-  size_t bytesRead = m_file.read(reinterpret_cast<uint8_t*>(&m_header), sizeof(XtcHeader));
-  if (bytesRead != sizeof(XtcHeader)) {
+  const int bytesRead = m_file.read(reinterpret_cast<uint8_t*>(&m_header), sizeof(XtcHeader));
+  if (bytesRead < 0) {
+    Serial.printf("[XTC] Read error at line %d\n", __LINE__);
+    return XtcError::READ_ERROR;
+  }
+  if (static_cast<size_t>(bytesRead) != sizeof(XtcHeader)) {
     return XtcError::READ_ERROR;
   }
 
@@ -187,13 +191,27 @@ XtcError XtcParser::readPageTable() {
     return XtcError::READ_ERROR;
   }
 
+  // Sanity cap on pageCount to prevent OOM on corrupt headers. The field is
+  // uint16_t, so an untrusted value could reach 65535 — reserving ~1.6 MB
+  // of PageTableEntry, which won't fit in ESP32-C3's 380 KB of heap.
+  constexpr uint16_t kMaxXtcPages = 4096;
+  if (m_header.pageCount > kMaxXtcPages) {
+    Serial.printf("[%lu] [XTC] Implausible pageCount %u (max %u), rejecting\n",
+                  millis(), m_header.pageCount, kMaxXtcPages);
+    return XtcError::CORRUPTED_HEADER;
+  }
+
   m_pageTable.resize(m_header.pageCount);
 
   // Read page table entries
   for (uint16_t i = 0; i < m_header.pageCount; i++) {
     PageTableEntry entry;
-    size_t bytesRead = m_file.read(reinterpret_cast<uint8_t*>(&entry), sizeof(PageTableEntry));
-    if (bytesRead != sizeof(PageTableEntry)) {
+    const int bytesRead = m_file.read(reinterpret_cast<uint8_t*>(&entry), sizeof(PageTableEntry));
+    if (bytesRead < 0) {
+      Serial.printf("[XTC] Read error at line %d (page table entry %u)\n", __LINE__, i);
+      return XtcError::READ_ERROR;
+    }
+    if (static_cast<size_t>(bytesRead) != sizeof(PageTableEntry)) {
       Serial.printf("[%lu] [XTC] Failed to read page table entry %u\n", millis(), i);
       return XtcError::READ_ERROR;
     }
@@ -281,7 +299,19 @@ XtcError XtcParser::readChapters() {
     char nameBuf[81];
     memcpy(nameBuf, chapterBuf.data(), 80);
     nameBuf[80] = '\0';
-    const size_t nameLen = strnlen(nameBuf, 80);
+    size_t nameLen = strnlen(nameBuf, 80);
+    // Walk back from the 80-byte cap so the chapter title doesn't end in
+    // the middle of a multi-byte UTF-8 codepoint. A CJK chapter title like
+    // "第一章：スタート" truncated at byte 80 would otherwise leak a broken
+    // lead byte into the TOC list and render as '?' on the device.
+    while (nameLen > 0
+           && (static_cast<unsigned char>(nameBuf[nameLen - 1]) & 0xC0) == 0x80) {
+      --nameLen;
+    }
+    if (nameLen > 0) {
+      const unsigned char lead = static_cast<unsigned char>(nameBuf[nameLen - 1]);
+      if (lead >= 0xC0) --nameLen;  // partial lead byte with no continuation
+    }
     std::string name(nameBuf, nameLen);
 
     uint16_t startPage = 0;
@@ -351,8 +381,13 @@ size_t XtcParser::loadPage(uint32_t pageIndex, uint8_t* buffer, size_t bufferSiz
 
   // Read page header (XTG for 1-bit, XTH for 2-bit - same structure)
   XtgPageHeader pageHeader;
-  size_t headerRead = m_file.read(reinterpret_cast<uint8_t*>(&pageHeader), sizeof(XtgPageHeader));
-  if (headerRead != sizeof(XtgPageHeader)) {
+  const int headerRead = m_file.read(reinterpret_cast<uint8_t*>(&pageHeader), sizeof(XtgPageHeader));
+  if (headerRead < 0) {
+    Serial.printf("[XTC] Read error at line %d (page %u header)\n", __LINE__, pageIndex);
+    m_lastError = XtcError::READ_ERROR;
+    return 0;
+  }
+  if (static_cast<size_t>(headerRead) != sizeof(XtgPageHeader)) {
     Serial.printf("[%lu] [XTC] Failed to read page header for page %u\n", millis(), pageIndex);
     m_lastError = XtcError::READ_ERROR;
     return 0;
@@ -386,15 +421,20 @@ size_t XtcParser::loadPage(uint32_t pageIndex, uint8_t* buffer, size_t bufferSiz
   }
 
   // Read bitmap data
-  size_t bytesRead = m_file.read(buffer, bitmapSize);
-  if (bytesRead != bitmapSize) {
-    Serial.printf("[%lu] [XTC] Page read error: expected %u, got %u\n", millis(), bitmapSize, bytesRead);
+  const int bytesRead = m_file.read(buffer, bitmapSize);
+  if (bytesRead < 0) {
+    Serial.printf("[XTC] Read error at line %d (page %u bitmap)\n", __LINE__, pageIndex);
+    m_lastError = XtcError::READ_ERROR;
+    return 0;
+  }
+  if (static_cast<size_t>(bytesRead) != bitmapSize) {
+    Serial.printf("[%lu] [XTC] Page read error: expected %u, got %d\n", millis(), bitmapSize, bytesRead);
     m_lastError = XtcError::READ_ERROR;
     return 0;
   }
 
   m_lastError = XtcError::OK;
-  return bytesRead;
+  return static_cast<size_t>(bytesRead);
 }
 
 XtcError XtcParser::loadPageStreaming(uint32_t pageIndex,
@@ -417,9 +457,9 @@ XtcError XtcParser::loadPageStreaming(uint32_t pageIndex,
 
   // Read and skip page header (XTG for 1-bit, XTH for 2-bit)
   XtgPageHeader pageHeader;
-  size_t headerRead = m_file.read(reinterpret_cast<uint8_t*>(&pageHeader), sizeof(XtgPageHeader));
+  const int headerRead = m_file.read(reinterpret_cast<uint8_t*>(&pageHeader), sizeof(XtgPageHeader));
   const uint32_t expectedMagic = (m_bitDepth == 2) ? XTH_MAGIC : XTG_MAGIC;
-  if (headerRead != sizeof(XtgPageHeader) || pageHeader.magic != expectedMagic) {
+  if (headerRead < 0 || static_cast<size_t>(headerRead) != sizeof(XtgPageHeader) || pageHeader.magic != expectedMagic) {
     return XtcError::READ_ERROR;
   }
 
@@ -438,12 +478,17 @@ XtcError XtcParser::loadPageStreaming(uint32_t pageIndex,
   size_t totalRead = 0;
 
   while (totalRead < bitmapSize) {
-    size_t toRead = std::min(chunkSize, bitmapSize - totalRead);
-    size_t bytesRead = m_file.read(chunk.data(), toRead);
-
-    if (bytesRead == 0) {
+    const size_t toRead = std::min(chunkSize, bitmapSize - totalRead);
+    // FsFile::read returns int; treat anything non-positive as a fatal
+    // read error. Previously stored into size_t, which turned a -1 error
+    // into SIZE_MAX, fed that to callback() as the 'bytes available' arg,
+    // and then totalRead += SIZE_MAX overflowed to exit the loop without
+    // reporting failure.
+    const int rawRead = m_file.read(chunk.data(), toRead);
+    if (rawRead <= 0) {
       return XtcError::READ_ERROR;
     }
+    const size_t bytesRead = static_cast<size_t>(rawRead);
 
     callback(chunk.data(), bytesRead, totalRead);
     totalRead += bytesRead;
@@ -459,10 +504,10 @@ bool XtcParser::isValidXtcFile(const char* filepath) {
   }
 
   uint32_t magic = 0;
-  size_t bytesRead = file.read(reinterpret_cast<uint8_t*>(&magic), sizeof(magic));
+  const int bytesRead = file.read(reinterpret_cast<uint8_t*>(&magic), sizeof(magic));
   file.close();
 
-  if (bytesRead != sizeof(magic)) {
+  if (bytesRead < 0 || static_cast<size_t>(bytesRead) != sizeof(magic)) {
     return false;
   }
 

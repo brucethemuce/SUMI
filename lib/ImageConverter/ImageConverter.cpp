@@ -51,8 +51,13 @@ class BmpImageConverter : public ImageConverter {
     (void)config;
     uint8_t buffer[512];
     while (input.available()) {
-      size_t bytesRead = input.read(buffer, sizeof(buffer));
-      if (output.write(buffer, bytesRead) != bytesRead) {
+      // FsFile::read returns int — -1 on error. Storing directly into
+      // size_t would turn that into SIZE_MAX and feed a bogus length to
+      // Print::write, which would then iterate into unmapped memory.
+      const int bytesRead = input.read(buffer, sizeof(buffer));
+      if (bytesRead <= 0) return false;
+      const size_t n = static_cast<size_t>(bytesRead);
+      if (output.write(buffer, n) != n) {
         return false;
       }
     }
@@ -104,8 +109,8 @@ bool ImageConverterFactory::convertToBmp(const std::string& inputPath, const std
 
   const bool success = converter->convert(inputFile, outputFile, config);
 
-  inputFile.close();
-  outputFile.close();
+  inputFile.close();                 // reader — no sync needed
+  SdMan.syncAndClose(outputFile);    // writer — force dirty sectors to disk
 
   if (success) {
     Serial.printf("[%lu] [%s] Converted %s to BMP: %s\n", millis(), config.logTag, converter->formatName(),

@@ -4,12 +4,16 @@
 #include <ComicReader.h>
 #include <ContentParser.h>
 #include <CoverHelpers.h>
+#include <Dictionary.h>
 #include <Epub/Page.h>
 #include <Epub/blocks/ImageBlock.h>
 #include <EpubChapterParser.h>
 #include <GfxRenderer.h>
+#include <LookupHistory.h>
 #include <MarkdownParser.h>
 #include <PageCache.h>
+#include <ReadingStats.h>
+#include <Utf8.h>
 #include <PlainTextParser.h>
 #include <SDCardManager.h>
 #include <Serialization.h>
@@ -22,6 +26,8 @@
 #include "../ble/BleHid.h"
 #endif
 
+#include "../content/GlobalBookmarkIndex.h"
+
 #include <cstring>
 #include <algorithm>
 
@@ -33,8 +39,12 @@
 #include "../content/ReaderNavigation.h"
 #include "../content/RecentBooks.h"
 #include "../core/Core.h"
+#include "../core/InputDrainGuard.h"
 #include "../ui/Elements.h"
 #include "ThemeManager.h"
+
+// Global reading stats instance (defined in main.cpp)
+extern sumi::ReadingStats readingStats;
 
 namespace sumi {
 
@@ -65,7 +75,7 @@ void ReaderState::saveAnchorMap(const ContentParser& parser, const std::string& 
   if (anchors.size() > UINT16_MAX) {
     uint16_t zero = 0;
     serialization::writePod(file, zero);
-    file.close();
+    SdMan.syncAndClose(file);
     return;
   }
   uint16_t count = static_cast<uint16_t>(anchors.size());
@@ -74,7 +84,7 @@ void ReaderState::saveAnchorMap(const ContentParser& parser, const std::string& 
     serialization::writeString(file, entry.first);
     serialization::writePod(file, entry.second);
   }
-  file.close();
+  SdMan.syncAndClose(file);
 }
 
 int ReaderState::loadAnchorPage(const std::string& cachePath, const std::string& anchor) {
@@ -84,6 +94,18 @@ int ReaderState::loadAnchorPage(const std::string& cachePath, const std::string&
 
   uint16_t count;
   if (!serialization::readPodChecked(file, count)) {
+    file.close();
+    return -1;
+  }
+
+  // Sanity cap: a corrupted .anchors header with count=65535 would
+  // otherwise drive 65535 readString()+emplace() loop iterations which
+  // could OOM the 380KB-heap ESP32-C3. Real EPUBs rarely exceed ~500
+  // anchors per chapter; 4096 is a safe ceiling that catches garbage
+  // without rejecting any plausible content.
+  constexpr uint16_t kMaxAnchors = 4096;
+  if (count > kMaxAnchors) {
+    Serial.printf("[READER] Anchor count %u exceeds max %u, discarding\n", count, kMaxAnchors);
     file.close();
     return -1;
   }
@@ -121,7 +143,15 @@ void ReaderState::createOrExtendCacheImpl(ContentParser& parser, const std::stri
   bool needsExtend = false;
 
   if (!pageCache_) {
-    pageCache_.reset(new PageCache(cachePath));
+    // nothrow + null check (matches loadCacheFromDisk): raw `new` would
+    // abort the device on heap exhaustion. The block below null-checks
+    // `pageCache_` before dereferencing, so a null result is safe.
+    auto* pc = new (std::nothrow) PageCache(cachePath);
+    if (!pc) {
+      Serial.println("[READER] PageCache alloc failed in createOrExtendCacheImpl");
+      return;
+    }
+    pageCache_.reset(pc);
     if (pageCache_->load(config)) {
       if (!SdMan.exists((cachePath + ".anchors").c_str())) {
         needsCreate = true;  // Migration: rebuild cache to generate anchor map
@@ -163,8 +193,15 @@ void ReaderState::backgroundCacheImpl(ContentParser& parser, const std::string& 
     return;
   }
 
-  // Create/load cache (we own pageCache_ while task is running)
-  pageCache_.reset(new PageCache(cachePath));
+  // Create/load cache (we own pageCache_ while task is running). nothrow:
+  // raw `new` would abort the background task with no chance for the
+  // main thread to recover the reader.
+  auto* pc = new (std::nothrow) PageCache(cachePath);
+  if (!pc) {
+    Serial.println("[READER] PageCache alloc failed in backgroundCacheImpl");
+    return;
+  }
+  pageCache_.reset(pc);
   bool loaded = pageCache_->load(config);
   // Migration: rebuild cache to generate anchor map if missing
   if (loaded && !SdMan.exists((cachePath + ".anchors").c_str())) {
@@ -217,14 +254,16 @@ ReaderState::~ReaderState() { stopBackgroundCaching(); }
 
 void ReaderState::setContentPath(const char* path) {
   if (path) {
-    strncpy(contentPath_, path, sizeof(contentPath_) - 1);
-    contentPath_[sizeof(contentPath_) - 1] = '\0';
+    utf8SafeCopy(contentPath_, path, sizeof(contentPath_));
   } else {
     contentPath_[0] = '\0';
   }
 }
 
 void ReaderState::enter(Core& core) {
+  // Drain queued button events so a power-button wake doesn't page-turn
+  InputDrainGuard::drain(core);
+
   // Free memory from other states before loading book
   THEME_MANAGER.clearCache();
   renderer_.clearWidthCache();
@@ -237,6 +276,8 @@ void ReaderState::enter(Core& core) {
   needsRender_ = true;
   tocMode_ = false;
   settingsMode_ = false;
+  bookmarkListMode_ = false;
+  globalBookmarkMode_ = false;
   centerLongPressFired_ = false;
   enterTime_ = millis();
   pagesUntilFullRefresh_ = 1;  // Use HALF_REFRESH on first render (FULL causes 5 flashes)
@@ -249,8 +290,7 @@ void ReaderState::enter(Core& core) {
 
   // Read path from shared buffer if not already set
   if (contentPath_[0] == '\0' && core.buf.path[0] != '\0') {
-    strncpy(contentPath_, core.buf.path, sizeof(contentPath_) - 1);
-    contentPath_[sizeof(contentPath_) - 1] = '\0';
+    utf8SafeCopy(contentPath_, core.buf.path, sizeof(contentPath_));
     core.buf.path[0] = '\0';
   }
 
@@ -259,10 +299,26 @@ void ReaderState::enter(Core& core) {
 
   Serial.printf("[READER] Entering with path: %s\n", contentPath_);
 
+  // Crash resilience: record that we are attempting to open a book.
+  // If the device reboots before render() clears this, the next boot
+  // will skip straight to Home instead of retrying the same crash.
+  core.settings.readerLoadAttempts++;
+  {
+    SdMan.mkdir(SUMI_DIR);
+    FsFile guard;
+    if (SdMan.openFileForWrite("RDR", SUMI_DIR "/reader_guard.bin", guard)) {
+      guard.write(&core.settings.readerLoadAttempts, 1);
+      SdMan.syncAndClose(guard);
+    }
+  }
+
   if (contentPath_[0] == '\0') {
     Serial.println("[READER] No content path set");
     return;
   }
+
+  // Start reading statistics session
+  readingStats.startSession(ReadingStats::hashPath(contentPath_));
 
   // Apply orientation setting to renderer
   switch (core.settings.orientation) {
@@ -283,11 +339,20 @@ void ReaderState::enter(Core& core) {
       break;
   }
 
-  // Set framebuffer as fallback ZIP dictionary for when arena is unavailable (BLE connected)
-  MemoryArena::fallbackBuffer = renderer_.getFrameBuffer();
+  // (v1 aliased the framebuffer as a ZIP-dictionary fallback for when
+  //  the arena was released for BLE; v2 never releases the arena, so
+  //  the alias is gone — Epub.cpp always uses MemoryArena::zipBuffer.)
 
-  // Open content using ContentHandle
-  auto result = core.content.open(contentPath_, SUMI_CACHE_DIR);
+  // Open content using ContentHandle. ContentHandle::open() and the
+  // EPUB parser inside it use new (std::nothrow) plus Result<void>
+  // returns for OOM, so we get an Error::OutOfMemory back without an
+  // exception. With -fexceptions OFF (see platformio.ini), any rogue
+  // throwing-`new` deeper in the stack would abort the chip, and the
+  // boot-loop guard handles that on the next boot. The previous
+  // try/catch around this call was dead code under -fno-exceptions.
+  // Audit #2.
+  Result<void> result = core.content.open(contentPath_, SUMI_CACHE_DIR);
+
   if (!result.ok()) {
     Serial.printf("[READER] Failed to open content: %s\n", errorToString(result.err));
     // Store error message for ErrorState to display
@@ -298,9 +363,9 @@ void ReaderState::enter(Core& core) {
 
   contentLoaded_ = true;
 
-  // Save last book path to settings
-  strncpy(core.settings.lastBookPath, contentPath_, sizeof(core.settings.lastBookPath) - 1);
-  core.settings.lastBookPath[sizeof(core.settings.lastBookPath) - 1] = '\0';
+  // Save last book path to settings. utf8SafeCopy null-terminates at the
+  // last full codepoint boundary so CJK book filenames survive saves.
+  utf8SafeCopy(core.settings.lastBookPath, contentPath_, sizeof(core.settings.lastBookPath));
   core.settings.save(core.storage);
   
   // Record in recent books list
@@ -402,6 +467,17 @@ void ReaderState::enter(Core& core) {
 void ReaderState::exit(Core& core) {
   Serial.println("[READER] Exiting");
 
+  // Clean reader exit — clear the crash guard so next boot resumes
+  // normally. This is the real "reader survived" signal (not first-page
+  // render, which happens before the background cache task can crash).
+  if (core.settings.readerLoadAttempts > 0) {
+    core.settings.readerLoadAttempts = 0;
+    SdMan.remove(SUMI_DIR "/reader_guard.bin");
+  }
+
+  // End reading statistics session (saves accumulated time to SD)
+  readingStats.endSession();
+
   // Stop background caching task first - BackgroundTask::stop() waits properly
   stopBackgroundCaching();
 
@@ -454,7 +530,8 @@ void ReaderState::exit(Core& core) {
     core.content.close();
   }
 
-  MemoryArena::fallbackBuffer = nullptr;
+  // (v1 cleared MemoryArena::fallbackBuffer here. v2 has no
+  //  fallbackBuffer; nothing to clear.)
 
   // Unload custom reader fonts to free memory
   // Explicit cleanup ensures predictable memory behavior and better logging
@@ -490,6 +567,22 @@ StateTransition ReaderState::update(Core& core) {
     autoTurnLastMs_ = 0;
 
     // Route input to overlay handlers
+    if (dictStage_ != DictStage::None) {
+      handleDictInput(core, e);
+      continue;
+    }
+    if (bookmarkListMode_) {
+      handleBookmarkListInput(core, e);
+      continue;
+    }
+    if (globalBookmarkMode_) {
+      handleGlobalBookmarkInput(core, e);
+      continue;
+    }
+    if (historyMode_) {
+      handleHistoryInput(core, e);
+      continue;
+    }
     if (settingsMode_) {
       handleSettingsInput(core, e);
       continue;
@@ -502,34 +595,48 @@ StateTransition ReaderState::update(Core& core) {
     switch (e.type) {
       case EventType::ButtonPress:
         if (landscapeScroll_) {
-          // Landscape scroll: Up/Down scroll within page, Left/Right navigate pages
-          // Divide content into exactly 3 scroll sections (top, middle, bottom)
+          // Landscape scroll: Up/Down scroll within page, Left/Right navigate pages.
+          // When sideButtonLayout == NextPrev, the physical top button (Up)
+          // means "next", so Up goes FORWARD through the content and Down
+          // goes BACKWARD.
           const int screenH = renderer_.getScreenHeight();
           const int maxScroll = pageContentHeight_ - screenH;
           const int scrollStep = (maxScroll > 0) ? ((maxScroll + 1) / 2) : screenH;
-          switch (e.button) {
-            case Button::Down:
-            case Button::Left: {
-              if (maxScroll > 0 && scrollY_ < maxScroll) {
-                scrollY_ = std::min(scrollY_ + scrollStep, maxScroll);
-                needsRender_ = true;
-              } else {
-                scrollY_ = 0;
-                pageContentHeight_ = 0;
-                navigateNext(core);
-              }
-              break;
+          const bool sideNextPrev = core.settings.sideButtonLayout == Settings::NextPrev;
+          const auto scrollForward = [&]() {
+            if (maxScroll > 0 && scrollY_ < maxScroll) {
+              scrollY_ = std::min(scrollY_ + scrollStep, maxScroll);
+              needsRender_ = true;
+            } else {
+              scrollY_ = 0;
+              pageContentHeight_ = 0;
+              navigateNext(core);
             }
-            case Button::Up:
+          };
+          const auto scrollBackward = [&]() {
+            if (scrollY_ > 0) {
+              scrollY_ = std::max(0, scrollY_ - scrollStep);
+              needsRender_ = true;
+            } else {
+              scrollY_ = 0;
+              pageContentHeight_ = 0;
+              navigatePrev(core);
+            }
+          };
+          switch (e.button) {
+            case Button::Left:
+              scrollForward();
+              break;
             case Button::Right:
-              if (scrollY_ > 0) {
-                scrollY_ = std::max(0, scrollY_ - scrollStep);
-                needsRender_ = true;
-              } else {
-                scrollY_ = 0;
-                pageContentHeight_ = 0;
-                navigatePrev(core);
-              }
+              scrollBackward();
+              break;
+            case Button::Down:
+              if (sideNextPrev) scrollBackward();
+              else              scrollForward();
+              break;
+            case Button::Up:
+              if (sideNextPrev) scrollForward();
+              else              scrollBackward();
               break;
             case Button::Center:
               // Defer to ButtonRelease — allows long-press to open settings first
@@ -549,20 +656,35 @@ StateTransition ReaderState::update(Core& core) {
                 }
               } else if (core.settings.shortPwrBtn == Settings::PowerRefresh) {
                 renderer_.displayBuffer(EInkDisplay::FULL_REFRESH);
+              } else {
+                // Default (PowerIgnore): open in-reader settings overlay.
+                enterSettingsMode(core);
               }
               break;
           }
         } else {
-        // Normal portrait mode
+        // Normal portrait mode. Left/Right are fixed (L=prev, R=next).
+        // Up/Down honour sideButtonLayout so "top button → next page"
+        // works inside the reader without disturbing menu navigation
+        // anywhere else in the UI.
+        const bool sideNextPrev = core.settings.sideButtonLayout == Settings::NextPrev;
         switch (e.button) {
           case Button::Right:
-          case Button::Down:
             navigateNext(core);
             break;
 
+          case Button::Down:
+            if (sideNextPrev) navigatePrev(core);
+            else              navigateNext(core);
+            break;
+
           case Button::Left:
-          case Button::Up:
             navigatePrev(core);
+            break;
+
+          case Button::Up:
+            if (sideNextPrev) navigateNext(core);
+            else              navigatePrev(core);
             break;
 
           case Button::Center:
@@ -577,6 +699,9 @@ StateTransition ReaderState::update(Core& core) {
             } else if (core.settings.shortPwrBtn == Settings::PowerRefresh) {
               // Manual screen refresh — clear ghosting
               renderer_.displayBuffer(EInkDisplay::FULL_REFRESH);
+            } else {
+              // Default (PowerIgnore): open in-reader settings overlay.
+              enterSettingsMode(core);
             }
             break;
         }
@@ -598,7 +723,8 @@ StateTransition ReaderState::update(Core& core) {
           if (centerLongPressFired_) {
             // Long press already handled — suppress short-press action
             centerLongPressFired_ = false;
-          } else if (!settingsMode_ && !tocMode_ && millis() - enterTime_ > 1500) {
+          } else if (!settingsMode_ && !tocMode_ && dictStage_ == DictStage::None &&
+                     millis() - enterTime_ > 1500) {
             // Short press Center: open TOC (guard prevents stale release from book-open button)
             if (core.content.tocCount() > 0) {
               enterTocMode(core);
@@ -670,7 +796,7 @@ StateTransition ReaderState::update(Core& core) {
   // Auto page turn (CrossPoint #1219): advance one page on timer expiry.
   // Reset timer on any manual input (handled by event loop setting autoTurnLastMs_=0).
   const uint32_t autoInterval = core.settings.getAutoPageTurnMs();
-  if (autoInterval > 0 && !settingsMode_ && !tocMode_) {
+  if (autoInterval > 0 && !settingsMode_ && !tocMode_ && !bookmarkListMode_ && !globalBookmarkMode_ && dictStage_ == DictStage::None) {
     const uint32_t now = millis();
     if (autoTurnLastMs_ == 0) {
       autoTurnLastMs_ = now;  // Initialize on first check
@@ -690,7 +816,49 @@ void ReaderState::render(Core& core) {
     return;
   }
 
-  if (settingsMode_) {
+  // Stop the bg cache task before touching the renderer. Two reasons:
+  // (1) CONCURRENCY.md C1: GfxRenderer's wordWidthCache is single-owner;
+  //     calling clearScreen/drawText/getTextWidth from main while the bg
+  //     task is alive races on that cache. The renderer logs warnings
+  //     (rate-limited) but doesn't actually serialize the access.
+  // (2) Peak heap: with BLE active the heap is ~20 KB free; if both the
+  //     bg parser and the main-task render allocate concurrently, the
+  //     parser's safety threshold (4 KB) trips inside startElement and
+  //     the cache extend fails — user gets stuck at the last cached
+  //     page with no way past. Empirically reproduced via [HP] log
+  //     timeline. Resume bg caching at the bottom of render() — by then
+  //     the heavy allocation is over and the bg task has room to work.
+  stopBackgroundCaching();
+
+  // Note: renderCurrentPage allocates during layout (vectors, strings,
+  // hash nodes inside parser_). With -fexceptions OFF (see platformio.ini
+  // — keeping it off saves ~4 KB of LwIP DRAM), a failed `new` calls
+  // std::terminate() → abort. The previous version of this code wrapped
+  // the dispatch in a try/catch, but the catch handlers were dead code
+  // — uncaught throws can't unwind to a handler when exceptions are
+  // disabled. The crash recovery story is now solely: abort →
+  // bootloader → next boot increments core.settings.readerLoadAttempts
+  // → boot-loop guard skips reader auto-resume after 3 attempts.
+  // Audit #2.
+
+  if (dictStage_ != DictStage::None) {
+    renderDictOverlay(core);
+  } else if (bookmarkListMode_) {
+    if (bookmarkView_.needsRender) {
+      ui::render(renderer_, THEME_MANAGER.current(), bookmarkView_);
+      bookmarkView_.needsRender = false;
+    }
+  } else if (globalBookmarkMode_) {
+    if (globalBookmarkView_.needsRender) {
+      ui::render(renderer_, THEME_MANAGER.current(), globalBookmarkView_);
+      globalBookmarkView_.needsRender = false;
+    }
+  } else if (historyMode_) {
+    if (historyView_.needsRender) {
+      ui::render(renderer_, THEME_MANAGER.current(), historyView_);
+      historyView_.needsRender = false;
+    }
+  } else if (settingsMode_) {
     renderSettingsOverlay(core);
   } else if (tocMode_) {
     renderTocOverlay(core);
@@ -704,12 +872,46 @@ void ReaderState::render(Core& core) {
     // during which InputManager may fire new long-press events. Without this reset, the
     // 1500ms guard set in enter() expires during render and those events trigger settings/TOC.
     enterTime_ = millis();
+
+    // [HP] post-render heap timeline (diagnostic for BLE page-turner crashes).
+    // Pairs with the "[HP] nav" line in applyNavResult to bracket the render's
+    // heap delta; if largest drops sharply between nav and render, the render
+    // path is the leak/fragmenter.
+#if FEATURE_BLUETOOTH
+    const int bleOn = ble::isConnected() ? 1 : 0;
+#else
+    const int bleOn = 0;
+#endif
+    Serial.printf("[HP] render: spine=%d page=%d flat=%u free=%lu largest=%lu ble=%d\n",
+                  currentSpineIndex_, currentSectionPage_, (unsigned)currentPage_,
+                  (unsigned long)ESP.getFreeHeap(),
+                  (unsigned long)ESP.getMaxAllocHeap(), bleOn);
+
+    // Crash resilience: DO NOT clear reader_guard.bin here. First-page
+    // render is not a sufficient signal of reader health — the background
+    // page cache task can still crash (seen with War and Peace: cover
+    // renders, then cache task std::bad_alloc aborts, boot loop). Guard
+    // is now cleared only on clean reader exit() or on the first user-
+    // initiated navigation (navigateNext/navigatePrev).
   }
 
   needsRender_ = false;
+
+  // Resume the bg cache task now that the main-task render is done. This
+  // is the paired restart for the stopBackgroundCaching() at the top of
+  // render(). The bg task will pick up cache extension if needed.
+  startBackgroundCaching(core);
 }
 
 void ReaderState::navigateNext(Core& core) {
+  // First user navigation is proof the reader is interactive — clear the
+  // crash guard so cover + cache init don't keep the guard set forever.
+  // If the device can render cover AND accept a button press, it's alive.
+  if (core.settings.readerLoadAttempts > 0) {
+    core.settings.readerLoadAttempts = 0;
+    SdMan.remove(SUMI_DIR "/reader_guard.bin");
+  }
+
   // Stop background task before accessing pageCache_ (ownership model)
   stopBackgroundCaching();
 
@@ -742,6 +944,7 @@ void ReaderState::navigateNext(Core& core) {
     }
     currentSectionPage_ = 0;
     needsRender_ = true;
+    readingStats.recordPageTurn();
     startBackgroundCaching(core);
     return;
   }
@@ -810,6 +1013,9 @@ void ReaderState::applyNavResult(const ReaderNavigation::NavResult& result, Core
   currentSectionPage_ = result.position.sectionPage;
   currentPage_ = result.position.flatPage;
   needsRender_ = result.needsRender;
+  if (result.needsRender) {
+    readingStats.recordPageTurn();
+  }
   scrollY_ = 0;  // Reset scroll for new page
   pageContentHeight_ = 0;
   if (result.needsCacheReset) {
@@ -817,7 +1023,26 @@ void ReaderState::applyNavResult(const ReaderNavigation::NavResult& result, Core
     parserSpineIndex_ = -1;
     pageCache_.reset();
   }
-  startBackgroundCaching(core);  // Resume caching
+  // If a render is coming, defer cache-task restart until after render()
+  // completes — otherwise the bg task and the upcoming main-task render
+  // contend for heap, blowing the parser's safety threshold under BLE
+  // pressure (CONCURRENCY.md C1). render() will resume caching at its end.
+  if (!needsRender_) {
+    startBackgroundCaching(core);
+  }
+
+  // [HP] page-turn heap timeline (diagnostic for BLE page-turner crashes).
+  // Grep "[HP] nav" in serial log to see free vs. largest-free across turns;
+  // a falling largest with stable free = fragmentation, falling free = leak.
+#if FEATURE_BLUETOOTH
+  const int bleOn = ble::isConnected() ? 1 : 0;
+#else
+  const int bleOn = 0;
+#endif
+  Serial.printf("[HP] nav: spine=%d page=%d flat=%u free=%lu largest=%lu ble=%d\n",
+                currentSpineIndex_, currentSectionPage_, (unsigned)currentPage_,
+                (unsigned long)ESP.getFreeHeap(),
+                (unsigned long)ESP.getMaxAllocHeap(), bleOn);
 }
 
 void ReaderState::renderCurrentPage(Core& core) {
@@ -1028,7 +1253,10 @@ void ReaderState::renderCachedPage(Core& core) {
     displayWithRefresh(core);
 
     // Grayscale text rendering (anti-aliasing) - skip for custom fonts (saves ~48KB)
-    if (core.settings.textAntiAliasing && !FONT_MANAGER.isUsingCustomReaderFont() &&
+    // Also skip when textDarkness >= 2 (Extra Dark/Maximum): all gray pixels are
+    // already rendered as black in BW mode, so the grayscale pass has nothing to add.
+    if (core.settings.textAntiAliasing && core.settings.textDarkness < 2 &&
+        !FONT_MANAGER.isUsingCustomReaderFont() &&
         renderer_.fontSupportsGrayscale(fontId) && renderer_.storeBwBuffer()) {
       renderer_.clearScreen(0x00);
       renderer_.setRenderMode(GfxRenderer::GRAYSCALE_LSB);
@@ -1116,9 +1344,17 @@ void ReaderState::loadCacheFromDisk(Core& core) {
     return;
   }
 
-  // Caller must have stopped background task (we own pageCache_)
+  // Caller must have stopped background task (we own pageCache_).
+  // nothrow + null check: raw `new` would abort the device under
+  // heap pressure; the rest of the function null-checks pageCache_,
+  // so a null result is safe as long as we don't dereference here.
   if (!pageCache_) {
-    pageCache_.reset(new PageCache(cachePath));
+    auto* pc = new (std::nothrow) PageCache(cachePath);
+    if (!pc) {
+      Serial.println("[READER] PageCache alloc failed in loadCacheFromDisk");
+      return;
+    }
+    pageCache_.reset(pc);
     if (!pageCache_->load(config)) {
       pageCache_.reset();
     }
@@ -1140,41 +1376,78 @@ void ReaderState::createOrExtendCache(Core& core) {
     auto epub = provider->getEpubShared();
     cachePath = epubSectionCachePath(epub->getCachePath(), currentSpineIndex_);
 
-    // Create parser if we don't have one (or if spine changed)
+    // Create parser if we don't have one (or if spine changed). nothrow
+    // matches the background-cache-task variant below — raw `new` would
+    // abort the device on heap exhaustion mid-page-render. Early return
+    // means `createOrExtendCacheImpl(*parser_, ...)` is never called
+    // with a null parser.
     if (!parser_ || parserSpineIndex_ != currentSpineIndex_) {
       std::string imageCachePath = core.settings.showImages ? (epub->getCachePath() + "/images") : "";
-      parser_.reset(new EpubChapterParser(epub, currentSpineIndex_, renderer_, config, imageCachePath));
+      auto* p = new (std::nothrow) EpubChapterParser(epub, currentSpineIndex_, renderer_, config, imageCachePath);
+      if (!p) {
+        Serial.println("[READER] EpubChapterParser alloc failed; skipping cache create/extend");
+        return;
+      }
+      parser_.reset(p);
       parserSpineIndex_ = currentSpineIndex_;
     }
   } else if (type == ContentType::Markdown) {
     cachePath = contentCachePath(core.content.cacheDir(), config.fontId);
     if (!parser_) {
-      parser_.reset(new MarkdownParser(contentPath_, renderer_, config));
+      auto* p = new (std::nothrow) MarkdownParser(contentPath_, renderer_, config);
+      if (!p) {
+        Serial.println("[READER] MarkdownParser alloc failed; skipping cache create/extend");
+        return;
+      }
+      parser_.reset(p);
       parserSpineIndex_ = 0;
     }
   } else {
     cachePath = contentCachePath(core.content.cacheDir(), config.fontId);
     if (!parser_) {
-      parser_.reset(new PlainTextParser(contentPath_, renderer_, config));
+      auto* p = new (std::nothrow) PlainTextParser(contentPath_, renderer_, config);
+      if (!p) {
+        Serial.println("[READER] PlainTextParser alloc failed; skipping cache create/extend");
+        return;
+      }
+      parser_.reset(p);
       parserSpineIndex_ = 0;
     }
   }
 
-  // Release primary buffer (32KB) before parsing when heap is tight or BLE is active.
-  // Parser uses framebuffer as ZIP dict (fallbackBuffer), not zipBuffer — safe to free.
-  // When BLE is connected, heap is fragmented (~110KB free vs ~160KB) and parser needs
-  // contiguous space for XML elements. Releasing 32KB gives the parser room to work.
-  const bool releasedPrimary = sumi::MemoryArena::primaryBuffer != nullptr
-                                && (ESP.getFreeHeap() < 30000
-                                    || sumi::MemoryArena::fallbackBuffer != nullptr);
-  if (releasedPrimary) {
-    sumi::MemoryArena::releasePrimary();
+  // (v1 used to releasePrimary() here when heap was tight or BLE was
+  //  active — the comment claimed the parser would use the framebuffer
+  //  as the ZIP dict via `fallbackBuffer`. In reality Epub.cpp always
+  //  used `zipBuffer` (the primary alias) and the fallback branch was
+  //  dead code. v2 keeps the arena permanently in .bss — no
+  //  release/reclaim possible, none needed.)
+  if (!parser_) return;  // shouldn't happen given the early returns above, defense-in-depth
+
+  // Temporarily release the external (CJK fallback) font during the
+  // parse. With BLE active, ~20 KB free heap is the entire budget for
+  // the parser, and the external font glyph cache eats several KB
+  // that the parser needs to reach the end of a long chapter. The
+  // parser doesn't render glyphs — it only measures widths via
+  // getTextWidth — and the built-in font handles ASCII fine; CJK
+  // widths fall back to the built-in font's missing-glyph metrics
+  // for the duration of the parse. Reload immediately after so the
+  // next page render has the font back.
+  ExternalFont* extFontPtr = FONT_MANAGER.getExternalFont();
+  char savedExtFont[32] = {0};
+  if (extFontPtr) {
+    utf8SafeCopy(savedExtFont, core.settings.readerFont, sizeof(savedExtFont));
+    Serial.printf("[READER] Releasing external font '%s' for parse (free=%lu before)\n",
+                  savedExtFont, (unsigned long)ESP.getFreeHeap());
+    FONT_MANAGER.unloadExternalFont();
+    Serial.printf("[READER] External font released (free=%lu after)\n",
+                  (unsigned long)ESP.getFreeHeap());
   }
 
   createOrExtendCacheImpl(*parser_, cachePath, config);
 
-  if (releasedPrimary) {
-    sumi::MemoryArena::reclaimPrimary();
+  if (savedExtFont[0] != '\0') {
+    Serial.printf("[READER] Reloading external font '%s' after parse\n", savedExtFont);
+    FONT_MANAGER.loadExternalFont(savedExtFont);
   }
 }
 
@@ -1433,6 +1706,22 @@ void ReaderState::startBackgroundCaching(Core& core) {
         const Theme& theme = THEME_MANAGER.current();
         Serial.println("[READER] Background cache task started");
 
+        // OOM story for the cache task. -fexceptions is off (see
+        // platformio.ini) — keeping it off saves ~4 KB of LwIP DRAM. So:
+        //   * The `new (std::nothrow) ...Parser(...)` calls below return
+        //     nullptr on alloc failure; we check and bail cleanly,
+        //     dropping the partial cache.
+        //   * Allocations deeper inside the parsers (std::vector,
+        //     std::string, hash nodes) still throw std::bad_alloc on
+        //     failure. With -fno-exceptions, an uncaught throw calls
+        //     std::terminate → abort. Boot-loop guard at next boot
+        //     increments core.settings.readerLoadAttempts and skips
+        //     reader auto-resume after 3 attempts. War-and-Peace-class
+        //     parse failures land here.
+        // The previous version of this code wrapped the body in a
+        // try/catch, but the catch handlers couldn't fire under
+        // -fno-exceptions. Audit #2.
+
         if (cacheTask_.shouldStop()) {
           Serial.println("[READER] Background cache task aborted (stop requested)");
           return;
@@ -1467,21 +1756,46 @@ void ReaderState::startBackgroundCaching(Core& core) {
               cachePath = epubSectionCachePath(epub->getCachePath(), spineToCache);
 
               if (!parser_ || parserSpineIndex_ != spineToCache) {
-                parser_.reset(
-                    new EpubChapterParser(provider->getEpubShared(), spineToCache, renderer_, config, imageCachePath));
+                auto* p = new (std::nothrow) EpubChapterParser(
+                    provider->getEpubShared(), spineToCache, renderer_,
+                    config, imageCachePath);
+                if (!p) {
+                  Serial.println("[READER] EpubChapterParser alloc failed; "
+                                 "dropping partial cache");
+                  pageCache_.reset();
+                  parser_.reset();
+                  return;
+                }
+                parser_.reset(p);
                 parserSpineIndex_ = spineToCache;
               }
             }
           } else if (type == ContentType::Markdown && !cacheTask_.shouldStop()) {
             cachePath = contentCachePath(coreRef.content.cacheDir(), config.fontId);
             if (!parser_) {
-              parser_.reset(new MarkdownParser(contentPath_, renderer_, config));
+              auto* p = new (std::nothrow) MarkdownParser(contentPath_, renderer_, config);
+              if (!p) {
+                Serial.println("[READER] MarkdownParser alloc failed; "
+                               "dropping partial cache");
+                pageCache_.reset();
+                parser_.reset();
+                return;
+              }
+              parser_.reset(p);
               parserSpineIndex_ = 0;
             }
           } else if (type == ContentType::Txt && !cacheTask_.shouldStop()) {
             cachePath = contentCachePath(coreRef.content.cacheDir(), config.fontId);
             if (!parser_) {
-              parser_.reset(new PlainTextParser(contentPath_, renderer_, config));
+              auto* p = new (std::nothrow) PlainTextParser(contentPath_, renderer_, config);
+              if (!p) {
+                Serial.println("[READER] PlainTextParser alloc failed; "
+                               "dropping partial cache");
+                pageCache_.reset();
+                parser_.reset();
+                return;
+              }
+              parser_.reset(p);
               parserSpineIndex_ = 0;
             }
           }
@@ -1507,14 +1821,21 @@ void ReaderState::startBackgroundCaching(Core& core) {
                 if (!SdMan.exists(nextCachePath.c_str()) && !cacheTask_.shouldStop()) {
                   Serial.printf("[READER] Pre-indexing next chapter (spine %d)\n", nextSpine);
                   std::string imageCachePath = coreRef.settings.showImages ? (epub->getCachePath() + "/images") : "";
-                  parser_.reset(new EpubChapterParser(provider->getEpubShared(), nextSpine, renderer_, config, imageCachePath));
-                  parserSpineIndex_ = nextSpine;
-                  // Release current cache — we're done with it, and building a new one
-                  pageCache_.reset();
-                  backgroundCacheImpl(*parser_, nextCachePath, config);
-                  // Don't keep the next chapter's cache in memory — it's saved to SD.
-                  // When the user actually navigates there, it loads from SD instantly.
-                  pageCache_.reset();
+                  auto* p = new (std::nothrow) EpubChapterParser(
+                      provider->getEpubShared(), nextSpine, renderer_, config, imageCachePath);
+                  if (!p) {
+                    Serial.println("[READER] Pre-index parser alloc failed; "
+                                   "skipping next-chapter cache");
+                  } else {
+                    parser_.reset(p);
+                    parserSpineIndex_ = nextSpine;
+                    // Release current cache — we're done with it, and building a new one
+                    pageCache_.reset();
+                    backgroundCacheImpl(*parser_, nextCachePath, config);
+                    // Don't keep the next chapter's cache in memory — it's saved to SD.
+                    // When the user actually navigates there, it loads from SD instantly.
+                    pageCache_.reset();
+                  }
                 }
               }
             }
@@ -1529,6 +1850,21 @@ void ReaderState::startBackgroundCaching(Core& core) {
         } else {
           Serial.println("[READER] Background cache task stopped");
         }
+
+        // Log stack high-water-mark so we can size the arena task stack
+        // region accurately. On arduino-esp32's IDF build
+        // uxTaskGetStackHighWaterMark returns BYTES (not words), despite
+        // FreeRTOS spec saying words — so no *4. The previous *4 version
+        // produced numbers larger than the stack and a uint-underflow peak.
+        TaskHandle_t h = cacheTask_.getHandle();
+        if (h) {
+          UBaseType_t remainingBytes = uxTaskGetStackHighWaterMark(h);
+          const unsigned total = (unsigned)sumi::MemoryArena::TASK_STACK_SIZE;
+          const unsigned free = (unsigned)remainingBytes;
+          const unsigned peak = (free <= total) ? (total - free) : 0;
+          Serial.printf("[MEM] PageCache stack high-water: %u bytes free of %u (peak %u used)\n",
+                        free, total, peak);
+        }
   };
 
   // Use arena task stack to avoid heap fragmentation from 24KB xTaskCreate allocation
@@ -1538,6 +1874,13 @@ void ReaderState::startBackgroundCaching(Core& core) {
   } else {
     cacheTask_.start("PageCache", kCacheTaskStackSize, std::move(taskBody), 0);
   }
+
+  // Publish the cacheTask handle so GfxRenderer's concurrency check can
+  // distinguish "main task forgot to stopBackgroundCaching" (warned) from
+  // "cacheTask is calling renderer for measurement" (allowed). The
+  // newly-spawned task may not have started running yet — that's fine,
+  // the check only matters once both tasks coexist. CONCURRENCY.md C1.
+  GfxRenderer::s_cacheTaskHandle_ = cacheTask_.getHandle();
 }
 
 void ReaderState::stopBackgroundCaching() {
@@ -1558,6 +1901,12 @@ void ReaderState::stopBackgroundCaching() {
   // pageCache_.reset() can trigger mutex ownership violations
   // (assert failed: xQueueGenericSend queue.c:832).
   vTaskDelay(10 / portTICK_PERIOD_MS);
+
+  // Clear the handle AFTER the task is provably stopped so any racing
+  // renderer call from cacheTask still sees its own handle. Once we
+  // clear, future main-task renderer calls find nullptr (no warning,
+  // because there's no bg task to be racing).
+  GfxRenderer::s_cacheTaskHandle_ = nullptr;
 }
 
 // ============================================================================
@@ -1673,11 +2022,18 @@ int ReaderState::findCurrentTocEntry(Core& core) {
       if (SdMan.openFileForRead("RDR", anchorPath, file)) {
         uint16_t count;
         if (serialization::readPodChecked(file, count)) {
-          for (uint16_t j = 0; j < count; j++) {
-            std::string id;
-            uint16_t page;
-            if (!serialization::readString(file, id) || !serialization::readPodChecked(file, page)) break;
-            anchors.emplace_back(std::move(id), page);
+          // Bound count before allocating — same cap as loadAnchorPage.
+          constexpr uint16_t kMaxAnchors = 4096;
+          if (count <= kMaxAnchors) {
+            anchors.reserve(count);
+            for (uint16_t j = 0; j < count; j++) {
+              std::string id;
+              uint16_t page;
+              if (!serialization::readString(file, id) || !serialization::readPodChecked(file, page)) break;
+              anchors.emplace_back(std::move(id), page);
+            }
+          } else {
+            Serial.printf("[READER] Anchor count %u exceeds max %u, skipping\n", count, kMaxAnchors);
           }
         }
         file.close();
@@ -1851,10 +2207,264 @@ void ReaderState::exitSettingsMode(Core& core) {
   Serial.println("[READER] Exited settings mode");
 }
 
+void ReaderState::handleHistoryInput(Core& core, const Event& e) {
+  if (e.type != EventType::ButtonPress) return;
+
+  switch (e.button) {
+    case Button::Up:
+      historyView_.moveUp();
+      needsRender_ = true;
+      break;
+
+    case Button::Down:
+      historyView_.moveDown();
+      needsRender_ = true;
+      break;
+
+    case Button::Center:
+    case Button::Right: {
+      // Re-look up the selected word
+      const auto* word = historyView_.selected();
+      if (word && !word->empty()) {
+        historyMode_ = false;
+        performDictLookup(core, *word);
+      }
+      break;
+    }
+
+    case Button::Left: {
+      // Delete selected word from history
+      const auto* word = historyView_.selected();
+      const char* cacheDir = core.content.cacheDir();
+      if (word && !word->empty() && cacheDir) {
+        sumi::LookupHistory::removeWord(cacheDir, *word);
+        // Reload
+        historyView_.words = sumi::LookupHistory::load(cacheDir);
+        if (historyView_.selectedIndex >= static_cast<int>(historyView_.words.size())) {
+          historyView_.selectedIndex = std::max(0, static_cast<int>(historyView_.words.size()) - 1);
+        }
+        historyView_.ensureVisible();
+        historyView_.needsRender = true;
+        needsRender_ = true;
+      }
+      break;
+    }
+
+    case Button::Back:
+      historyMode_ = false;
+      settingsMode_ = true;  // return to in-reader settings
+      settingsView_.needsRender = true;
+      needsRender_ = true;
+      break;
+
+    default:
+      break;
+  }
+}
+
+// ============================================================================
+// Bookmark List Overlay
+// ============================================================================
+
+void ReaderState::enterBookmarkList(Core& core) {
+  const char* cacheDir = core.content.cacheDir();
+  if (!cacheDir) return;
+  bookmarkView_.pages = sumi::Bookmarks::load(cacheDir);
+  bookmarkView_.totalBookPages = static_cast<int>(core.content.pageCount());
+  bookmarkView_.selectedIndex = 0;
+  bookmarkView_.scrollOffset = 0;
+  bookmarkView_.needsRender = true;
+  settingsMode_ = false;
+  bookmarkListMode_ = true;
+  needsRender_ = true;
+  Serial.printf("[BMK] Opened bookmark list (%d bookmarks)\n", (int)bookmarkView_.pages.size());
+}
+
+void ReaderState::handleBookmarkListInput(Core& core, const Event& e) {
+  if (e.type != EventType::ButtonPress) return;
+
+  switch (e.button) {
+    case Button::Up:
+      bookmarkView_.moveUp();
+      needsRender_ = true;
+      break;
+
+    case Button::Down:
+      bookmarkView_.moveDown();
+      needsRender_ = true;
+      break;
+
+    case Button::Center:
+    case Button::Right: {
+      // Jump to bookmarked page
+      uint32_t page = bookmarkView_.selectedPage();
+      if (page > 0 || (!bookmarkView_.pages.empty() && bookmarkView_.pages[0] == 0)) {
+        bookmarkListMode_ = false;
+        // Apply the page via the same mechanism as TOC jump for flat-page formats,
+        // or via spine navigation for EPUB
+        ContentType type = core.content.metadata().type;
+        if (type == ContentType::Xtc || type == ContentType::Comic) {
+          currentPage_ = page;
+        } else {
+          // For EPUB/Txt/Markdown, flatPage maps to currentPage_
+          currentPage_ = page;
+          // Reset section state so renderCurrentPage re-resolves
+          currentSectionPage_ = -1;
+          currentSpineIndex_ = 0;
+          parser_.reset();
+          parserSpineIndex_ = -1;
+          pageCache_.reset();
+        }
+        needsRender_ = true;
+        Serial.printf("[BMK] Jumped to bookmarked page %u\n", page);
+      }
+      break;
+    }
+
+    case Button::Left: {
+      // Delete bookmark
+      uint32_t page = bookmarkView_.selectedPage();
+      const char* cacheDir = core.content.cacheDir();
+      if (cacheDir && !bookmarkView_.pages.empty()) {
+        sumi::Bookmarks::toggle(cacheDir, page);
+        sumi::GlobalBookmarkIndex::removeBookmark(contentPath_, page);
+        bookmarkView_.pages = sumi::Bookmarks::load(cacheDir);
+        if (bookmarkView_.selectedIndex >= static_cast<int>(bookmarkView_.pages.size())) {
+          bookmarkView_.selectedIndex = std::max(0, static_cast<int>(bookmarkView_.pages.size()) - 1);
+        }
+        bookmarkView_.ensureVisible();
+        bookmarkView_.needsRender = true;
+        needsRender_ = true;
+      }
+      break;
+    }
+
+    case Button::Back:
+      bookmarkListMode_ = false;
+      settingsMode_ = true;
+      settingsView_.needsRender = true;
+      needsRender_ = true;
+      break;
+
+    default:
+      break;
+  }
+}
+
+// ============================================================================
+// Global Bookmark Index Overlay
+// ============================================================================
+
+void ReaderState::enterGlobalBookmarkList(Core& core) {
+  auto entries = sumi::GlobalBookmarkIndex::loadAll();
+  globalBookmarkView_.entries.clear();
+  globalBookmarkView_.entries.reserve(entries.size());
+  for (const auto& e : entries) {
+    ui::GlobalBookmarkListView::DisplayEntry de;
+    memset(&de, 0, sizeof(de));
+    utf8SafeCopy(de.bookTitle, e.bookTitle, sizeof(de.bookTitle));
+    utf8SafeCopy(de.snippet, e.snippet, sizeof(de.snippet));
+    de.page = e.page;
+    globalBookmarkView_.entries.push_back(de);
+  }
+  globalBookmarkView_.selectedIndex = 0;
+  globalBookmarkView_.scrollOffset = 0;
+  globalBookmarkView_.needsRender = true;
+  settingsMode_ = false;
+  globalBookmarkMode_ = true;
+  needsRender_ = true;
+  Serial.printf("[GBI] Opened global bookmark list (%d entries)\n",
+                (int)globalBookmarkView_.entries.size());
+}
+
+void ReaderState::handleGlobalBookmarkInput(Core& core, const Event& e) {
+  if (e.type != EventType::ButtonPress) return;
+
+  switch (e.button) {
+    case Button::Up:
+      globalBookmarkView_.moveUp();
+      needsRender_ = true;
+      break;
+
+    case Button::Down:
+      globalBookmarkView_.moveDown();
+      needsRender_ = true;
+      break;
+
+    case Button::Back:
+      globalBookmarkMode_ = false;
+      settingsMode_ = true;
+      settingsView_.needsRender = true;
+      needsRender_ = true;
+      break;
+
+    default:
+      break;
+  }
+}
+
 void ReaderState::handleSettingsInput(Core& core, const Event& e) {
   if (e.type != EventType::ButtonPress) {
     return;
   }
+
+  // Shared helper: when an Action-type row is active, dispatch by label
+  // (since Action is a single enum variant used for both Bluetooth and
+  // Look up Word). Returns true if an action was dispatched.
+  auto tryAction = [&]() -> bool {
+    const auto& def = settingsView_.DEFS[settingsView_.selected];
+    if (def.type != ui::InReaderSettingsView::SettingType::Action) return false;
+    if (def.label && def.label[0] == 'L') {
+      // "Lookup History" (label[7]=='H') vs "Look up Word" (label[7]=='W')
+      if (def.label[7] == 'H') {
+        const char* cacheDir = core.content.cacheDir();
+        if (cacheDir) {
+          historyView_.words = sumi::LookupHistory::load(cacheDir);
+          historyView_.selectedIndex = 0;
+          historyView_.scrollOffset = 0;
+          historyView_.needsRender = true;
+          settingsMode_ = false;
+          historyMode_ = true;
+          needsRender_ = true;
+        }
+        return true;
+      }
+      enterDictWordSelect(core);
+      return true;
+    }
+    if (def.label && def.label[0] == 'T' /* "Toggle Bookmark" */) {
+      const char* cacheDir = core.content.cacheDir();
+      if (cacheDir) {
+        bool added = sumi::Bookmarks::toggle(cacheDir, currentPage_);
+        Serial.printf("[BMK] %s bookmark at page %u\n", added ? "Added" : "Removed", currentPage_);
+        // Sync to global bookmark index
+        if (added) {
+          const char* title = core.content.metadata().title;
+          sumi::GlobalBookmarkIndex::addBookmark(contentPath_, title, currentPage_);
+        } else {
+          sumi::GlobalBookmarkIndex::removeBookmark(contentPath_, currentPage_);
+        }
+        loadInReaderSettings(core);
+        settingsView_.needsRender = true;
+        needsRender_ = true;
+      }
+      return true;
+    }
+    if (def.label && def.label[0] == 'V' /* "View Bookmarks" */) {
+      enterBookmarkList(core);
+      return true;
+    }
+    if (def.label && def.label[0] == 'A' /* "All Bookmarks" */) {
+      enterGlobalBookmarkList(core);
+      return true;
+    }
+#if FEATURE_BLUETOOTH
+    handleBleAction(core);
+    return true;
+#else
+    return false;
+#endif
+  };
 
   switch (e.button) {
     case Button::Up:
@@ -1868,13 +2478,7 @@ void ReaderState::handleSettingsInput(Core& core, const Event& e) {
       break;
 
     case Button::Left:
-#if FEATURE_BLUETOOTH
-      if (settingsView_.DEFS[settingsView_.selected].type ==
-          ui::InReaderSettingsView::SettingType::Action) {
-        handleBleAction(core);
-        break;
-      }
-#endif
+      if (tryAction()) break;
       settingsView_.cycleValue(-1);
       applyInReaderSettings(core);
       needsRender_ = true;
@@ -1882,13 +2486,7 @@ void ReaderState::handleSettingsInput(Core& core, const Event& e) {
 
     case Button::Right:
     case Button::Center:
-#if FEATURE_BLUETOOTH
-      if (settingsView_.DEFS[settingsView_.selected].type ==
-          ui::InReaderSettingsView::SettingType::Action) {
-        handleBleAction(core);
-        break;
-      }
-#endif
+      if (tryAction()) break;
       settingsView_.cycleValue(1);
       applyInReaderSettings(core);
       needsRender_ = true;
@@ -1914,22 +2512,41 @@ void ReaderState::renderSettingsOverlay(Core& core) {
 void ReaderState::loadInReaderSettings(Core& core) {
   const auto& s = core.settings;
 
+  // Mark the view as XTC so reflow-related settings (font, size, line
+  // spacing, hyphenation, alignment, show images) are hidden from the
+  // overlay — those are baked into the XTC at process time and ignored
+  // at read time. Comics are pre-rendered too but don't reach this
+  // settings overlay (no chapter list / TOC path), so checking XTC
+  // alone is enough here. Selected, scrollOffset, and the move helpers
+  // are all isXtc-aware so navigation skips hidden rows cleanly.
+  settingsView_.isXtc = (core.content.metadata().type == ContentType::Xtc);
+  // If selected lands on a now-hidden row (e.g. user switched orientations
+  // mid-session and re-entered), snap to the first visible entry.
+  if (!settingsView_.isVisible(settingsView_.selected)) {
+    settingsView_.selected = 0;  // "Look up Word" — always visible
+    settingsView_.scrollOffset = 0;
+  }
+
   // Index 0: Font (FontSelect) - load available .epdfont families
   settingsView_.fontCount = 0;
   settingsView_.currentFontIndex = 0;
-  strncpy(settingsView_.fontNames[0], "Default", sizeof(settingsView_.fontNames[0]) - 1);
+  utf8SafeCopy(settingsView_.fontNames[0], "Default", sizeof(settingsView_.fontNames[0]));
   settingsView_.fontCount = 1;
   auto fonts = FONT_MANAGER.listAvailableFonts();
   for (size_t i = 0; i < fonts.size() && settingsView_.fontCount < ui::InReaderSettingsView::MAX_FONTS; i++) {
-    if (!FontManager::isBinFont(fonts[i].c_str())) {
-      int idx = settingsView_.fontCount;
-      strncpy(settingsView_.fontNames[idx], fonts[i].c_str(), sizeof(settingsView_.fontNames[idx]) - 1);
-      settingsView_.fontNames[idx][sizeof(settingsView_.fontNames[idx]) - 1] = '\0';
-      if (s.readerFont[0] && strcmp(fonts[i].c_str(), s.readerFont) == 0) {
-        settingsView_.currentFontIndex = idx;
-      }
-      settingsView_.fontCount++;
+    // Include both .epdfont families (full replacement) and .bin fonts
+    // (CJK glyph fallback). The picker used to skip .bin entries, which
+    // left users with Japanese flashcards unable to select notosansjp
+    // and stuck on the built-in font that has no CJK glyphs (rendering
+    // every kanji as '?'). FontManager::getReaderFontId handles both
+    // formats correctly: a .bin pick keeps the built-in for ASCII and
+    // streams CJK glyphs from the .bin file.
+    int idx = settingsView_.fontCount;
+    utf8SafeCopy(settingsView_.fontNames[idx], fonts[i].c_str(), sizeof(settingsView_.fontNames[idx]));
+    if (s.readerFont[0] && strcmp(fonts[i].c_str(), s.readerFont) == 0) {
+      settingsView_.currentFontIndex = idx;
     }
+    settingsView_.fontCount++;
   }
   settingsView_.values[0] = 0;  // Not used for FontSelect
 
@@ -1942,9 +2559,33 @@ void ReaderState::loadInReaderSettings(Core& core) {
   settingsView_.values[6] = s.textAntiAliasing;
   settingsView_.values[7] = s.showImages;
   settingsView_.values[8] = s.statusBar;
+  settingsView_.values[9] = s.textDarkness;
+
+  // Snapshot global defaults before per-book overrides
+  globalFontSize_ = s.fontSize;
+  globalLineSpacing_ = s.lineSpacing;
+  globalHyphenation_ = s.hyphenation;
+  globalShowImages_ = s.showImages;
+  globalTextDarkness_ = s.textDarkness;
+
+  // Apply per-book overrides (value != -1 means override active)
+  const char* cacheDir = core.content.cacheDir();
+  if (cacheDir) {
+    bookOverrides_ = sumi::BookOverrides::load(cacheDir);
+    if (bookOverrides_.fontSize >= 0)
+      settingsView_.values[1] = static_cast<uint8_t>(bookOverrides_.fontSize);
+    if (bookOverrides_.lineSpacing >= 0)
+      settingsView_.values[3] = static_cast<uint8_t>(bookOverrides_.lineSpacing);
+    if (bookOverrides_.hyphenation >= 0)
+      settingsView_.values[5] = static_cast<uint8_t>(bookOverrides_.hyphenation);
+    if (bookOverrides_.showImages >= 0)
+      settingsView_.values[7] = static_cast<uint8_t>(bookOverrides_.showImages);
+    if (bookOverrides_.textDarkness >= 0)
+      settingsView_.values[9] = static_cast<uint8_t>(bookOverrides_.textDarkness);
+  }
 
 #if FEATURE_BLUETOOTH
-  // Index 9: Bluetooth action — show current connection state
+  // Index 10: Bluetooth action — show current connection state
   if (ble::isReady() && ble::isConnected()) {
     strncpy(settingsView_.actionStatus, "Connected", sizeof(settingsView_.actionStatus) - 1);
   } else if (s.blePageTurner[0] != '\0' || s.bleKeyboard[0] != '\0') {
@@ -1953,6 +2594,79 @@ void ReaderState::loadInReaderSettings(Core& core) {
     strncpy(settingsView_.actionStatus, "No saved device", sizeof(settingsView_.actionStatus) - 1);
   }
 #endif
+
+  // Index 9: Look up Word — show the active dictionary's display name so
+  // the user knows which one will get queried. "None" if no dict active.
+  if (s.dictionaryName[0] != '\0') {
+    // setActive() is cheap when already active, parses .ifo to get display.
+    if (sumi::Dictionary::setActive(s.dictionaryName)) {
+      utf8SafeCopy(settingsView_.dictActionStatus,
+                   sumi::Dictionary::activeDisplayName().c_str(),
+                   sizeof(settingsView_.dictActionStatus));
+    } else {
+      utf8SafeCopy(settingsView_.dictActionStatus, "Missing", sizeof(settingsView_.dictActionStatus));
+    }
+  } else {
+    utf8SafeCopy(settingsView_.dictActionStatus, "None", sizeof(settingsView_.dictActionStatus));
+  }
+
+  // Index 10: Lookup History — show word count so the user sees at a glance
+  // how many words they've looked up in this book.
+  if (cacheDir && sumi::LookupHistory::hasHistory(cacheDir)) {
+    auto words = sumi::LookupHistory::load(cacheDir);
+    char buf[24];
+    snprintf(buf, sizeof(buf), "%d word%s",
+             static_cast<int>(words.size()), words.size() == 1 ? "" : "s");
+    utf8SafeCopy(settingsView_.historyActionStatus, buf,
+                 sizeof(settingsView_.historyActionStatus));
+  } else {
+    utf8SafeCopy(settingsView_.historyActionStatus, "Empty",
+                 sizeof(settingsView_.historyActionStatus));
+  }
+
+  // Index 11: Toggle Bookmark — show current page bookmark state
+  if (cacheDir && sumi::Bookmarks::isBookmarked(cacheDir, currentPage_)) {
+    char buf[24];
+    snprintf(buf, sizeof(buf), "\xe2\x98\x85 Page %u", currentPage_);
+    utf8SafeCopy(settingsView_.bookmarkToggleStatus, buf,
+                 sizeof(settingsView_.bookmarkToggleStatus));
+  } else {
+    char buf[24];
+    snprintf(buf, sizeof(buf), "Page %u", currentPage_);
+    utf8SafeCopy(settingsView_.bookmarkToggleStatus, buf,
+                 sizeof(settingsView_.bookmarkToggleStatus));
+  }
+
+  // Index 12: View Bookmarks — show bookmark count
+  if (cacheDir) {
+    int bmCount = sumi::Bookmarks::count(cacheDir);
+    if (bmCount > 0) {
+      char buf[24];
+      snprintf(buf, sizeof(buf), "%d bookmark%s", bmCount, bmCount == 1 ? "" : "s");
+      utf8SafeCopy(settingsView_.bookmarkListStatus, buf,
+                   sizeof(settingsView_.bookmarkListStatus));
+    } else {
+      utf8SafeCopy(settingsView_.bookmarkListStatus, "Empty",
+                   sizeof(settingsView_.bookmarkListStatus));
+    }
+  } else {
+    utf8SafeCopy(settingsView_.bookmarkListStatus, "Empty",
+                 sizeof(settingsView_.bookmarkListStatus));
+  }
+
+  // Index 13: All Bookmarks — show global bookmark count
+  {
+    int gCount = sumi::GlobalBookmarkIndex::count();
+    if (gCount > 0) {
+      char buf[24];
+      snprintf(buf, sizeof(buf), "%d across books", gCount);
+      utf8SafeCopy(settingsView_.globalBookmarkStatus, buf,
+                   sizeof(settingsView_.globalBookmarkStatus));
+    } else {
+      utf8SafeCopy(settingsView_.globalBookmarkStatus, "Empty",
+                   sizeof(settingsView_.globalBookmarkStatus));
+    }
+  }
 }
 
 void ReaderState::applyInReaderSettings(Core& core) {
@@ -1973,7 +2687,7 @@ void ReaderState::applyInReaderSettings(Core& core) {
                         s.hyphenation != settingsView_.values[5] ||
                         s.showImages != settingsView_.values[7]);
 
-  // Apply all values (shifted +1 for Font at index 0)
+  // Apply all values to runtime settings (shifted +1 for Font at index 0)
   s.fontSize = settingsView_.values[1];
   s.textLayout = settingsView_.values[2];
   s.lineSpacing = settingsView_.values[3];
@@ -1982,6 +2696,7 @@ void ReaderState::applyInReaderSettings(Core& core) {
   s.textAntiAliasing = settingsView_.values[6];
   s.showImages = settingsView_.values[7];
   s.statusBar = settingsView_.values[8];
+  s.textDarkness = settingsView_.values[9];
 
   // Invalidate page cache if layout changed
   if (cacheInvalid) {
@@ -1990,8 +2705,48 @@ void ReaderState::applyInReaderSettings(Core& core) {
     pageCache_.reset();
   }
 
-  // Persist to disk
+  // Save per-book overrides: any field that differs from global default
+  // gets stored as an override; fields matching global get -1 (inherit).
+  const char* cacheDir = core.content.cacheDir();
+  if (cacheDir) {
+    bookOverrides_.fontSize =
+        (settingsView_.values[1] != globalFontSize_)
+            ? static_cast<int8_t>(settingsView_.values[1]) : -1;
+    bookOverrides_.lineSpacing =
+        (settingsView_.values[3] != globalLineSpacing_)
+            ? static_cast<int8_t>(settingsView_.values[3]) : -1;
+    bookOverrides_.hyphenation =
+        (settingsView_.values[5] != globalHyphenation_)
+            ? static_cast<int8_t>(settingsView_.values[5]) : -1;
+    bookOverrides_.showImages =
+        (settingsView_.values[7] != globalShowImages_)
+            ? static_cast<int8_t>(settingsView_.values[7]) : -1;
+    bookOverrides_.textDarkness =
+        (settingsView_.values[9] != globalTextDarkness_)
+            ? static_cast<int8_t>(settingsView_.values[9]) : -1;
+    sumi::BookOverrides::save(cacheDir, bookOverrides_);
+
+    // Restore global defaults for the overrideable fields so global settings
+    // file stays unchanged. The runtime `s` keeps the per-book values for
+    // the current session -- they'll be re-applied from overrides on next open.
+    s.fontSize = globalFontSize_;
+    s.lineSpacing = globalLineSpacing_;
+    s.hyphenation = globalHyphenation_;
+    s.showImages = globalShowImages_;
+    s.textDarkness = globalTextDarkness_;
+  }
+
+  // Persist global settings (non-overrideable fields like textLayout, alignment, etc.)
   s.save(core.storage);
+
+  // Re-apply per-book overrides to runtime settings for continued rendering
+  if (cacheDir) {
+    s.fontSize = settingsView_.values[1];
+    s.lineSpacing = settingsView_.values[3];
+    s.hyphenation = settingsView_.values[5];
+    s.showImages = settingsView_.values[7];
+    s.textDarkness = settingsView_.values[9];
+  }
 }
 
 #if FEATURE_BLUETOOTH
@@ -2012,10 +2767,9 @@ void ReaderState::handleBleAction(Core& core) {
   renderSettingsOverlay(core);
   renderer_.displayBuffer(EInkDisplay::FAST_REFRESH);
 
-  // Release arena to free heap for NimBLE stack init
-  if (sumi::MemoryArena::isInitialized()) {
-    sumi::MemoryArena::release();
-  }
+  // (v1 released the MemoryArena before BLE init to free heap for the
+  //  NimBLE stack. v2's arena is in .bss; NimBLE works from the heap
+  //  that remains after boot.)
   ble::init();
 
   bool connected = false;
@@ -2109,10 +2863,8 @@ void ReaderState::handleBleAction(Core& core) {
     Serial.println("[READER] BLE connect failed");
   }
 
-  // Re-allocate arena for reading (deinit freed BLE stack if not connected)
-  if (!sumi::MemoryArena::isInitialized()) {
-    sumi::MemoryArena::init();
-  }
+  // (v1 re-allocated the arena here after BLE connect/deinit. v2's
+  //  arena is permanently in .bss — already initialised, never freed.)
 
   needsRender_ = true;
   settingsView_.needsRender = true;
@@ -2124,6 +2876,283 @@ void ReaderState::exitToUI(Core& core) {
   exitTarget_ = StateId::Home;
   // exit() will be called by the state machine during transition,
   // which handles progress saving, thumbnail generation, and cleanup.
+}
+
+// ============================================================================
+// Dictionary overlay — in-reader lookup flow
+// ============================================================================
+
+void ReaderState::enterDictWordSelect(Core& core) {
+  // Settings → Look up Word closes the settings overlay and opens the
+  // word-select overlay with the current rendered page as the substrate.
+  // Auto-discovery: if no dictionary has ever been selected, scan
+  // /dictionary/ on the SD and pick the first one. Saves the user a
+  // trip to Device Settings → Dictionary just to "enable" something
+  // they already installed. Reported by users: "I press Look up Word
+  // and nothing happens" — most often because the device-settings dict
+  // dropdown was never visited but the dictionary files are on the SD.
+  if (core.settings.dictionaryName[0] == '\0') {
+    auto avail = sumi::Dictionary::listAvailable();
+    if (avail.empty()) {
+      Serial.println("[DICT] No dictionaries on /dictionary/ — install one first");
+      // Surface the failure to the user instead of silently returning.
+      snprintf(core.buf.text, sizeof(core.buf.text),
+               "No dictionary installed.\nAdd one to /dictionary/ on SD.");
+      // Reuse the error-toast path the bookmark/save flow uses by
+      // bouncing back to settings with an overlay flag the next render
+      // can show. Simplest: log + Serial print that the user can spot
+      // when something feels broken; the toast itself is a follow-up.
+      return;
+    }
+    utf8SafeCopy(core.settings.dictionaryName, avail[0].name.c_str(),
+                 sizeof(core.settings.dictionaryName));
+    Serial.printf("[DICT] Auto-selected '%s' (first of %u available)\n",
+                  core.settings.dictionaryName, (unsigned)avail.size());
+    core.settings.save(core.storage);
+  }
+
+  // Make sure Dictionary has the right index loaded. setActive is cheap if
+  // already set; clearing cached state is a no-op for the active name.
+  if (!sumi::Dictionary::setActive(core.settings.dictionaryName)) {
+    Serial.printf("[DICT] setActive failed for '%s'\n", core.settings.dictionaryName);
+    return;
+  }
+
+  // Snapshot the current page. loadPage allocates a new Page — we take
+  // ownership for the overlay lifetime so the background cacher can't
+  // reclaim the underlying memory while the user is navigating words.
+  if (!pageCache_) {
+    Serial.println("[DICT] No page cache — skipping word select");
+    return;
+  }
+  dictSelectedPage_ = pageCache_->loadPage(currentSectionPage_);
+  if (!dictSelectedPage_) {
+    Serial.println("[DICT] loadPage returned null");
+    return;
+  }
+
+  const Viewport vp = getReaderViewport();
+  const int fontId = core.settings.getReaderFontId(THEME_MANAGER.current());
+
+  dictWordSelectView_ = ui::DictWordSelectView{};
+  dictWordSelectView_.page = dictSelectedPage_.get();
+  dictWordSelectView_.fontId = fontId;
+  dictWordSelectView_.marginLeft = vp.marginLeft;
+  dictWordSelectView_.marginTop = vp.marginTop;
+  dictWordSelectView_.extractWords(renderer_);
+  dictWordSelectView_.mergeHyphenatedWords("");  // No cross-page merge for now
+
+  dictStage_ = DictStage::WordSelect;
+  settingsMode_ = false;  // Close the settings overlay we came from
+  needsRender_ = true;
+  Serial.printf("[DICT] Entered word-select: %zu words, %zu rows\n",
+                dictWordSelectView_.words.size(), dictWordSelectView_.rows.size());
+}
+
+void ReaderState::exitDictOverlay(Core& core) {
+  (void)core;
+  dictStage_ = DictStage::None;
+  dictSelectedPage_.reset();
+  // Keep the pre-populated view data around — cheap and lets Back-then-
+  // reopen avoid re-extracting. Reset on next enterDictWordSelect.
+  needsRender_ = true;
+  Serial.println("[DICT] Exited dictionary overlay");
+}
+
+void ReaderState::performDictLookup(Core& core, const std::string& cleaned) {
+  if (cleaned.empty()) {
+    Serial.println("[DICT] Empty cleaned word — bailing");
+    return;
+  }
+
+  Serial.printf("[DICT] Looking up '%s'\n", cleaned.c_str());
+
+  // Poll raw button state inside the lookup so holding Back during a
+  // long first-open scan cancels it. lookupAll() walks every installed
+  // dict, building each one's sparse offset cache on first visit; this
+  // can add up across many dicts so cancellation is important here.
+  // We use isPressed (direct GPIO read) rather than the event queue
+  // because the queue only drains in update() which we're not inside.
+  auto shouldCancel = [&core]() -> bool {
+    return core.input.isPressed(Button::Back);
+  };
+
+  // Record every searched word in the book's lookup history even if we
+  // don't find a hit — the history view in the reader menu will show
+  // them all, matching the Crosspoint fork's behaviour. Use the generic
+  // content cacheDir so this works for TXT files too.
+  const char* cacheDir = core.content.cacheDir();
+  if (cacheDir) {
+    sumi::LookupHistory::addWord(cacheDir, cleaned);
+  }
+
+  auto results = sumi::Dictionary::lookupAll(cleaned, nullptr, shouldCancel);
+
+  if (!results.empty()) {
+    dictDefinitionView_ = ui::DictDefinitionView{};
+    dictDefinitionView_.headword = cleaned;
+    dictDefinitionView_.fontId = core.settings.getReaderFontId(THEME_MANAGER.current());
+    dictDefinitionView_.sections.reserve(results.size());
+    for (auto& r : results) {
+      ui::DictDefinitionView::Section s;
+      s.sourceLabel = r.dictDisplayName;
+      if (r.viaStemmer) {
+        s.sourceLabel += " — stem of ‘";
+        s.sourceLabel += r.headword;
+        s.sourceLabel += "’";
+        Serial.printf("[DICT] Stem hit in %s: '%s' → '%s'\n",
+                      r.dictName.c_str(), cleaned.c_str(), r.headword.c_str());
+      } else {
+        Serial.printf("[DICT] Hit in %s: '%s'\n",
+                      r.dictName.c_str(), cleaned.c_str());
+      }
+      s.body = std::move(r.definition);
+      dictDefinitionView_.sections.push_back(std::move(s));
+    }
+    dictDefinitionView_.wrapText(renderer_, THEME_MANAGER.current());
+    dictStage_ = DictStage::Definition;
+    needsRender_ = true;
+    return;
+  }
+
+  // Fallback: fuzzy suggestions aggregated across every dict.
+  auto similar = sumi::Dictionary::findSimilarAll(cleaned, ui::DictSuggestionsView::MAX_SUGGESTIONS);
+  if (!similar.empty()) {
+    dictSuggestionsView_ = ui::DictSuggestionsView{};
+    dictSuggestionsView_.originalWord = cleaned;
+    dictSuggestionsView_.suggestions = std::move(similar);
+    dictSuggestionsView_.selectedIndex = 0;
+    dictStage_ = DictStage::Suggestions;
+    needsRender_ = true;
+    return;
+  }
+
+  // No hit, no stem, no fuzzy match — return to word select with an ugly
+  // but truthful log message. A future iteration can flash a toast.
+  Serial.printf("[DICT] '%s' not found\n", cleaned.c_str());
+  dictStage_ = DictStage::WordSelect;
+  needsRender_ = true;
+}
+
+void ReaderState::handleDictInput(Core& core, const Event& e) {
+  if (e.type != EventType::ButtonPress) return;
+
+  // Orientation-aware mapping: in landscape, up/down becomes word-prev/next
+  // so "forward" in reading order always feels natural. The Crosspoint fork
+  // has identical logic; we reuse it.
+  const uint8_t orientation = core.settings.orientation;
+  const bool landscape = orientation == Settings::LandscapeCW || orientation == Settings::LandscapeCCW;
+  const bool inverted = orientation == Settings::Inverted;
+
+  Button rowPrev, rowNext, wordPrev, wordNext;
+  if (landscape && orientation == Settings::LandscapeCW) {
+    rowPrev = Button::Left; rowNext = Button::Right;
+    wordPrev = Button::Down; wordNext = Button::Up;
+  } else if (landscape) {
+    rowPrev = Button::Right; rowNext = Button::Left;
+    wordPrev = Button::Up; wordNext = Button::Down;
+  } else if (inverted) {
+    rowPrev = Button::Down; rowNext = Button::Up;
+    wordPrev = Button::Right; wordNext = Button::Left;
+  } else {
+    rowPrev = Button::Up; rowNext = Button::Down;
+    wordPrev = Button::Left; wordNext = Button::Right;
+  }
+
+  switch (dictStage_) {
+    case DictStage::WordSelect: {
+      if (e.button == Button::Back) {
+        exitDictOverlay(core);
+        return;
+      }
+      if (e.button == rowPrev)       { dictWordSelectView_.movePrevRow(); needsRender_ = true; return; }
+      if (e.button == rowNext)       { dictWordSelectView_.moveNextRow(); needsRender_ = true; return; }
+      if (e.button == wordPrev)      { dictWordSelectView_.movePrevWord(); needsRender_ = true; return; }
+      if (e.button == wordNext)      { dictWordSelectView_.moveNextWord(); needsRender_ = true; return; }
+      if (e.button == Button::Center) {
+        const auto* w = dictWordSelectView_.selectedWord();
+        if (w == nullptr) return;
+        const std::string cleaned = sumi::Dictionary::cleanWord(w->lookupText);
+        performDictLookup(core, cleaned);
+      }
+      return;
+    }
+
+    case DictStage::Definition: {
+      if (e.button == Button::Back) {
+        // Back from definition → word select (so the user can try another
+        // word without re-entering from settings).
+        dictStage_ = DictStage::WordSelect;
+        needsRender_ = true;
+        return;
+      }
+      if (e.button == Button::Center) {
+        // Confirm from definition = close the entire overlay, back to reader.
+        exitDictOverlay(core);
+        return;
+      }
+      if (e.button == Button::Left) {
+        dictDefinitionView_.pageBackward();
+        if (dictDefinitionView_.needsRender) needsRender_ = true;
+        return;
+      }
+      if (e.button == Button::Right) {
+        dictDefinitionView_.pageForward();
+        if (dictDefinitionView_.needsRender) needsRender_ = true;
+        return;
+      }
+      return;
+    }
+
+    case DictStage::Suggestions: {
+      if (e.button == Button::Back) {
+        dictStage_ = DictStage::WordSelect;
+        needsRender_ = true;
+        return;
+      }
+      if (e.button == Button::Up) {
+        dictSuggestionsView_.moveUp();
+        if (dictSuggestionsView_.needsRender) needsRender_ = true;
+        return;
+      }
+      if (e.button == Button::Down) {
+        dictSuggestionsView_.moveDown();
+        if (dictSuggestionsView_.needsRender) needsRender_ = true;
+        return;
+      }
+      if (e.button == Button::Center) {
+        const auto* sel = dictSuggestionsView_.selected();
+        if (sel == nullptr) return;
+        performDictLookup(core, *sel);
+        return;
+      }
+      return;
+    }
+
+    case DictStage::None:
+    default:
+      return;
+  }
+}
+
+void ReaderState::renderDictOverlay(Core& core) {
+  (void)core;
+  const Theme& theme = THEME_MANAGER.current();
+  switch (dictStage_) {
+    case DictStage::WordSelect:
+      ui::render(renderer_, theme, dictWordSelectView_);
+      break;
+    case DictStage::Definition:
+      ui::render(renderer_, theme, dictDefinitionView_);
+      break;
+    case DictStage::Suggestions:
+      ui::render(renderer_, theme, dictSuggestionsView_);
+      break;
+    case DictStage::None:
+    default:
+      break;
+  }
+  core.display.markDirty();
 }
 
 }  // namespace sumi

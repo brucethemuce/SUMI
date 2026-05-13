@@ -186,9 +186,11 @@ public:
         // Always reset to portrait mode for Sudoku
         d_.setRotation(3);
         // orientation handled by host
-        
-        screenW = 480;  // Portrait dimensions
-        screenH = 800;
+
+        // Use runtime dimensions (X4=480x800, X3=528x792) instead of
+        // X4 hardcodes — previously Sudoku drew outside the panel on X3.
+        screenW = w;
+        screenH = h;
         
         // Calculate board layout - more space without number pad
         int headerH = 58;  // Header + progress bar
@@ -228,13 +230,17 @@ public:
     
     void saveSettings() {
         SdMan.mkdir("/.sumi");
-        FsFile f = SdMan.open(SUDOKU_SETTINGS_PATH, (O_WRONLY | O_CREAT | O_TRUNC));
-        if (f) {
-            f.write((uint8_t*)&settings, sizeof(SudokuSettings));
-            f.close();
+        // Atomic — see docs/ATOMIC_WRITE_DESIGN.md. O_TRUNC + raw write
+        // could leave the file empty on power loss mid-save and the
+        // user's chosen difficulty/timer settings would reset.
+        FsFile f;
+        if (!SdMan.atomicOpenWrite("SUDOKU", SUDOKU_SETTINGS_PATH, f)) return;
+        f.write((uint8_t*)&settings, sizeof(SudokuSettings));
+        if (!SdMan.atomicCommit(f, SUDOKU_SETTINGS_PATH)) {
+            SdMan.atomicAbort(f, SUDOKU_SETTINGS_PATH);
         }
     }
-    
+
     void loadStats() {
         stats = SudokuStats();
         FsFile f = SdMan.open(SUDOKU_STATS_PATH, O_RDONLY);
@@ -247,13 +253,15 @@ public:
     
     void saveStats() {
         SdMan.mkdir("/.sumi");
-        FsFile f = SdMan.open(SUDOKU_STATS_PATH, (O_WRONLY | O_CREAT | O_TRUNC));
-        if (f) {
-            f.write((uint8_t*)&stats, sizeof(SudokuStats));
-            f.close();
+        // Atomic — see saveSettings comment.
+        FsFile f;
+        if (!SdMan.atomicOpenWrite("SUDOKU", SUDOKU_STATS_PATH, f)) return;
+        f.write((uint8_t*)&stats, sizeof(SudokuStats));
+        if (!SdMan.atomicCommit(f, SUDOKU_STATS_PATH)) {
+            SdMan.atomicAbort(f, SUDOKU_STATS_PATH);
         }
     }
-    
+
     void checkSavedGame() {
         hasSavedGame = false;
         savedProgress = 0;
@@ -283,9 +291,11 @@ public:
     // ==========================================================================
     bool saveGame() {
         SdMan.mkdir("/.sumi");
-        FsFile f = SdMan.open(SUDOKU_SAVE_PATH, (O_WRONLY | O_CREAT | O_TRUNC));
-        if (!f) return false;
-        
+        // Atomic — power loss mid-save would otherwise wipe the user's
+        // saved puzzle including their current solve progress.
+        FsFile f;
+        if (!SdMan.atomicOpenWrite("SUDOKU", SUDOKU_SAVE_PATH, f)) return false;
+
         SudokuSaveData save;
         memcpy(save.board, board, sizeof(board));
         memcpy(save.solution, solution, sizeof(solution));
@@ -299,9 +309,12 @@ public:
         save.errorsCount = errorsCount;
         save.undoCount = min(undoCount, 20);
         memcpy(save.undoStack, undoStack, sizeof(UndoEntry) * save.undoCount);
-        
+
         f.write((uint8_t*)&save, sizeof(SudokuSaveData));
-        f.close();
+        if (!SdMan.atomicCommit(f, SUDOKU_SAVE_PATH)) {
+            SdMan.atomicAbort(f, SUDOKU_SAVE_PATH);
+            return false;
+        }
         hasSavedGame = true;
         return true;
     }
@@ -309,12 +322,13 @@ public:
     bool loadGame() {
         FsFile f = SdMan.open(SUDOKU_SAVE_PATH, O_RDONLY);
         if (!f) return false;
-        
-        SudokuSaveData save;
-        f.read((uint8_t*)&save, sizeof(SudokuSaveData));
+
+        SudokuSaveData save = {};
+        const int bytesRead = f.read((uint8_t*)&save, sizeof(SudokuSaveData));
         f.close();
-        
-        if (!save.isValid()) {
+
+        // Require a full, valid read — see ChessGame::loadGame rationale.
+        if (bytesRead != sizeof(SudokuSaveData) || !save.isValid()) {
             deleteSavedGame();
             return false;
         }
@@ -323,13 +337,24 @@ public:
         memcpy(solution, save.solution, sizeof(solution));
         memcpy(given, save.given, sizeof(given));
         memcpy(pencilMarks, save.pencilMarks, sizeof(pencilMarks));
-        difficulty = (SudokuDifficulty)save.difficulty;
+        // Clamp persisted fields that index into fixed-size arrays.
+        // isValid() only checks magic + version, so a corrupt save could
+        // have difficulty >= 4 (indexing off the end of CLUE_COUNTS[4]
+        // and DIFF_NAMES[4] in drawing/generation) or cursor coords
+        // outside 0..8 (indexing board[cursorR][cursorC]).
+        difficulty = save.difficulty > DIFF_EXPERT
+                       ? DIFF_EXPERT
+                       : (SudokuDifficulty)save.difficulty;
         elapsedSeconds = save.elapsedSeconds;
-        cursorR = save.cursorR;
-        cursorC = save.cursorC;
+        cursorR = (save.cursorR >= 0 && save.cursorR < 9) ? save.cursorR : 0;
+        cursorC = (save.cursorC >= 0 && save.cursorC < 9) ? save.cursorC : 0;
         hintsUsed = save.hintsUsed;
         errorsCount = save.errorsCount;
+        // Clamp persisted undo-stack length. isValid() only checks magic
+        // and version, so a truncated or corrupted save file could leave
+        // undoCount past the 20-entry array and the memcpy would overflow.
         undoCount = save.undoCount;
+        if (undoCount > 20) undoCount = 20;
         memcpy(undoStack, save.undoStack, sizeof(UndoEntry) * undoCount);
         
         selectedNum = 1;

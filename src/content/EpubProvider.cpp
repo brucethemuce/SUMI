@@ -2,6 +2,8 @@
 
 #include <cstring>
 
+#include <Utf8.h>
+
 namespace sumi {
 
 Result<void> EpubProvider::open(const char* path, const char* cacheDir) {
@@ -18,22 +20,15 @@ Result<void> EpubProvider::open(const char* path, const char* cacheDir) {
   meta.clear();
   meta.type = ContentType::Epub;
 
-  const std::string& title = epub->getTitle();
-  strncpy(meta.title, title.c_str(), sizeof(meta.title) - 1);
-  meta.title[sizeof(meta.title) - 1] = '\0';
+  // UTF-8 safe copy: titles/authors may contain CJK text. A naive strncpy
+  // into a fixed-size buffer can slice a 3-byte codepoint mid-sequence,
+  // which later renders as '?' at the broken character.
+  utf8SafeCopy(meta.title, epub->getTitle().c_str(), sizeof(meta.title));
+  utf8SafeCopy(meta.author, epub->getAuthor().c_str(), sizeof(meta.author));
 
-  const std::string& author = epub->getAuthor();
-  strncpy(meta.author, author.c_str(), sizeof(meta.author) - 1);
-  meta.author[sizeof(meta.author) - 1] = '\0';
-
-  const std::string& cachePath = epub->getCachePath();
-  strncpy(meta.cachePath, cachePath.c_str(), sizeof(meta.cachePath) - 1);
-  meta.cachePath[sizeof(meta.cachePath) - 1] = '\0';
-
-  // Cover path
-  std::string coverPath = epub->getCoverBmpPath();
-  strncpy(meta.coverPath, coverPath.c_str(), sizeof(meta.coverPath) - 1);
-  meta.coverPath[sizeof(meta.coverPath) - 1] = '\0';
+  // Paths are ASCII-safe but reuse the helper for consistency.
+  utf8SafeCopy(meta.cachePath, epub->getCachePath().c_str(), sizeof(meta.cachePath));
+  utf8SafeCopy(meta.coverPath, epub->getCoverBmpPath().c_str(), sizeof(meta.coverPath));
 
   meta.totalPages = epub->getSpineItemsCount();
   meta.currentPage = 0;
@@ -62,8 +57,7 @@ Result<TocEntry> EpubProvider::getTocEntry(uint16_t index) const {
 
   auto tocItem = epub->getTocItem(index);
   TocEntry entry;
-  strncpy(entry.title, tocItem.title.c_str(), sizeof(entry.title) - 1);
-  entry.title[sizeof(entry.title) - 1] = '\0';
+  utf8SafeCopy(entry.title, tocItem.title.c_str(), sizeof(entry.title));
   entry.pageIndex = epub->getSpineIndexForTocIndex(index);
   entry.depth = tocItem.level;
 

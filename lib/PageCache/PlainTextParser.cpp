@@ -2,8 +2,10 @@
 
 #include <Epub/Page.h>
 #include <Epub/ParsedText.h>
+#include <Epub/hyphenation/Hyphenator.h>
 #include <GfxRenderer.h>
 #include <SDCardManager.h>
+#include <Utf8.h>
 
 #include <utility>
 
@@ -24,6 +26,15 @@ void PlainTextParser::reset() {
 
 bool PlainTextParser::parsePages(const std::function<void(std::unique_ptr<Page>)>& onPageComplete, uint16_t maxPages,
                                  const AbortCallback& shouldAbort) {
+  // Hyphenator::setPreferredLanguage holds a process-global cached
+  // language picked from the last EPUB that was opened. Without this
+  // reset, opening a French EPUB then a plain .txt would apply French
+  // hyphenation patterns to the TXT content (and vice versa). TXT has
+  // no language metadata — clear the preference so fallback hyphenation
+  // (the safe generic algorithm) applies instead of potentially
+  // wrong-language patterns.
+  Hyphenator::setPreferredLanguage("");
+
   FsFile file;
   if (!SdMan.openFileForRead("TXT", filepath_, file)) {
     Serial.printf("[TXT] Failed to open file: %s\n", filepath_.c_str());
@@ -88,7 +99,11 @@ bool PlainTextParser::parsePages(const std::function<void(std::unique_ptr<Page>)
   };
 
   if (currentOffset_ == 0) {
-    size_t peekBytes = file.read(buffer, READ_CHUNK_SIZE);
+    // FsFile::read returns int: positive bytesRead or negative on error.
+    // Previously we stored it directly into `size_t`, which turned a -1
+    // error into SIZE_MAX and the subsequent `buffer[peekBytes] = '\0'`
+    // would write far out of bounds.
+    const int peekBytes = file.read(buffer, READ_CHUNK_SIZE);
     if (peekBytes > 0) {
       buffer[peekBytes] = '\0';
       isRtl_ = ScriptDetector::containsArabic(reinterpret_cast<const char*>(buffer));
@@ -110,8 +125,8 @@ bool PlainTextParser::parsePages(const std::function<void(std::unique_ptr<Page>)
       return false;
     }
 
-    size_t bytesRead = file.read(buffer, READ_CHUNK_SIZE);
-    if (bytesRead == 0) break;
+    const int bytesRead = file.read(buffer, READ_CHUNK_SIZE);
+    if (bytesRead <= 0) break;  // 0 = EOF, <0 = I/O error — abort the loop either way
 
     buffer[bytesRead] = '\0';
 
@@ -163,12 +178,44 @@ bool PlainTextParser::parsePages(const std::function<void(std::unique_ptr<Page>)
         continue;
       }
 
+      // Unicode whitespace (NBSP, narrow NBSP, EN/EM/thin spaces,
+      // ideographic space) also acts as a word boundary. See
+      // lib/Utf8 utf8UnicodeWhitespaceBytes() for the full list.
+      if (int skip = utf8UnicodeWhitespaceBytes(reinterpret_cast<const char*>(buffer) + i,
+                                                static_cast<int>(bytesRead - i))) {
+        if (!partialWord.empty()) {
+          currentBlock->addWord(partialWord, EpdFontFamily::REGULAR);
+          partialWord.clear();
+        }
+        i += static_cast<size_t>(skip - 1);  // loop increments
+        continue;
+      }
+
       partialWord += c;
 
-      // Prevent extremely long words from accumulating
+      // Prevent extremely long words from accumulating. CJK text has no
+      // inter-word whitespace so partialWord would grow unbounded without
+      // this guard. When we do flush early, step back over any trailing
+      // UTF-8 continuation bytes so the emitted word ends on a codepoint
+      // boundary — otherwise a CJK character would be split across two
+      // word fragments and render as '?' at the join.
       if (partialWord.length() > 100) {
-        currentBlock->addWord(partialWord, EpdFontFamily::REGULAR);
-        partialWord.clear();
+        size_t safeLen = partialWord.length();
+        while (safeLen > 0
+               && (static_cast<unsigned char>(partialWord[safeLen - 1]) & 0xC0) == 0x80) {
+          --safeLen;
+        }
+        // If the byte at safeLen-1 is a multi-byte lead, the continuation
+        // bytes needed to complete that codepoint haven't arrived yet —
+        // keep them in partialWord for the next iteration.
+        if (safeLen > 0) {
+          const unsigned char lead = static_cast<unsigned char>(partialWord[safeLen - 1]);
+          if (lead >= 0xC0) --safeLen;
+        }
+        if (safeLen > 0) {
+          currentBlock->addWord(partialWord.substr(0, safeLen), EpdFontFamily::REGULAR);
+          partialWord.erase(0, safeLen);
+        }
       }
     }
 

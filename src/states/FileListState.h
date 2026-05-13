@@ -2,10 +2,12 @@
 
 #include <cstdint>
 #include <cstring>
+#include <memory>
 #include <string>
 #include <vector>
 
 #include "../config.h"
+#include "../content/EpubProvider.h"
 #include "../ui/views/SettingsViews.h"
 #include "State.h"
 
@@ -22,8 +24,12 @@ class PluginHostState;
 class FileListState : public State {
   enum class Screen : uint8_t {
     Browse,
+    FileAction,       // 3-option Index/Delete/Cancel popup on Right-press
     ConfirmDelete,
-    ConvertInfo,     // Friendly "needs conversion" message
+    ConvertInfo,      // Friendly "needs conversion" message
+    IndexConfirm,     // Tradeoff explainer with Start/Cancel
+    Indexing,         // Live progress (chapter N of M)
+    IndexDone,        // "Indexed N chapters" — any key dismisses
   };
 
  public:
@@ -56,7 +62,14 @@ class FileListState : public State {
   struct FileEntry {
     std::string name;
     bool isDir;
-    int8_t progressPercent;  // -1 = never opened, 0-100 = reading progress
+    int16_t progressPercent;  // -1 = never opened, 0-100 = reading progress.
+                              // Widened from int8_t in Batch 7 alongside
+                              // LibraryIndex::Entry::progressPercent so a
+                              // stale entry where currentPage > totalPages
+                              // can't manufacture a negative phantom (audit
+                              // #35). LibraryIndex clamps to [0, 100], so
+                              // valid values still fit; the wider type
+                              // documents the sentinel.
     bool unsupported;        // true = known format but needs conversion via sumi.page
     uint8_t contentHint;     // ContentHint from LibraryIndex (0 = generic/unknown)
   };
@@ -69,6 +82,22 @@ class FileListState : public State {
   bool firstRender_;  // Use HALF_REFRESH on first render to clear ghosting
   Screen currentScreen_;
   ui::ConfirmDialogView confirmView_;
+  ui::FileActionMenuView actionView_;
+
+  // On-device indexer state. Valid only while currentScreen_ is in
+  // {IndexConfirm, Indexing, IndexDone}. The indexer pre-builds the
+  // page cache for every spine of the selected EPUB so subsequent
+  // reads (especially with BLE on, where heap is too tight for the
+  // cold-extend path) load instantly.
+  std::unique_ptr<EpubProvider> indexProvider_;
+  char indexBookPath_[256] = {};
+  char indexSavedFont_[32] = {};
+  uint16_t indexCurrentSpine_ = 0;
+  uint16_t indexTotalSpines_ = 0;
+  uint32_t indexStartMs_ = 0;
+  bool indexFontWasLoaded_ = false;
+  bool indexBleWasInitd_ = false;
+  uint8_t indexResult_ = 0;  // 0 = in-progress, 1 = success, 2 = cancelled, 3 = error
 
 #if FEATURE_PLUGINS
   PluginHostState* pluginHost_ = nullptr;
@@ -78,12 +107,22 @@ class FileListState : public State {
   bool pendingOpen_ = false;  // Set by openSelected to trigger Reader transition
 
   void loadFiles(Core& core);
+  void promptFileAction(Core& core);
   void promptDelete(Core& core);
   void navigateUp(Core& core);
   void navigateDown(Core& core);
   void openSelected(Core& core);
   void goBack(Core& core);
   void showConvertMessage(Core& core, const char* filename);
+
+  // On-device indexer entry points.
+  void enterIndexConfirm(Core& core, const char* filename);
+  void renderIndexConfirm(Core& core);
+  bool startIndexing(Core& core);              // false on early-fail (not an EPUB / open failed)
+  void indexOneSpineStep(Core& core);          // builds cache for current spine, advances counter
+  void renderIndexProgress(Core& core);
+  void renderIndexDone(Core& core);
+  void finishIndexing(Core& core);             // releases provider, restores font/BLE state
 
   // Pagination helpers
   int getPageItems() const;

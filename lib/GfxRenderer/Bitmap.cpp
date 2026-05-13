@@ -175,25 +175,31 @@ BmpReaderError Bitmap::parseHeaders() {
   const bool needsDithering = !nativePalette && dithering;
   // Use arena-backed memory when available to avoid heap fragmentation
   if (needsDithering) {
+    // -fno-exceptions: a failing `new` aborts the device. Use nothrow
+    // and null-check before isValid() so heap-exhausted dither
+    // allocation falls back to undithered output instead of bricking
+    // the boot.
     if (USE_ATKINSON) {
       if (sumi::MemoryArena::isInitialized() && sumi::MemoryArena::ditherRegion) {
-        atkinsonDitherer = new AtkinsonDitherer(width, sumi::MemoryArena::ditherRegion,
-                                                sumi::MemoryArena::DITHER_REGION_SIZE);
+        atkinsonDitherer = new (std::nothrow) AtkinsonDitherer(
+            width, sumi::MemoryArena::ditherRegion,
+            sumi::MemoryArena::DITHER_REGION_SIZE);
       } else {
-        atkinsonDitherer = new AtkinsonDitherer(width);
+        atkinsonDitherer = new (std::nothrow) AtkinsonDitherer(width);
       }
-      if (!atkinsonDitherer->isValid()) {
+      if (atkinsonDitherer && !atkinsonDitherer->isValid()) {
         delete atkinsonDitherer;
         atkinsonDitherer = nullptr;
       }
     } else {
       if (sumi::MemoryArena::isInitialized() && sumi::MemoryArena::ditherRegion) {
-        fsDitherer = new FloydSteinbergDitherer(width, sumi::MemoryArena::ditherRegion,
-                                                sumi::MemoryArena::DITHER_REGION_SIZE);
+        fsDitherer = new (std::nothrow) FloydSteinbergDitherer(
+            width, sumi::MemoryArena::ditherRegion,
+            sumi::MemoryArena::DITHER_REGION_SIZE);
       } else {
-        fsDitherer = new FloydSteinbergDitherer(width);
+        fsDitherer = new (std::nothrow) FloydSteinbergDitherer(width);
       }
-      if (!fsDitherer->isValid()) {
+      if (fsDitherer && !fsDitherer->isValid()) {
         delete fsDitherer;
         fsDitherer = nullptr;
       }

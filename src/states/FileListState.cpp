@@ -2,15 +2,19 @@
 
 #include <Arduino.h>
 #include <EInkDisplay.h>
+#include <EpubChapterParser.h>
 #include <FsHelpers.h>
 #include <GfxRenderer.h>
+#include <PageCache.h>
 #include <SDCardManager.h>
+#include <Utf8.h>
 #include <esp_system.h>
 
 #include <algorithm>
 #include <cctype>
 #include <cstring>
 
+#include "../FontManager.h"
 #include "../core/BootMode.h"
 #include "../core/Core.h"
 #include "../content/LibraryIndex.h"
@@ -42,8 +46,7 @@ FileListState::~FileListState() = default;
 
 void FileListState::setDirectory(const char* dir) {
   if (dir && dir[0] != '\0') {
-    strncpy(currentDir_, dir, sizeof(currentDir_) - 1);
-    currentDir_[sizeof(currentDir_) - 1] = '\0';
+    utf8SafeCopy(currentDir_, dir, sizeof(currentDir_));
   } else {
     strcpy(currentDir_, "/");
   }
@@ -58,8 +61,7 @@ void FileListState::enter(Core& core) {
 
   if (preservePosition) {
     // Restore directory from settings
-    strncpy(currentDir_, core.settings.fileListDir, sizeof(currentDir_) - 1);
-    currentDir_[sizeof(currentDir_) - 1] = '\0';
+    utf8SafeCopy(currentDir_, core.settings.fileListDir, sizeof(currentDir_));
     // Consume the transition so it doesn't fire again on next entry
     clearTransition();
   }
@@ -102,7 +104,12 @@ void FileListState::exit(Core& core) { Serial.println("[FILES] Exiting"); }
 
 void FileListState::loadFiles(Core& core) {
   files_.clear();
-  files_.reserve(512);  // Pre-allocate for large libraries
+  // Conservative pre-reserve so we don't throw std::bad_alloc on a
+  // fragmented heap (free heap on Home with arena held is typically
+  // ~29 KB with <16 KB contiguous — reserve(512) tried to grab ~16 KB
+  // and threw, which aborts because ESP-IDF can't unwind C++ exceptions).
+  // Vector grows geometrically as needed for actual entry counts.
+  files_.reserve(32);
 
   FsFile dir;
   auto result = core.storage.openDir(currentDir_, dir);
@@ -114,8 +121,14 @@ void FileListState::loadFiles(Core& core) {
   char name[256];
   FsFile entry;
 
-  // Collect all entries (no hard limit during collection)
-  while ((entry = dir.openNextFile())) {
+  // Hard cap enforced DURING collection — push_back on a 380 KB heap
+  // device can OOM well before a degenerate "directory with 100k
+  // entries" finishes iterating. Pre-Batch-9-audit the limit
+  // was applied AFTER the loop via resize/shrink_to_fit, which still
+  // attempted every push_back on the way to the cap.
+  constexpr size_t MAX_ENTRIES = 1000;
+
+  while ((entry = dir.openNextFile()) && files_.size() < MAX_ENTRIES) {
     entry.getName(name, sizeof(name));
 
     if (isHidden(name)) {
@@ -132,15 +145,12 @@ void FileListState::loadFiles(Core& core) {
       files_.push_back({std::string(name), false, -1, true, 0});
     }
   }
-  dir.close();
-
-  // Safety check - prevent OOM on extreme cases
-  constexpr size_t MAX_ENTRIES = 1000;
-  if (files_.size() > MAX_ENTRIES) {
-    Serial.printf("[FILES] Warning: truncated to %zu entries\n", MAX_ENTRIES);
-    files_.resize(MAX_ENTRIES);
-    files_.shrink_to_fit();
+  if (entry) {
+    Serial.printf("[FILES] Warning: capped at %zu entries — directory has more\n",
+                  MAX_ENTRIES);
+    entry.close();
   }
+  dir.close();
 
   // Sort: directories first, then supported files, then unsupported (convertible),
   // each group sorted by natural sort (case-insensitive)
@@ -198,7 +208,7 @@ void FileListState::loadFiles(Core& core) {
       // Build full path for hash
       char fullPath[512];
       size_t dirLen = strlen(currentDir_);
-      if (currentDir_[dirLen - 1] == '/') {
+      if (dirLen > 0 && currentDir_[dirLen - 1] == '/') {
         snprintf(fullPath, sizeof(fullPath), "%s%s", currentDir_, f.name.c_str());
       } else {
         snprintf(fullPath, sizeof(fullPath), "%s/%s", currentDir_, f.name.c_str());
@@ -337,13 +347,17 @@ void FileListState::showConvertMessage(Core& core, const char* filename) {
   renderer_.drawCenteredText(theme.readerFontId, y, "Needs Conversion!", theme.primaryTextBlack, BOLD);
   y += titleLineH + 20;
 
-  // Truncated filename
+  // Truncated filename (UTF-8 safe — `%.33s` and strncpy would slice a
+  // CJK codepoint mid-sequence, rendered later as '?'). Copy through
+  // utf8SafeCopy and append "..." only if the source actually overflowed.
   char nameLine[48];
   if (strlen(filename) > 36) {
-    snprintf(nameLine, sizeof(nameLine), "%.33s...", filename);
+    // Reserve 3 bytes at the end for "..." + a spare for the terminator.
+    char head[34];
+    utf8SafeCopy(head, filename, sizeof(head));
+    snprintf(nameLine, sizeof(nameLine), "%s...", head);
   } else {
-    strncpy(nameLine, filename, sizeof(nameLine) - 1);
-    nameLine[sizeof(nameLine) - 1] = '\0';
+    utf8SafeCopy(nameLine, filename, sizeof(nameLine));
   }
   renderer_.drawCenteredText(theme.uiFontId, y, nameLine, theme.primaryTextBlack);
   y += lineH + 12;
@@ -375,9 +389,93 @@ StateTransition FileListState::update(Core& core) {
     switch (e.type) {
       case EventType::ButtonPress:
         if (currentScreen_ == Screen::ConvertInfo) {
-          // Any button dismisses the convert info message
+          // Any button dismisses the info message.
           currentScreen_ = Screen::Browse;
           needsRender_ = true;
+        } else if (currentScreen_ == Screen::IndexConfirm) {
+          // Center starts indexing; anything else cancels.
+          if (e.button == Button::Center) {
+            if (!startIndexing(core)) {
+              // EPUB-only / open failure → bail out via the Done screen,
+              // which surfaces the error to the user instead of a silent
+              // dismissal.
+              currentScreen_ = Screen::IndexDone;
+              needsRender_ = true;
+            }
+          } else {
+            currentScreen_ = Screen::Browse;
+            needsRender_ = true;
+          }
+        } else if (currentScreen_ == Screen::Indexing) {
+          // Cancel mid-indexing via Back or Power. Other buttons ignored
+          // so a stray press doesn't disturb the parser.
+          if (e.button == Button::Back || e.button == Button::Power) {
+            Serial.printf("[INDEX] User cancelled at chapter %u of %u\n",
+                          (unsigned)indexCurrentSpine_, (unsigned)indexTotalSpines_);
+            indexResult_ = 2;  // cancelled
+            finishIndexing(core);
+            currentScreen_ = Screen::IndexDone;
+            needsRender_ = true;
+          }
+        } else if (currentScreen_ == Screen::IndexDone) {
+          // Any button returns to browse. Reload the file list so any
+          // newly-built caches are reflected (e.g. progress bar update).
+          currentScreen_ = Screen::Browse;
+          loadFiles(core);
+          needsRender_ = true;
+        } else if (currentScreen_ == Screen::FileAction) {
+          switch (e.button) {
+            case Button::Up:
+              actionView_.moveUp();
+              needsRender_ = true;
+              break;
+            case Button::Down:
+              actionView_.moveDown();
+              needsRender_ = true;
+              break;
+            case Button::Center:
+              switch (actionView_.currentAction()) {
+                case ui::FileActionMenuView::ActionIndex: {
+                  // Build full path the same way openSelected / promptDelete
+                  // do (currentDir_ + name with separator handling).
+                  if (selectedIndex_ < files_.size()) {
+                    const FileEntry& entry = files_[selectedIndex_];
+                    char pathBuf[256];
+                    size_t dirLen = strlen(currentDir_);
+                    const bool trailing = (dirLen > 0 && currentDir_[dirLen - 1] == '/');
+                    if (trailing) {
+                      snprintf(pathBuf, sizeof(pathBuf), "%s%s",
+                               currentDir_, entry.name.c_str());
+                    } else {
+                      snprintf(pathBuf, sizeof(pathBuf), "%s/%s",
+                               currentDir_, entry.name.c_str());
+                    }
+                    enterIndexConfirm(core, pathBuf);
+                  } else {
+                    currentScreen_ = Screen::Browse;
+                    needsRender_ = true;
+                  }
+                  break;
+                }
+                case ui::FileActionMenuView::ActionDelete:
+                  // Hand off to the existing confirm-delete flow.
+                  promptDelete(core);
+                  break;
+                case ui::FileActionMenuView::ActionCancel:
+                default:
+                  currentScreen_ = Screen::Browse;
+                  needsRender_ = true;
+                  break;
+              }
+              break;
+            case Button::Back:
+            case Button::Left:
+              currentScreen_ = Screen::Browse;
+              needsRender_ = true;
+              break;
+            default:
+              break;
+          }
         } else if (currentScreen_ == Screen::ConfirmDelete) {
           // Confirmation dialog input
           switch (e.button) {
@@ -388,11 +486,21 @@ StateTransition FileListState::update(Core& core) {
               break;
             case Button::Center:
               if (confirmView_.isYesSelected()) {
-                // Execute delete inline (like SettingsState pattern)
+                // Execute delete inline (like SettingsState pattern).
+                // Defensive bound: should match promptDelete's check, but
+                // covers the race where files_ was reloaded between
+                // showing the dialog and Yes-confirming (won't happen in
+                // single-task flow but cheap insurance).
+                if (files_.empty() || selectedIndex_ >= files_.size()) {
+                  currentScreen_ = Screen::Browse;
+                  needsRender_ = true;
+                  break;
+                }
                 const FileEntry& entry = files_[selectedIndex_];
                 char pathBuf[512];  // currentDir_(256) + '/' + name(128)
                 size_t dirLen = strlen(currentDir_);
-                if (currentDir_[dirLen - 1] == '/') {
+                const bool trailing = (dirLen > 0 && currentDir_[dirLen - 1] == '/');
+                if (trailing) {
                   snprintf(pathBuf, sizeof(pathBuf), "%s%s", currentDir_, entry.name.c_str());
                 } else {
                   snprintf(pathBuf, sizeof(pathBuf), "%s/%s", currentDir_, entry.name.c_str());
@@ -430,7 +538,15 @@ StateTransition FileListState::update(Core& core) {
               break;
           }
         } else {
-          // Normal browse mode
+          // Normal browse mode.
+          //
+          // Button layout (discoverable, no long-press needed):
+          //   Up/Down : navigate list
+          //   Center  : open file / enter directory
+          //   Back    : up one level (home if at root)
+          //   Left    : jump to root (shortcut when deep in folders)
+          //   Right   : delete selected item (with confirmation)
+          //   Power   : reserved for sleep
           switch (e.button) {
             case Button::Up:
               navigateUp(core);
@@ -439,9 +555,20 @@ StateTransition FileListState::update(Core& core) {
               navigateDown(core);
               break;
             case Button::Left:
+              // Jump to root. Only does something when not already at root.
+              if (strcmp(currentDir_, "/") != 0) {
+                strcpy(currentDir_, "/");
+                selectedIndex_ = 0;
+                loadFiles(core);
+                needsRender_ = true;
+              }
               break;
             case Button::Right:
-              goHome_ = true;
+              // Show the file-action popup (Index / Delete / Cancel). The
+              // popup teaches users that "Index for faster reading"
+              // exists; selecting Delete from it leads into the same
+              // confirmation dialog as before.
+              promptFileAction(core);
               break;
             case Button::Center:
               openSelected(core);
@@ -457,6 +584,22 @@ StateTransition FileListState::update(Core& core) {
 
       default:
         break;
+    }
+  }
+
+  // Drive the on-device indexer one spine per update tick. Each tick
+  // synchronously renders "Chapter N of M" then runs the (blocking)
+  // page-cache build for that spine. The render-before-work order
+  // means the screen shows the chapter the user is waiting on, not
+  // the one just completed.
+  if (currentScreen_ == Screen::Indexing) {
+    if (indexCurrentSpine_ >= indexTotalSpines_) {
+      indexResult_ = 1;  // success
+      finishIndexing(core);
+      currentScreen_ = Screen::IndexDone;
+      needsRender_ = true;
+    } else {
+      indexOneSpineStep(core);
     }
   }
 
@@ -505,8 +648,39 @@ void FileListState::render(Core& core) {
     return;
   }
 
+  if (currentScreen_ == Screen::FileAction) {
+    ui::render(renderer_, theme, actionView_);
+    actionView_.needsRender = false;
+    needsRender_ = false;
+    core.display.markDirty();
+    return;
+  }
+
   if (currentScreen_ == Screen::ConvertInfo) {
-    // Already rendered by showConvertMessage(), just clear the flag
+    // Already rendered by showConvertMessage(), just clear the flag.
+    needsRender_ = false;
+    core.display.markDirty();
+    return;
+  }
+
+  if (currentScreen_ == Screen::IndexConfirm) {
+    renderIndexConfirm(core);
+    needsRender_ = false;
+    core.display.markDirty();
+    return;
+  }
+
+  if (currentScreen_ == Screen::Indexing) {
+    // Painted on demand by indexOneSpineStep before each spine; the
+    // periodic re-render path doesn't need to do anything beyond
+    // clearing the flag.
+    needsRender_ = false;
+    core.display.markDirty();
+    return;
+  }
+
+  if (currentScreen_ == Screen::IndexDone) {
+    renderIndexDone(core);
     needsRender_ = false;
     core.display.markDirty();
     return;
@@ -583,11 +757,18 @@ void FileListState::openSelected(Core& core) {
     return;
   }
 
+  // Same defensive clamp as promptDelete: navigate{Up,Down} bound
+  // selectedIndex_, but a stale index from before a list refresh
+  // would otherwise read past files_.size() here.
+  if (selectedIndex_ >= files_.size()) {
+    selectedIndex_ = files_.size() - 1;
+  }
+
   const FileEntry& entry = files_[selectedIndex_];
 
   // Build full path
   size_t dirLen = strlen(currentDir_);
-  if (currentDir_[dirLen - 1] == '/') {
+  if (dirLen > 0 && currentDir_[dirLen - 1] == '/') {
     snprintf(selectedPath_, sizeof(selectedPath_), "%s%s", currentDir_, entry.name.c_str());
   } else {
     snprintf(selectedPath_, sizeof(selectedPath_), "%s/%s", currentDir_, entry.name.c_str());
@@ -595,15 +776,13 @@ void FileListState::openSelected(Core& core) {
 
   if (entry.isDir) {
     // Enter directory
-    strncpy(currentDir_, selectedPath_, sizeof(currentDir_) - 1);
-    currentDir_[sizeof(currentDir_) - 1] = '\0';
+    utf8SafeCopy(currentDir_, selectedPath_, sizeof(currentDir_));
     selectedIndex_ = 0;
     loadFiles(core);
     needsRender_ = true;
 
     // Save directory for return after mode switch
-    strncpy(core.settings.fileListDir, currentDir_, sizeof(core.settings.fileListDir) - 1);
-    core.settings.fileListDir[sizeof(core.settings.fileListDir) - 1] = '\0';
+    utf8SafeCopy(core.settings.fileListDir, currentDir_, sizeof(core.settings.fileListDir));
     core.settings.fileListSelectedName[0] = '\0';
     core.settings.fileListSelectedIndex = 0;
   } else if (entry.unsupported) {
@@ -646,19 +825,15 @@ void FileListState::openSelected(Core& core) {
 #endif
   } else {
     // Save position for return
-    strncpy(core.settings.fileListDir, currentDir_, sizeof(core.settings.fileListDir) - 1);
-    core.settings.fileListDir[sizeof(core.settings.fileListDir) - 1] = '\0';
-    strncpy(core.settings.fileListSelectedName, entry.name.c_str(), sizeof(core.settings.fileListSelectedName) - 1);
-    core.settings.fileListSelectedName[sizeof(core.settings.fileListSelectedName) - 1] = '\0';
+    utf8SafeCopy(core.settings.fileListDir, currentDir_, sizeof(core.settings.fileListDir));
+    utf8SafeCopy(core.settings.fileListSelectedName, entry.name.c_str(), sizeof(core.settings.fileListSelectedName));
     core.settings.fileListSelectedIndex = selectedIndex_;
 
     // Select file - transition to Reader state
     Serial.printf("[FILES] Selected: %s\n", selectedPath_);
-    strncpy(core.buf.path, selectedPath_, sizeof(core.buf.path) - 1);
-    core.buf.path[sizeof(core.buf.path) - 1] = '\0';
+    utf8SafeCopy(core.buf.path, selectedPath_, sizeof(core.buf.path));
     // Save lastBookPath for cold boot "continue reading"
-    strncpy(core.settings.lastBookPath, selectedPath_, sizeof(core.settings.lastBookPath) - 1);
-    core.settings.lastBookPath[sizeof(core.settings.lastBookPath) - 1] = '\0';
+    utf8SafeCopy(core.settings.lastBookPath, selectedPath_, sizeof(core.settings.lastBookPath));
     core.settings.transitionReturnTo = 1;  // ReturnTo::FILE_MANAGER
     core.settings.saveToFile();
     pendingOpen_ = true;
@@ -686,8 +861,41 @@ void FileListState::goBack(Core& core) {
   needsRender_ = true;
 }
 
+void FileListState::promptFileAction(Core& core) {
+  (void)core;
+  if (files_.empty()) return;
+  if (selectedIndex_ >= files_.size()) {
+    selectedIndex_ = files_.size() - 1;
+  }
+
+  const FileEntry& entry = files_[selectedIndex_];
+
+  // Truncate long names to fit the popup title width. Same UTF-8-safe
+  // truncation pattern as the delete dialog so CJK file names don't
+  // split mid-codepoint.
+  char titleBuf[ui::FileActionMenuView::MAX_TITLE_LEN];
+  if (entry.name.length() > 60) {
+    char head[58];
+    utf8SafeCopy(head, entry.name.c_str(), sizeof(head));
+    snprintf(titleBuf, sizeof(titleBuf), "%s...", head);
+  } else {
+    utf8SafeCopy(titleBuf, entry.name.c_str(), sizeof(titleBuf));
+  }
+  actionView_.setup(titleBuf);
+  currentScreen_ = Screen::FileAction;
+  needsRender_ = true;
+}
+
 void FileListState::promptDelete(Core& core) {
   if (files_.empty()) return;
+
+  // Defense-in-depth: navigateUp/navigateDown bound selectedIndex_ to
+  // [0, files_.size()-1], but a stale index from before a loadFiles()
+  // shrank the list could otherwise read out-of-bounds. Same fix
+  // pattern as the post-delete clamp at line 428.
+  if (selectedIndex_ >= files_.size()) {
+    selectedIndex_ = files_.size() - 1;
+  }
 
   const FileEntry& entry = files_[selectedIndex_];
   const char* typeStr = entry.isDir ? "folder" : "file";
@@ -697,15 +905,347 @@ void FileListState::promptDelete(Core& core) {
 
   char line2[48];
   if (entry.name.length() > 40) {
-    snprintf(line2, sizeof(line2), "%.37s...", entry.name.c_str());
+    // UTF-8 safe truncation: `%.37s` slices bytes, which corrupts CJK.
+    char head[38];
+    utf8SafeCopy(head, entry.name.c_str(), sizeof(head));
+    snprintf(line2, sizeof(line2), "%s...", head);
   } else {
-    strncpy(line2, entry.name.c_str(), sizeof(line2) - 1);
-    line2[sizeof(line2) - 1] = '\0';
+    utf8SafeCopy(line2, entry.name.c_str(), sizeof(line2));
   }
 
   confirmView_.setup("Confirm Delete", line1, line2);
   currentScreen_ = Screen::ConfirmDelete;
+  (void)core;
   needsRender_ = true;
+}
+
+void FileListState::enterIndexConfirm(Core& core, const char* filename) {
+  (void)core;
+  utf8SafeCopy(indexBookPath_, filename ? filename : "", sizeof(indexBookPath_));
+  indexResult_ = 0;
+  indexCurrentSpine_ = 0;
+  indexTotalSpines_ = 0;
+  currentScreen_ = Screen::IndexConfirm;
+  needsRender_ = true;
+}
+
+void FileListState::renderIndexConfirm(Core& core) {
+  (void)core;
+  Theme& theme = THEME_MANAGER.mutableCurrent();
+  renderer_.clearScreen(theme.backgroundColor);
+
+  const int pageH = renderer_.getScreenHeight();
+  const int pageW = renderer_.getScreenWidth();
+  const int lineH = renderer_.getLineHeight(theme.menuFontId);
+  int y = pageH / 2 - lineH * 6;
+
+  renderer_.drawCenteredText(theme.readerFontId, y, "Index for Faster Reading",
+                             theme.primaryTextBlack, EpdFontFamily::BOLD);
+  y += lineH + 16;
+
+  // Truncate filename UTF-8-safely so a long CJK title doesn't bleed off-screen.
+  char shortName[44];
+  const char* baseName = indexBookPath_;
+  const char* slash = strrchr(indexBookPath_, '/');
+  if (slash && *(slash + 1)) baseName = slash + 1;
+  if (baseName && baseName[0]) {
+    utf8SafeCopy(shortName, baseName, sizeof(shortName));
+    renderer_.drawCenteredText(theme.menuFontId, y, shortName, theme.primaryTextBlack);
+    y += lineH + 14;
+  }
+
+  renderer_.drawCenteredText(theme.menuFontId, y,
+                             "Pre-builds every chapter's page cache so",
+                             theme.primaryTextBlack);
+  y += lineH + 2;
+  renderer_.drawCenteredText(theme.menuFontId, y,
+                             "reads load instantly, no Bluetooth-stalls.",
+                             theme.primaryTextBlack);
+  y += lineH + 14;
+  renderer_.drawCenteredText(theme.menuFontId, y,
+                             "Tradeoff: font, font size, line spacing,",
+                             theme.primaryTextBlack);
+  y += lineH + 2;
+  renderer_.drawCenteredText(theme.menuFontId, y,
+                             "hyphenation get baked in at this moment.",
+                             theme.primaryTextBlack);
+  y += lineH + 2;
+  renderer_.drawCenteredText(theme.menuFontId, y,
+                             "Changing them later rebuilds the cache.",
+                             theme.primaryTextBlack);
+  y += lineH + 14;
+  renderer_.drawCenteredText(theme.menuFontId, y,
+                             "Takes 1-10 minutes. Leave it alone.",
+                             theme.primaryTextBlack);
+  y += lineH + 20;
+
+  // Two big buttons, matching the ConfirmDialogView style.
+  constexpr int buttonWidth = 140;
+  constexpr int buttonHeight = 50;
+  constexpr int buttonSpacing = 30;
+  constexpr int totalWidth = buttonWidth * 2 + buttonSpacing;
+  const int startX = (pageW - totalWidth) / 2;
+
+  // Start button — selected by default (Center confirms).
+  renderer_.fillRect(startX, y, buttonWidth, buttonHeight, theme.selectionFillBlack);
+  const int startTextW = renderer_.getTextWidth(theme.menuFontId, "Start");
+  renderer_.drawText(theme.menuFontId,
+                     startX + (buttonWidth - startTextW) / 2,
+                     y + (buttonHeight - renderer_.getFontAscenderSize(theme.menuFontId)) / 2,
+                     "Start", theme.selectionTextBlack);
+
+  // Cancel button.
+  const int cancelX = startX + buttonWidth + buttonSpacing;
+  renderer_.drawRect(cancelX, y, buttonWidth, buttonHeight, theme.primaryTextBlack);
+  const int cancelTextW = renderer_.getTextWidth(theme.menuFontId, "Cancel");
+  renderer_.drawText(theme.menuFontId,
+                     cancelX + (buttonWidth - cancelTextW) / 2,
+                     y + (buttonHeight - renderer_.getFontAscenderSize(theme.menuFontId)) / 2,
+                     "Cancel", theme.primaryTextBlack);
+
+  renderer_.displayBuffer();
+}
+
+bool FileListState::startIndexing(Core& core) {
+  // Only EPUBs can be indexed on-device for now — XTC is already indexed
+  // and other formats don't go through the page-cache pipeline.
+  if (!indexBookPath_[0]) return false;
+  const size_t pathLen = strlen(indexBookPath_);
+  if (pathLen < 5 || strcasecmp(indexBookPath_ + pathLen - 5, ".epub") != 0) {
+    indexResult_ = 3;  // error
+    return false;
+  }
+
+  // Save the user's current external font so we can reload it after.
+  // The indexer releases it for the duration of the parse to free
+  // 8-15 KB of heap (same trick as the in-reader cold extend).
+  indexFontWasLoaded_ = (FONT_MANAGER.getExternalFont() != nullptr);
+  if (indexFontWasLoaded_) {
+    utf8SafeCopy(indexSavedFont_, core.settings.readerFont, sizeof(indexSavedFont_));
+    Serial.printf("[INDEX] Releasing external font '%s' for indexing\n", indexSavedFont_);
+    FONT_MANAGER.unloadExternalFont();
+  } else {
+    indexSavedFont_[0] = '\0';
+  }
+
+  // Note: we DO NOT call ble::deinit() here even though it would free
+  // ~48 KB. ble::init() on the re-init path has been observed to
+  // synchronously block loopTask past the task watchdog timeout, which
+  // would crash mid-indexing. Trust that ~20 KB free + font released +
+  // background cache task NOT running is enough for the parser; if not,
+  // the parser's safety threshold bails per-spine and the per-spine
+  // cache stays partial — still strictly better than today.
+  indexBleWasInitd_ = false;  // reserved for future deinit attempt
+
+  // Open the EPUB. Use the global cache dir so the per-book subdirectory
+  // matches what the reader will read at runtime.
+  indexProvider_ = std::unique_ptr<EpubProvider>(new (std::nothrow) EpubProvider());
+  if (!indexProvider_) {
+    indexResult_ = 3;
+    return false;
+  }
+  auto openResult = indexProvider_->open(indexBookPath_, SUMI_CACHE_DIR);
+  if (!openResult.ok() || !indexProvider_->getEpub()) {
+    Serial.printf("[INDEX] Failed to open EPUB '%s' for indexing\n", indexBookPath_);
+    indexProvider_.reset();
+    indexResult_ = 3;
+    return false;
+  }
+
+  indexTotalSpines_ = indexProvider_->getEpub()->getSpineItemsCount();
+  indexCurrentSpine_ = 0;
+  indexStartMs_ = millis();
+  Serial.printf("[INDEX] Starting on-device indexing of '%s' (%u spines)\n",
+                indexBookPath_, (unsigned)indexTotalSpines_);
+  currentScreen_ = Screen::Indexing;
+  needsRender_ = true;
+  return true;
+}
+
+void FileListState::indexOneSpineStep(Core& core) {
+  // Defensive: somebody got us here without an open provider.
+  if (!indexProvider_ || !indexProvider_->getEpub()) {
+    indexResult_ = 3;
+    currentScreen_ = Screen::IndexDone;
+    needsRender_ = true;
+    return;
+  }
+  if (indexCurrentSpine_ >= indexTotalSpines_) {
+    indexResult_ = 1;  // success
+    currentScreen_ = Screen::IndexDone;
+    needsRender_ = true;
+    return;
+  }
+
+  // Show "Chapter <currentSpine + 1> of <total>" BEFORE the spine work
+  // so the user has something on screen during the blocking parse.
+  // The post-spine increment means the next call's renderIndexProgress
+  // shows the new chapter.
+  renderIndexProgress(core);
+
+  auto epubShared = indexProvider_->getEpubShared();
+  auto* epub = epubShared.get();
+  const Theme& theme = THEME_MANAGER.current();
+
+  // Compute the same viewport the reader will use, so the cache config
+  // matches at read time and doesn't trigger "Config mismatch" on first
+  // open.
+  int marginT, marginR, marginB, marginL;
+  renderer_.getOrientedViewableTRBL(&marginT, &marginR, &marginB, &marginL);
+  // Reader adds horizontalPadding (per ReaderState::getReaderViewport).
+  // Mirror the same constants here so the config matches byte-for-byte.
+  constexpr int horizontalPadding = 16;
+  constexpr int statusBarMargin = 30;
+  marginL += horizontalPadding;
+  marginR += horizontalPadding;
+  marginB += statusBarMargin;
+  const int width = renderer_.getScreenWidth() - marginL - marginR;
+  const int height = renderer_.getScreenHeight() - marginT - marginB;
+
+  auto config = core.settings.getRenderConfig(theme, width, height);
+  config.allowTallImages = false;
+
+  // Build per-spine cache path matching ReaderState's epubSectionCachePath:
+  //   <epubCachePath>/sections/<spineIndex>.bin
+  std::string cachePath = epub->getCachePath() + "/sections/" +
+                           std::to_string(indexCurrentSpine_) + ".bin";
+  std::string imageCachePath =
+      core.settings.showImages ? (epub->getCachePath() + "/images") : "";
+
+  auto* parser = new (std::nothrow) EpubChapterParser(
+      epubShared, indexCurrentSpine_, renderer_, config, imageCachePath);
+  if (!parser) {
+    Serial.printf("[INDEX] Spine %u parser alloc failed — skipping\n",
+                  (unsigned)indexCurrentSpine_);
+    indexCurrentSpine_++;
+    needsRender_ = true;
+    return;
+  }
+
+  PageCache cache(cachePath);
+  // maxPages=0 means unlimited — let the parser run to chapter end. The
+  // existing safety threshold inside the parser still applies; if heap
+  // pressure hits, we get a partial cache for this spine, which is
+  // still better than nothing.
+  const uint32_t t0 = millis();
+  const bool ok = cache.create(*parser, config, /*maxPages=*/0, /*skipPages=*/0, nullptr);
+  const uint32_t ms = millis() - t0;
+  Serial.printf("[INDEX] Spine %u/%u: %s in %lu ms (%u pages, partial=%d)\n",
+                (unsigned)(indexCurrentSpine_ + 1), (unsigned)indexTotalSpines_,
+                ok ? "OK" : "FAIL", (unsigned long)ms,
+                (unsigned)cache.pageCount(), cache.isPartial() ? 1 : 0);
+
+  delete parser;
+  indexCurrentSpine_++;
+  // No needsRender_=true: the next update tick's renderIndexProgress
+  // call will paint the new chapter number directly. Setting it would
+  // just queue a redundant redraw of the SAME (just-rendered) frame.
+}
+
+void FileListState::renderIndexProgress(Core& core) {
+  (void)core;
+  Theme& theme = THEME_MANAGER.mutableCurrent();
+  renderer_.clearScreen(theme.backgroundColor);
+
+  const int pageH = renderer_.getScreenHeight();
+  const int pageW = renderer_.getScreenWidth();
+  const int lineH = renderer_.getLineHeight(theme.menuFontId);
+  int y = pageH / 2 - lineH * 4;
+
+  renderer_.drawCenteredText(theme.readerFontId, y, "Indexing...",
+                             theme.primaryTextBlack, EpdFontFamily::BOLD);
+  y += lineH + 16;
+
+  char shortName[40];
+  const char* baseName = indexBookPath_;
+  const char* slash = strrchr(indexBookPath_, '/');
+  if (slash && *(slash + 1)) baseName = slash + 1;
+  if (baseName[0]) {
+    utf8SafeCopy(shortName, baseName, sizeof(shortName));
+    renderer_.drawCenteredText(theme.menuFontId, y, shortName, theme.primaryTextBlack);
+    y += lineH + 18;
+  }
+
+  char status[48];
+  snprintf(status, sizeof(status), "Chapter %u of %u",
+           (unsigned)(indexCurrentSpine_ + 1), (unsigned)indexTotalSpines_);
+  renderer_.drawCenteredText(theme.readerFontId, y, status,
+                             theme.primaryTextBlack, EpdFontFamily::BOLD);
+  y += lineH + 24;
+
+  // Simple progress bar (no time estimate — spine work varies wildly).
+  constexpr int barWidth = 320;
+  constexpr int barHeight = 16;
+  const int barX = (pageW - barWidth) / 2;
+  const int barY = y;
+  renderer_.drawRect(barX, barY, barWidth, barHeight, theme.primaryTextBlack);
+  const int filled = indexTotalSpines_ > 0
+                         ? (barWidth * indexCurrentSpine_) / indexTotalSpines_
+                         : 0;
+  if (filled > 0) {
+    renderer_.fillRect(barX + 1, barY + 1, filled - 2 < 0 ? 0 : filled - 2,
+                       barHeight - 2, theme.primaryTextBlack);
+  }
+  y += barHeight + 24;
+
+  renderer_.drawCenteredText(theme.menuFontId, y,
+                             "Press Back to cancel",
+                             theme.primaryTextBlack);
+
+  renderer_.displayBuffer();
+}
+
+void FileListState::renderIndexDone(Core& core) {
+  (void)core;
+  Theme& theme = THEME_MANAGER.mutableCurrent();
+  renderer_.clearScreen(theme.backgroundColor);
+
+  const int pageH = renderer_.getScreenHeight();
+  const int lineH = renderer_.getLineHeight(theme.menuFontId);
+  int y = pageH / 2 - lineH * 2;
+
+  const char* headline = "Indexing Complete";
+  if (indexResult_ == 2) headline = "Indexing Cancelled";
+  else if (indexResult_ == 3) headline = "Indexing Failed";
+  renderer_.drawCenteredText(theme.readerFontId, y, headline,
+                             theme.primaryTextBlack, EpdFontFamily::BOLD);
+  y += lineH + 20;
+
+  char summary[64];
+  if (indexResult_ == 1) {
+    const uint32_t secs = (millis() - indexStartMs_) / 1000;
+    snprintf(summary, sizeof(summary), "Built %u chapters in %lus",
+             (unsigned)indexTotalSpines_, (unsigned long)secs);
+  } else if (indexResult_ == 2) {
+    snprintf(summary, sizeof(summary), "Stopped at chapter %u of %u",
+             (unsigned)indexCurrentSpine_, (unsigned)indexTotalSpines_);
+  } else {
+    snprintf(summary, sizeof(summary), "See serial log for details");
+  }
+  renderer_.drawCenteredText(theme.menuFontId, y, summary, theme.primaryTextBlack);
+  y += lineH + 20;
+
+  renderer_.drawCenteredText(theme.menuFontId, y,
+                             "Press any button to return",
+                             theme.primaryTextBlack);
+  renderer_.displayBuffer();
+}
+
+void FileListState::finishIndexing(Core& core) {
+  (void)core;
+  if (indexProvider_) {
+    indexProvider_->close();
+    indexProvider_.reset();
+  }
+  if (indexFontWasLoaded_ && indexSavedFont_[0]) {
+    Serial.printf("[INDEX] Reloading external font '%s' after indexing\n",
+                  indexSavedFont_);
+    FONT_MANAGER.loadExternalFont(indexSavedFont_);
+  }
+  indexFontWasLoaded_ = false;
+  indexSavedFont_[0] = '\0';
+  indexBleWasInitd_ = false;
+  // currentSpine/totalSpines/result kept for IndexDone screen rendering.
 }
 
 int FileListState::getPageItems() const {

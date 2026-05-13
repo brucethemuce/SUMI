@@ -96,9 +96,12 @@ void statusBar(const GfxRenderer& r, const Theme& t, int page, int total, int pe
 void bookCard(const GfxRenderer& r, const Theme& t, int y, const char* title, const char* author, const uint8_t* cover,
               int coverW, int coverH);
 
-// File entry - File name with directory indicator, content type tag, and conversion status
+// File entry - File name with directory indicator, content type tag, and conversion status.
+// progressPercent: -1 = never opened, 0-100 = reading progress. Widened
+// from int8_t to int16_t in Batch 7 to match the corresponding fields in
+// LibraryIndex / FileListState (audit #35).
 void fileEntry(const GfxRenderer& r, const Theme& t, int y, const char* name, bool isDir, bool selected,
-               int8_t progressPercent = -1, bool unsupported = false, uint8_t contentHint = 0);
+               int16_t progressPercent = -1, bool unsupported = false, uint8_t contentHint = 0);
 
 // Chapter item - TOC entry with depth indentation and current chapter indicator
 // fontId: Use reader font (readerFontIdXSmall) for EPUB/TXT/Markdown to support non-Latin glyphs,

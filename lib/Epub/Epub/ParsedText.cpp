@@ -221,6 +221,14 @@ bool ParsedText::layoutAndExtractLines(const GfxRenderer& renderer, const int fo
     return false;
   }
 
+  // Guard against lineBreakIndices being empty (can happen if abort fires
+  // inside the break computation, or if all words are zero-width under an
+  // unusual font). Computing `.size() - 1` on a zero-size vector wraps to
+  // SIZE_MAX and the for loop below would try to draw ~2^64 lines.
+  if (lineBreakIndices.empty()) {
+    return true;
+  }
+
   const size_t lineCount = includeLastLine ? lineBreakIndices.size() : lineBreakIndices.size() - 1;
 
   for (size_t i = 0; i < lineCount; ++i) {
@@ -322,8 +330,13 @@ std::vector<size_t> ParsedText::computeLineBreaks(const int pageWidth, const int
   ans[n - 1] = n - 1;
 
   for (int i = static_cast<int>(n) - 2; i >= 0; --i) {
-    // Check for abort periodically (every 100 words)
-    if (shouldAbort && (static_cast<size_t>(-i) % 100 == 0) && shouldAbort()) {
+    // Check for abort periodically (every 100 words). The old condition
+    // was `static_cast<size_t>(-i) % 100 == 0` which, for positive i,
+    // casts a negative int to size_t and yields values near SIZE_MAX
+    // that almost never hit 0 modulo 100 — the abort check was
+    // effectively dead for long chapters. Use the iteration offset
+    // (n-2-i) so the modulo math is on a positive value again.
+    if (shouldAbort && ((static_cast<size_t>(n) - 2 - static_cast<size_t>(i)) % 100 == 0) && shouldAbort()) {
       return {};
     }
 

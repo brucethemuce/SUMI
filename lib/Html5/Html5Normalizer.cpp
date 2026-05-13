@@ -264,13 +264,15 @@ bool normalizeVoidElements(const std::string& inputPath, const std::string& outp
 
   if (!flushWrite()) goto error;
 
-  inFile.close();
-  outFile.close();
+  inFile.close();                 // reader
+  SdMan.syncAndClose(outFile);    // writer — normalized HTML is about
+                                  // to be re-read by the chapter
+                                  // parser, so tail must be on disk
   return true;
 
 error:
   inFile.close();
-  outFile.close();
+  outFile.close();                // removing anyway
   SdMan.remove(outputPath.c_str());
   return false;
 }

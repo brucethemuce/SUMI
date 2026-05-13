@@ -2,11 +2,20 @@
 
 #include "core/SumiSettings.h"
 
+// Physical button layout:
+//   - frontLayout (FrontBCLR vs FrontLRBC) swaps the BOTTOM two toggle
+//     switches between Back/Confirm and Left/Right. This is a pure
+//     hardware remap and applies to every state.
+//   - sideButtonLayout (PrevNext vs NextPrev) used to also swap the side
+//     toggle between Up/Down, which broke menu navigation in every
+//     non-reader state (user feedback: "the top sidebutton move the page
+//     forward and bottom go backwards. While SUMI has a setting for this,
+//     changing it also messes up the normal up down movements in menus").
+//     That swap now lives inside ReaderState page navigation only; here
+//     Up/Down are a direct 1:1 hardware mapping.
 decltype(InputManager::BTN_BACK) MappedInputManager::mapButton(const Button button) const {
   const auto frontLayout = settings_ ? static_cast<sumi::Settings::FrontButtonLayout>(settings_->frontButtonLayout)
                                      : sumi::Settings::FrontBCLR;
-  const auto sideLayout = settings_ ? static_cast<sumi::Settings::SideButtonLayout>(settings_->sideButtonLayout)
-                                    : sumi::Settings::PrevNext;
 
   switch (button) {
     case Button::Back:
@@ -42,39 +51,11 @@ decltype(InputManager::BTN_BACK) MappedInputManager::mapButton(const Button butt
           return InputManager::BTN_RIGHT;
       }
     case Button::Up:
-      switch (sideLayout) {
-        case sumi::Settings::NextPrev:
-          return InputManager::BTN_DOWN;
-        case sumi::Settings::PrevNext:
-        default:
-          return InputManager::BTN_UP;
-      }
+      return InputManager::BTN_UP;
     case Button::Down:
-      switch (sideLayout) {
-        case sumi::Settings::NextPrev:
-          return InputManager::BTN_UP;
-        case sumi::Settings::PrevNext:
-        default:
-          return InputManager::BTN_DOWN;
-      }
+      return InputManager::BTN_DOWN;
     case Button::Power:
       return InputManager::BTN_POWER;
-    case Button::PageBack:
-      switch (sideLayout) {
-        case sumi::Settings::NextPrev:
-          return InputManager::BTN_DOWN;
-        case sumi::Settings::PrevNext:
-        default:
-          return InputManager::BTN_UP;
-      }
-    case Button::PageForward:
-      switch (sideLayout) {
-        case sumi::Settings::NextPrev:
-          return InputManager::BTN_UP;
-        case sumi::Settings::PrevNext:
-        default:
-          return InputManager::BTN_DOWN;
-      }
   }
 
   return InputManager::BTN_BACK;

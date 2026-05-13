@@ -1,6 +1,9 @@
 #include "LibraryIndex.h"
 
 #include <Arduino.h>
+#include <Crc32.h>
+
+#include <vector>
 
 #include "../core/Core.h"
 
@@ -50,107 +53,131 @@ bool LibraryIndex::updateEntry(Core& core, const char* bookPath, uint16_t curren
 
   const uint32_t hash = hashPath(bookPath);
 
-  // Read existing file to find entry and get count
+  // Single-pass: read every existing entry into a small in-memory vector
+  // (200 × 9 bytes = 1.8 KB max), patch in place, then write once.
+  // Pre-Batch-9 this opened INDEX_PATH twice — once to find the matching
+  // hash, once to copy entries into the new file — and the second open
+  // could see a different state if anything else mutated SD between
+  // them. The atomic-write protocol still wraps the write side; the
+  // change here is purely "halve the SD opens". Audit #49.
+  std::vector<Entry> entries;
+  entries.reserve(MAX_ENTRIES);
+
   FsFile readFile;
-  auto readResult = core.storage.openRead(INDEX_PATH, readFile);
-  
-  int existingCount = 0;
-  int targetIdx = -1;
-  
-  if (readResult.ok()) {
-    uint8_t version;
-    if (readFile.read(&version, 1) == 1 && version == VERSION) {
-      uint16_t count;
+  if (core.storage.openRead(INDEX_PATH, readFile).ok()) {
+    uint8_t version = 0;
+    Crc32 crc;
+    // Accept v2 (pre-Batch-8 layout, no trailer) and v3 (adds CRC32
+    // trailer). v3 reads still tolerate v2 files — they get migrated
+    // on next save.
+    if (readFile.read(&version, 1) == 1 && version >= 2 && version <= VERSION) {
+      crc.update(&version, 1);
+      uint16_t count = 0;
       if (readFile.read(reinterpret_cast<uint8_t*>(&count), 2) == 2) {
-        existingCount = count;
-        // Stream through entries to find matching hash
+        crc.update(&count, 2);
+        if (count > MAX_ENTRIES) {
+          Serial.printf("[%lu] [LIB] count %u exceeds MAX_ENTRIES %d, capping\n",
+                        millis(), count, MAX_ENTRIES);
+          count = MAX_ENTRIES;
+        }
         Entry tempEntry;
-        for (int i = 0; i < existingCount && i < MAX_ENTRIES; i++) {
-          if (readFile.read(reinterpret_cast<uint8_t*>(&tempEntry), sizeof(Entry)) == sizeof(Entry)) {
-            if (tempEntry.pathHash == hash) {
-              targetIdx = i;
-              break;
+        for (int i = 0; i < count; i++) {
+          if (readFile.read(reinterpret_cast<uint8_t*>(&tempEntry), sizeof(Entry)) ==
+              sizeof(Entry)) {
+            crc.update(&tempEntry, sizeof(Entry));
+            entries.push_back(tempEntry);
+          } else {
+            break;  // Truncated — keep what we have.
+          }
+        }
+        // Verify CRC32 trailer for v3+. Tolerant per audit policy: a
+        // mismatch logs and we keep the data we already loaded.
+        if (version >= VERSION_WITH_CRC) {
+          uint32_t fileCrc = 0;
+          if (readFile.read(reinterpret_cast<uint8_t*>(&fileCrc), 4) == 4) {
+            const uint32_t computed = crc.finalize();
+            if (fileCrc != computed) {
+              Serial.printf("[%lu] [LIB] WARN: library.bin CRC32 mismatch "
+                            "(file=0x%08X computed=0x%08X); accepting payload\n",
+                            millis(),
+                            static_cast<unsigned>(fileCrc),
+                            static_cast<unsigned>(computed));
             }
+          } else {
+            Serial.printf("[%lu] [LIB] WARN: library.bin v%u missing CRC32 trailer\n",
+                          millis(), static_cast<unsigned>(version));
           }
         }
       }
+    } else if (version != 0) {
+      Serial.printf("[%lu] [LIB] Unsupported version %u, dropping\n",
+                    millis(), static_cast<unsigned>(version));
     }
     readFile.close();
   }
 
-  // Now we know if we're updating or appending
-  // Reopen for read to copy entries
-  readResult = core.storage.openRead(INDEX_PATH, readFile);
-  
-  // Open temp file for write
-  FsFile writeFile;
-  auto writeResult = core.storage.openWrite("/.sumi/library.tmp", writeFile);
-  if (!writeResult.ok()) {
-    if (readResult.ok()) readFile.close();
-    Serial.println("[LIBIDX] Failed to write library.tmp");
-    return false;
-  }
-
-  // Write header
-  writeFile.write(&VERSION, 1);
-  
-  int newCount = (targetIdx >= 0) ? existingCount : 
-                 (existingCount < MAX_ENTRIES) ? existingCount + 1 : existingCount;
-  uint16_t cnt = static_cast<uint16_t>(newCount);
-  writeFile.write(reinterpret_cast<const uint8_t*>(&cnt), 2);
-
-  // Create the new/updated entry
+  // Construct the new/updated entry. If contentHint==0 (caller didn't
+  // supply one) we preserve the prior entry's hint when updating.
   Entry newEntry;
   newEntry.pathHash = hash;
   newEntry.currentPage = currentPage;
   newEntry.totalPages = totalPages;
   newEntry.contentHint = contentHint;
 
-  if (readResult.ok()) {
-    // Skip old header
-    readFile.seek(3);
-    
-    Entry tempEntry;
-    int written = 0;
-    for (int i = 0; i < existingCount && written < newCount; i++) {
-      if (readFile.read(reinterpret_cast<uint8_t*>(&tempEntry), sizeof(Entry)) != sizeof(Entry)) break;
-      
-      if (i == targetIdx) {
-        // Replace this entry
-        if (contentHint == 0) newEntry.contentHint = tempEntry.contentHint;  // Preserve hint
-        writeFile.write(reinterpret_cast<const uint8_t*>(&newEntry), sizeof(Entry));
-      } else if (existingCount >= MAX_ENTRIES && i == 0 && targetIdx < 0) {
-        // Skip oldest entry when full and adding new
-        continue;
-      } else {
-        writeFile.write(reinterpret_cast<const uint8_t*>(&tempEntry), sizeof(Entry));
-      }
-      written++;
+  bool updated = false;
+  for (auto& e : entries) {
+    if (e.pathHash == hash) {
+      if (contentHint == 0) newEntry.contentHint = e.contentHint;
+      e = newEntry;
+      updated = true;
+      break;
     }
-    readFile.close();
-    
-    // Append new entry if not updating existing
-    if (targetIdx < 0 && written < MAX_ENTRIES) {
-      writeFile.write(reinterpret_cast<const uint8_t*>(&newEntry), sizeof(Entry));
+  }
+  if (!updated) {
+    if (entries.size() >= static_cast<size_t>(MAX_ENTRIES)) {
+      // Drop oldest to make room — matches pre-Batch-9 behaviour.
+      entries.erase(entries.begin());
     }
-  } else {
-    // No existing file, just write new entry
-    writeFile.write(reinterpret_cast<const uint8_t*>(&newEntry), sizeof(Entry));
+    entries.push_back(newEntry);
   }
 
-  // Flush and close temp file before replacing the original.
-  // SdFat rename fails if target exists, so we must remove first.
-  // sync() ensures data is on disk before we remove the old file.
-  writeFile.sync();
-  writeFile.close();
-  SdMan.remove(INDEX_PATH);
-  SdMan.rename("/.sumi/library.tmp", INDEX_PATH);
+  // Atomic write: helper opens <INDEX_PATH>.tmp; on commit, performs the
+  // canonical→.bak, .tmp→canonical, drop-.bak rotation documented in
+  // docs/ATOMIC_WRITE_DESIGN.md. Power loss at any intermediate point
+  // is recovered by recoverAtomicWrites() at next boot — the previous
+  // unsafe remove+rename pair could leave the library file missing.
+  FsFile writeFile;
+  if (!core.storage.atomicOpenWrite(INDEX_PATH, writeFile).ok()) {
+    Serial.println("[LIBIDX] atomicOpenWrite failed");
+    return false;
+  }
 
-  Serial.printf("[LIBIDX] Updated: hash=%u page=%u/%u (%d entries)\n", hash, currentPage, totalPages, newCount);
+  Crc32 wcrc;
+  writeFile.write(&VERSION, 1);
+  wcrc.update(&VERSION, 1);
+  uint16_t cnt = static_cast<uint16_t>(entries.size());
+  writeFile.write(reinterpret_cast<const uint8_t*>(&cnt), 2);
+  wcrc.update(&cnt, 2);
+  for (const auto& e : entries) {
+    writeFile.write(reinterpret_cast<const uint8_t*>(&e), sizeof(Entry));
+    wcrc.update(&e, sizeof(Entry));
+  }
+  // CRC32 trailer (v3+). Audit #26 follow-up.
+  const uint32_t trailer = wcrc.finalize();
+  writeFile.write(reinterpret_cast<const uint8_t*>(&trailer), 4);
+
+  if (!core.storage.atomicCommit(writeFile, INDEX_PATH).ok()) {
+    Serial.println("[LIBIDX] atomicCommit failed");
+    core.storage.atomicAbort(writeFile, INDEX_PATH);
+    return false;
+  }
+
+  Serial.printf("[LIBIDX] Updated: hash=%u page=%u/%u (%zu entries)\n",
+                hash, currentPage, totalPages, entries.size());
   return true;
 }
 
-int8_t LibraryIndex::getProgress(Core& core, const char* bookPath) {
+int16_t LibraryIndex::getProgress(Core& core, const char* bookPath) {
   if (!bookPath || bookPath[0] == '\0') return -1;
 
   const uint32_t hash = hashPath(bookPath);
@@ -160,7 +187,9 @@ int8_t LibraryIndex::getProgress(Core& core, const char* bookPath) {
   if (!result.ok()) return -1;
 
   uint8_t version;
-  if (file.read(&version, 1) != 1 || version != VERSION) {
+  // Accept v2 (no CRC) and v3+ (CRC trailer present but unused on these
+  // read-only paths — they don't track CRC, just consume entries).
+  if (file.read(&version, 1) != 1 || version < 2 || version > VERSION) {
     file.close();
     return -1;
   }
@@ -170,12 +199,14 @@ int8_t LibraryIndex::getProgress(Core& core, const char* bookPath) {
     file.close();
     return -1;
   }
+  if (count > MAX_ENTRIES) count = MAX_ENTRIES;
 
   Entry entry;
   for (uint16_t i = 0; i < count; i++) {
     if (file.read(reinterpret_cast<uint8_t*>(&entry), sizeof(Entry)) != sizeof(Entry)) break;
     if (entry.pathHash == hash) {
       file.close();
+      // progressPercent() clamps to [0, 100], so int16_t fits.
       return entry.progressPercent();
     }
   }
@@ -190,7 +221,9 @@ int LibraryIndex::loadAll(Core& core, Entry* entries, int maxEntries) {
   if (!result.ok()) return 0;
 
   uint8_t version;
-  if (file.read(&version, 1) != 1 || version != VERSION) {
+  // Accept v2 (no CRC) and v3+ (CRC trailer present but unused on these
+  // read-only paths — they don't track CRC, just consume entries).
+  if (file.read(&version, 1) != 1 || version < 2 || version > VERSION) {
     file.close();
     return 0;
   }
@@ -200,6 +233,7 @@ int LibraryIndex::loadAll(Core& core, Entry* entries, int maxEntries) {
     file.close();
     return 0;
   }
+  if (count > MAX_ENTRIES) count = MAX_ENTRIES;
 
   int toRead = (count < maxEntries) ? count : maxEntries;
   int actual = 0;
@@ -221,7 +255,9 @@ bool LibraryIndex::findByHash(Core& core, uint32_t hash, Entry& entry) {
   if (!result.ok()) return false;
 
   uint8_t version;
-  if (file.read(&version, 1) != 1 || version != VERSION) {
+  // Accept v2 (no CRC) and v3+ (CRC trailer present but unused on these
+  // read-only paths — they don't track CRC, just consume entries).
+  if (file.read(&version, 1) != 1 || version < 2 || version > VERSION) {
     file.close();
     return false;
   }
@@ -231,6 +267,7 @@ bool LibraryIndex::findByHash(Core& core, uint32_t hash, Entry& entry) {
     file.close();
     return false;
   }
+  if (count > MAX_ENTRIES) count = MAX_ENTRIES;
 
   Entry temp;
   for (uint16_t i = 0; i < count; i++) {

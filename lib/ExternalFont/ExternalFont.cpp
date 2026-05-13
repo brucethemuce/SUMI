@@ -1,6 +1,7 @@
 #include "ExternalFont.h"
 
 #include <HardwareSerial.h>
+#include <Utf8.h>
 
 #include <algorithm>
 #include <cstring>
@@ -39,12 +40,19 @@ bool ExternalFont::parseFilename(const char* filepath) {
     filename = filepath;
   }
 
-  // Parse format: FontName_size_WxH.bin
+  // Parse format: FontName_size_WxH.bin (preferred)
+  //          OR : FontName_WxH.bin       (lenient — size inferred from H)
   // Example: KingHwaOldSong_38_33x39.bin
+  // Lenient: font_30x35.bin                (height becomes the font size)
+  //
+  // The gallery shipped a couple of .bin files without the _size_
+  // component. Strict parsing was rejecting those — users dropped them
+  // in /config/fonts/, the external-font preload silently failed, and
+  // every CJK character rendered as '?'. Fall through to a height-only
+  // size when the size component is missing.
 
   char nameCopy[64];
-  strncpy(nameCopy, filename, sizeof(nameCopy) - 1);
-  nameCopy[sizeof(nameCopy) - 1] = '\0';
+  utf8SafeCopy(nameCopy, filename, sizeof(nameCopy));
 
   // Remove .bin extension
   char* ext = strstr(nameCopy, ".bin");
@@ -80,24 +88,27 @@ bool ExternalFont::parseFilename(const char* filepath) {
 
   *lastUnderscore = '\0';
 
-  // Find size
+  // Try to find an explicit size component before the WxH. If there's
+  // no underscore left in the name, accept the lenient form: the
+  // remaining string IS the font name and the height doubles as the
+  // logical font size for renderer purposes.
   lastUnderscore = strrchr(nameCopy, '_');
-  if (!lastUnderscore) {
-    Serial.printf("[EXT_FONT] Invalid filename format: no size\n");
-    return false;
+  if (lastUnderscore != nullptr) {
+    int size = 0;
+    if (sscanf(lastUnderscore + 1, "%d", &size) == 1 && size > 0 && size <= MAX_CHAR_DIM) {
+      _fontSize = (uint8_t)size;
+      *lastUnderscore = '\0';
+    } else {
+      // Underscore exists but next token isn't a number — keep it as
+      // part of the name (e.g. "Noto_Sans_Regular_30x35.bin").
+      _fontSize = (uint8_t)_charHeight;
+    }
+  } else {
+    _fontSize = (uint8_t)_charHeight;
   }
-
-  int size;
-  if (sscanf(lastUnderscore + 1, "%d", &size) != 1) {
-    Serial.printf("[EXT_FONT] Failed to parse size\n");
-    return false;
-  }
-  _fontSize = (uint8_t)size;
-  *lastUnderscore = '\0';
 
   // Remaining part is font name
-  strncpy(_fontName, nameCopy, sizeof(_fontName) - 1);
-  _fontName[sizeof(_fontName) - 1] = '\0';
+  utf8SafeCopy(_fontName, nameCopy, sizeof(_fontName));
 
   // Calculate bytes per char
   _bytesPerRow = (_charWidth + 7) / 8;
@@ -191,8 +202,8 @@ bool ExternalFont::readGlyphFromSD(uint32_t codepoint, uint8_t* buffer) {
     return false;
   }
 
-  size_t bytesRead = _fontFile.read(buffer, _bytesPerChar);
-  if (bytesRead != _bytesPerChar) {
+  const int bytesRead = _fontFile.read(buffer, _bytesPerChar);
+  if (bytesRead < 0 || static_cast<size_t>(bytesRead) != _bytesPerChar) {
     // May be end of file or other error, fill with zeros
     memset(buffer, 0, _bytesPerChar);
   }

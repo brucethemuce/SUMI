@@ -1,6 +1,7 @@
 #include "HomeView.h"
 
 #include <CoverHelpers.h>
+#include <I18n.h>
 
 #include <algorithm>
 #include <cstdio>
@@ -64,10 +65,10 @@ void render(const GfxRenderer& r, const Theme& t, const HomeView& v) {
     }
     const int lineHeight = r.getLineHeight(t.uiFontId);
     const int centerY = cardY + cardHeight / 2;
-    const char* noBookText = "No book open";
+    const char* noBookText = _tr(HOME_NO_BOOK_OPEN);
     const int nbw = r.getTextWidth(t.uiFontId, noBookText);
     r.drawText(t.uiFontId, cardX + (cardWidth - nbw) / 2, centerY - lineHeight, noBookText, t.primaryTextBlack);
-    const char* hintText = "Press \"Files\" to browse";
+    const char* hintText = _tr(HOME_PRESS_FILES);
     const int hw = r.getTextWidth(t.uiFontId, hintText);
     r.drawText(t.uiFontId, cardX + (cardWidth - hw) / 2, centerY + lineHeight / 2, hintText, t.secondaryTextBlack);
   }
@@ -137,16 +138,14 @@ void render(const GfxRenderer& r, const Theme& t, const HomeView& v) {
 
     // Progress text below bar
     const int textY = barY + barH + 6;
-    char progressText[32];
+    // Use translated format strings so "Chapter"/"Page"/"complete" follow
+    // the selected language. snprintf still formats the %d the same way.
+    char progressText[64];
     if (v.bookTotalPages > 0) {
-      if (v.isChapterBased) {
-        snprintf(progressText, sizeof(progressText), "Chapter %d of %d", v.bookCurrentPage, v.bookTotalPages);
-      } else {
-        snprintf(progressText, sizeof(progressText), "Page %d of %d", v.bookCurrentPage, v.bookTotalPages);
-      }
+      const char* fmt = v.isChapterBased ? _tr(HOME_CHAPTER_OF_FMT) : _tr(HOME_PAGE_OF_FMT);
+      snprintf(progressText, sizeof(progressText), fmt, v.bookCurrentPage, v.bookTotalPages);
     } else {
-      // Just show percentage when we don't have page counts
-      snprintf(progressText, sizeof(progressText), "%d%% complete", v.bookProgress);
+      snprintf(progressText, sizeof(progressText), _tr(HOME_PERCENT_COMPLETE_FMT), v.bookProgress);
     }
     const int ptw = r.getTextWidth(t.uiFontId, progressText);
     r.drawText(t.uiFontId, cardX + (cardWidth - ptw) / 2, textY, progressText, t.secondaryTextBlack);
@@ -154,19 +153,19 @@ void render(const GfxRenderer& r, const Theme& t, const HomeView& v) {
 
   // === LIBRARY CAROUSEL (dots at bottom showing position) ===
   if (v.recentBookCount > 0) {
-    const int carouselY = pageHeight - 35;
-    
+    const int carouselY = pageHeight - 50;
+
     // Draw carousel dots showing position
     const int totalDots = v.recentBookCount + 1;  // +1 for current book
     constexpr int dotSpacing = 16;
     constexpr int dotRadius = 4;
     const int dotsWidth = (totalDots - 1) * dotSpacing;
     const int dotsStartX = (pageWidth - dotsWidth) / 2;
-    
+
     for (int i = 0; i < totalDots; i++) {
       const int dotX = dotsStartX + i * dotSpacing;
       const bool isSelected = (i == v.selectedBookIndex);
-      
+
       if (isSelected) {
         // Filled dot for selected
         r.fillRect(dotX - dotRadius, carouselY - dotRadius, dotRadius * 2, dotRadius * 2, t.primaryTextBlack);
@@ -175,6 +174,22 @@ void render(const GfxRenderer& r, const Theme& t, const HomeView& v) {
         r.drawRect(dotX - dotRadius, carouselY - dotRadius, dotRadius * 2, dotRadius * 2, t.primaryTextBlack);
       }
     }
+  }
+
+  // === BOTTOM BUTTON HINTS ===
+  // The left/right buttons on the Home screen are non-obvious without a hint
+  // (reported in user feedback: "Left Button is the File Button (With No
+  // visible indication whatsoever) / The Right Button is the Menu Button").
+  // Small arrows + labels at the very bottom of the screen give a passive
+  // but always-visible clue.
+  {
+    constexpr int hintMargin = 12;
+    const int hintY = pageHeight - 18;
+    const char* leftHint  = _tr(HOME_FILES);
+    const char* rightHint = _tr(HOME_MENU);
+    r.drawText(t.smallFontId, hintMargin, hintY, leftHint, t.secondaryTextBlack);
+    const int rw = r.getTextWidth(t.smallFontId, rightHint);
+    r.drawText(t.smallFontId, pageWidth - hintMargin - rw, hintY, rightHint, t.secondaryTextBlack);
   }
 
   // Note: displayBuffer() is NOT called here; HomeState will call it

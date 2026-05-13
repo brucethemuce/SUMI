@@ -116,7 +116,12 @@ bool Epub::parseTocNcxFile() const {
     tempNcxFile.close();
     return false;
   }
-  tempNcxFile.close();
+  // syncAndClose before reopening: SdFat may drop the tail sectors of
+  // a just-written file if you rely on close() alone to flush, and
+  // we're about to re-open the same path for reading. Without the
+  // sync the reader sees truncated XML and Expat returns a parse
+  // error, silently leaving the TOC empty on fresh first-open.
+  SdMan.syncAndClose(tempNcxFile);
   if (!SdMan.openFileForRead("EBP", tmpNcxPath, tempNcxFile)) {
     return false;
   }
@@ -138,10 +143,16 @@ bool Epub::parseTocNcxFile() const {
   }
 
   while (tempNcxFile.available()) {
-    const auto readSize = tempNcxFile.read(ncxBuffer, 1024);
-    const auto processedSize = ncxParser.write(ncxBuffer, readSize);
+    // FsFile::read returns int and may return -1 on I/O error. Previously
+    // this `auto readSize` captured -1 as an int, then `processedSize != readSize`
+    // was evaluated against the parser write() call whose second arg is
+    // size_t — -1 implicitly promoted to SIZE_MAX and the parser read
+    // ~4 GB off a 1024-byte buffer. Guard explicitly on short/error reads.
+    const int readSize = tempNcxFile.read(ncxBuffer, 1024);
+    if (readSize <= 0) break;
+    const auto processedSize = ncxParser.write(ncxBuffer, static_cast<size_t>(readSize));
 
-    if (processedSize != readSize) {
+    if (processedSize != static_cast<size_t>(readSize)) {
       Serial.printf("[%lu] [EBP] Could not process all toc ncx data\n", millis());
       free(ncxBuffer);
       tempNcxFile.close();
@@ -175,7 +186,8 @@ bool Epub::parseTocNavFile() const {
     tempNavFile.close();
     return false;
   }
-  tempNavFile.close();
+  // syncAndClose — same rationale as parseTocNcxFile above.
+  SdMan.syncAndClose(tempNavFile);
   if (!SdMan.openFileForRead("EBP", tmpNavPath, tempNavFile)) {
     return false;
   }
@@ -200,10 +212,13 @@ bool Epub::parseTocNavFile() const {
   }
 
   while (tempNavFile.available()) {
-    const auto readSize = tempNavFile.read(navBuffer, 1024);
-    const auto processedSize = navParser.write(navBuffer, readSize);
+    // Same read-cast fix as parseTocNcxFile above — FsFile::read's -1
+    // error return previously propagated to SIZE_MAX via implicit cast.
+    const int readSize = tempNavFile.read(navBuffer, 1024);
+    if (readSize <= 0) break;
+    const auto processedSize = navParser.write(navBuffer, static_cast<size_t>(readSize));
 
-    if (processedSize != readSize) {
+    if (processedSize != static_cast<size_t>(readSize)) {
       Serial.printf("[%lu] [EBP] Could not process all toc nav data\n", millis());
       free(navBuffer);
       tempNavFile.close();
@@ -225,7 +240,11 @@ bool Epub::parseCssFiles() {
     return true;
   }
 
-  cssParser_.reset(new CssParser());
+  cssParser_.reset(new (std::nothrow) CssParser());
+  if (!cssParser_) {
+    Serial.printf("[%lu] [EBP] CssParser alloc failed; skipping CSS parse\n", millis());
+    return false;
+  }
 
   for (const auto& cssHref : cssFiles_) {
     // Extract CSS file to temp location
@@ -263,8 +282,14 @@ bool Epub::parseCssFiles() {
 bool Epub::load(const bool buildIfMissing) {
   Serial.printf("[%lu] [EBP] Loading ePub: %s\n", millis(), filepath.c_str());
 
-  // Initialize spine/TOC cache
-  bookMetadataCache.reset(new BookMetadataCache(cachePath));
+  // Initialize spine/TOC cache. nothrow because the next line
+  // dereferences bookMetadataCache; under -fno-exceptions a failing
+  // raw `new` would abort during book-open.
+  bookMetadataCache.reset(new (std::nothrow) BookMetadataCache(cachePath));
+  if (!bookMetadataCache) {
+    Serial.printf("[%lu] [EBP] BookMetadataCache alloc failed\n", millis());
+    return false;
+  }
 
   // Try to load existing cache first
   if (bookMetadataCache->load()) {
@@ -332,7 +357,9 @@ bool Epub::load(const bool buildIfMissing) {
 
   if (!tocParsed) {
     Serial.printf("[%lu] [EBP] Warning: Could not parse any TOC format\n", millis());
-    // Continue anyway - book will work without TOC
+    // Generate synthetic TOC entries from spine so the user still has chapter
+    // navigation even when the EPUB ships without a proper table of contents.
+    bookMetadataCache->generateSyntheticToc();
   }
 
   if (!bookMetadataCache->endTocPass()) {
@@ -356,8 +383,13 @@ bool Epub::load(const bool buildIfMissing) {
     Serial.printf("[%lu] [EBP] Could not cleanup tmp files - ignoring\n", millis());
   }
 
-  // Reload the cache from disk so it's in the correct state
-  bookMetadataCache.reset(new BookMetadataCache(cachePath));
+  // Reload the cache from disk so it's in the correct state. nothrow
+  // matches the earlier alloc — see comment at line 286.
+  bookMetadataCache.reset(new (std::nothrow) BookMetadataCache(cachePath));
+  if (!bookMetadataCache) {
+    Serial.printf("[%lu] [EBP] BookMetadataCache realloc failed\n", millis());
+    return false;
+  }
   if (!bookMetadataCache->load()) {
     Serial.printf("[%lu] [EBP] Failed to reload cache after writing\n", millis());
     return false;
@@ -519,11 +551,11 @@ bool Epub::generateCoverPreviewBmp() const {
       FsFile coverFile;
       if (SdMan.openFileForWrite("EBP", previewPath, coverFile)) {
         if (readItemContentsToStream(path, coverFile, 1024)) {
-          coverFile.close();
+          SdMan.syncAndClose(coverFile);
           Serial.printf("[%lu] [EBP] Extracted BMP cover preview directly\n", millis());
           return true;
         }
-        coverFile.close();
+        coverFile.close();  // partial — will remove
         SdMan.remove(previewPath.c_str());
       }
     } else {
@@ -533,7 +565,7 @@ bool Epub::generateCoverPreviewBmp() const {
       FsFile coverFile;
       if (SdMan.openFileForWrite("EBP", coverTempPath, coverFile)) {
         if (readItemContentsToStream(path, coverFile, 1024)) {
-          coverFile.close();
+          SdMan.syncAndClose(coverFile);
           ImageConvertConfig config;
           config.quickMode = true;
           config.logTag = "EBP";
@@ -544,7 +576,7 @@ bool Epub::generateCoverPreviewBmp() const {
           // Conversion failed - clean up partial output
           SdMan.remove(previewPath.c_str());
         } else {
-          coverFile.close();
+          coverFile.close();  // partial — will remove
         }
       }
       SdMan.remove(coverTempPath.c_str());
@@ -595,11 +627,11 @@ bool Epub::generateThumbBmp() const {
       FsFile thumbFile;
       if (SdMan.openFileForWrite("EBP", thumbPath, thumbFile)) {
         if (readItemContentsToStream("sumi-thumb.bmp", thumbFile, 1024)) {
-          thumbFile.close();
+          SdMan.syncAndClose(thumbFile);
           Serial.printf("[%lu] [EBP] Extracted pre-made sumi-thumb.bmp\n", millis());
           return true;
         }
-        thumbFile.close();
+        thumbFile.close();  // partial, removing
         SdMan.remove(thumbPath.c_str());
       }
     }
@@ -665,9 +697,9 @@ bool Epub::generateThumbBmp() const {
       FsFile coverFile;
       if (SdMan.openFileForWrite("EBP", coverBmpPath, coverFile)) {
         if (readItemContentsToStream(coverImageHref, coverFile, 1024)) {
-          coverFile.close();
+          SdMan.syncAndClose(coverFile);
         } else {
-          coverFile.close();
+          coverFile.close();  // removing anyway
           SdMan.remove(coverBmpPath.c_str());
         }
       }
@@ -691,7 +723,9 @@ bool Epub::generateThumbBmp() const {
       coverFile.close();
       return false;
     }
-    coverFile.close();
+    // Sync before handing off to the image converter — it reads this
+    // file fresh so the tail sectors must have landed.
+    SdMan.syncAndClose(coverFile);
 
     // Use 2-bit dithering for all thumbnails (4 gray levels, matches cover quality)
     ImageConvertConfig config;
@@ -750,11 +784,11 @@ bool Epub::generateCoverBmp(bool use1BitDithering) const {
       FsFile coverFile;
       if (SdMan.openFileForWrite("EBP", coverPath, coverFile)) {
         if (readItemContentsToStream("sumi-cover.bmp", coverFile, 1024)) {
-          coverFile.close();
+          SdMan.syncAndClose(coverFile);
           Serial.printf("[%lu] [EBP] Extracted pre-made sumi-cover.bmp\n", millis());
           return true;
         }
-        coverFile.close();
+        coverFile.close();  // partial, removing
         SdMan.remove(coverPath.c_str());
       }
     }
@@ -849,11 +883,11 @@ bool Epub::generateCoverBmp(bool use1BitDithering) const {
       FsFile coverFile;
       if (SdMan.openFileForWrite("EBP", coverPath, coverFile)) {
         if (readItemContentsToStream(path, coverFile, 1024)) {
-          coverFile.close();
+          SdMan.syncAndClose(coverFile);
           Serial.printf("[%lu] [EBP] Extracted BMP cover directly\n", millis());
           return true;
         }
-        coverFile.close();
+        coverFile.close();  // partial, removing
         SdMan.remove(coverPath.c_str());
       }
     } else {
@@ -864,7 +898,8 @@ bool Epub::generateCoverBmp(bool use1BitDithering) const {
       FsFile coverFile;
       if (SdMan.openFileForWrite("EBP", coverTempPath, coverFile)) {
         if (readItemContentsToStream(path, coverFile, 1024)) {
-          coverFile.close();
+          // Sync before handing to converter — it reads the file fresh
+          SdMan.syncAndClose(coverFile);
           ImageConvertConfig config;
           config.oneBit = use1BitDithering;
           config.logTag = "EBP";
@@ -875,7 +910,7 @@ bool Epub::generateCoverBmp(bool use1BitDithering) const {
           // Conversion failed - clean up partial output
           SdMan.remove(coverPath.c_str());
         } else {
-          coverFile.close();
+          coverFile.close();  // partial, removing
         }
       }
       SdMan.remove(coverTempPath.c_str());
@@ -918,13 +953,13 @@ bool Epub::generateCoverBmp(bool use1BitDithering) const {
     FsFile coverFile;
     if (SdMan.openFileForWrite("EBP", coverPath, coverFile)) {
       if (readItemContentsToStream(coverImageHref, coverFile, 1024)) {
-        coverFile.close();
+        SdMan.syncAndClose(coverFile);
         Serial.printf("[%lu] [EBP] Extracted BMP cover directly from OPF ref\n", millis());
         // Also generate thumbnail immediately
         CoverHelpers::generateThumbFromCover(coverPath, getThumbBmpPath(), "EBP");
         return true;
       }
-      coverFile.close();
+      coverFile.close();  // partial, removing
       SdMan.remove(coverPath.c_str());
     }
     // Fall through to failure marker if extract failed
@@ -941,7 +976,8 @@ bool Epub::generateCoverBmp(bool use1BitDithering) const {
       coverFile.close();
       return false;
     }
-    coverFile.close();
+    // Sync so the next-step converter sees a complete file
+    SdMan.syncAndClose(coverFile);
 
     ImageConvertConfig config;
     config.oneBit = use1BitDithering;
@@ -998,9 +1034,11 @@ bool Epub::readItemContentsToStream(const std::string& itemHref, Print& out, con
     return false;
   }
 
-  // Use MemoryArena::zipBuffer if no dictBuffer provided (avoids 32KB malloc)
+  // Use MemoryArena::zipBuffer if no dictBuffer provided (avoids 32KB
+  // malloc). Under v2 the arena is .bss-resident and zipBuffer is
+  // never null after init() — the v1 framebuffer-aliased fallback
+  // (`MemoryArena::fallbackBuffer`) is gone.
   uint8_t* buffer = dictBuffer ? dictBuffer : sumi::MemoryArena::zipBuffer;
-  if (!buffer) buffer = sumi::MemoryArena::fallbackBuffer;
 
   const std::string path = FsHelpers::normalisePath(itemHref);
   return ZipFile(filepath).readFileToStream(path.c_str(), out, chunkSize, buffer);

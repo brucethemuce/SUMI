@@ -2,7 +2,10 @@
 
 #include <Arduino.h>
 #include <GfxRenderer.h>
+#include <I18n.h>
+#include <ReadingStats.h>
 #include <SDCardManager.h>
+#include <Utf8.h>
 #include "../core/MemoryArena.h"
 // SdFat and FS.h both define FILE_READ/FILE_WRITE - undef before LittleFS re-includes FS.h
 #undef FILE_READ
@@ -26,6 +29,9 @@
 #if FEATURE_PLUGINS
 #include "PluginListState.h"
 #endif
+
+// Global reading stats instance (defined in main.cpp)
+extern sumi::ReadingStats readingStats;
 
 namespace sumi {
 
@@ -84,22 +90,13 @@ void SettingsState::exit(Core& core) {
   }
 #endif
   
-  // Re-allocate memory arena if it was released for BLE scan/pairing, file transfer, or plugins.
-#if FEATURE_BLUETOOTH
-  if (!sumi::MemoryArena::isInitialized()) {
-    if (!ble::isConnected()) {
-      ble::deinit();  // Free BLE stack memory before arena allocation
-    }
-    Serial.printf("[SETTINGS] Re-allocating memory arena (BLE %s)\n",
-                  ble::isConnected() ? "HID connected" : "not connected");
-    sumi::MemoryArena::init();
-  }
-#else
-  if (!sumi::MemoryArena::isInitialized()) {
-    Serial.println("[SETTINGS] Re-allocating memory arena");
-    sumi::MemoryArena::init();
-  }
-#endif
+  // (v1 re-allocated the MemoryArena here if a BLE scan / pair /
+  //  transfer / plugin had freed it. v2 keeps the arena permanently in
+  //  .bss, so this re-init was always a no-op. The companion
+  //  `ble::deinit()` that gated on "arena needs allocation" is also
+  //  gone — every path that does a transient `ble::init()` now pairs
+  //  it with its own `ble::deinit()` immediately. See main.cpp's
+  //  inactivity timeout for the canonical pattern.)
 }
 
 StateTransition SettingsState::update(Core& core) {
@@ -498,6 +495,18 @@ void SettingsState::goBack(Core& core) {
         ble_transfer::setCallback(nullptr);
         bleCallbackRegistered_ = false;
       }
+      // BLE is transfer-screen-scoped: tear down advertising + stack when
+      // the user leaves so the radio isn't burning power / accepting
+      // connections from the browser while they're reading a book.
+      // The arena reclaim mirrors the manual-toggle-off path above.
+      if (bleTransferEnabled_) {
+        ble_transfer::stopAdvertising();
+        ble_transfer::deinit();
+        bleTransferEnabled_ = false;
+        Serial.println("[BLE] File transfer auto-disabled on leaving screen");
+        // (v1 re-init'd the arena here. v2 keeps it permanently in
+        //  .bss — nothing to re-allocate.)
+      }
       // If files were received, do a full refresh to clear e-ink ghosting
       if (bleTransferDirty_) {
         bleTransferDirty_ = false;
@@ -553,17 +562,12 @@ void SettingsState::handleConfirm(Core& core) {
           bleCallbackRegistered_ = false;
         }
         Serial.println("[BLE] File transfer disabled");
-        // Re-allocate memory arena when BLE is disabled
-        if (!sumi::MemoryArena::isInitialized()) {
-          Serial.println("[BLE] Re-allocating memory arena");
-          sumi::MemoryArena::init();
-        }
+        // (v1 re-init'd the arena after disabling BLE. v2 has no
+        //  release/reclaim path; arena lives in .bss.)
       } else {
-        // Release memory arena to free up heap for BLE stack
-        if (sumi::MemoryArena::isInitialized()) {
-          Serial.println("[BLE] Releasing memory arena for BLE stack");
-          sumi::MemoryArena::release();
-        }
+        // (v1 released the arena to free heap for the BLE stack. v2
+        //  keeps the arena permanently in .bss; NimBLE works from the
+        //  ~120 KB of heap that remains after boot.)
         ble_transfer::init();
         ble_transfer::startAdvertising();
         bleTransferEnabled_ = true;
@@ -660,11 +664,11 @@ void SettingsState::handleConfirm(Core& core) {
                                 nameLower.indexOf("shutter") >= 0 ||
                                 nameLower.indexOf("free") >= 0;
             if (isPageTurner) {
-              strncpy(core.settings.blePageTurner, devAddr,
-                      sizeof(core.settings.blePageTurner) - 1);
+              utf8SafeCopy(core.settings.blePageTurner, devAddr,
+                           sizeof(core.settings.blePageTurner));
             } else {
-              strncpy(core.settings.bleKeyboard, devAddr,
-                      sizeof(core.settings.bleKeyboard) - 1);
+              utf8SafeCopy(core.settings.bleKeyboard, devAddr,
+                           sizeof(core.settings.bleKeyboard));
             }
             core.settings.save(core.storage);
           }
@@ -771,8 +775,7 @@ void SettingsState::loadReaderSettings() {
   readerView_.themeCount = 0;
   readerView_.currentThemeIndex = 0;
   for (size_t i = 0; i < themes.size() && i < ui::ReaderSettingsView::MAX_THEMES; i++) {
-    strncpy(readerView_.themeNames[i], themes[i].c_str(), sizeof(readerView_.themeNames[i]) - 1);
-    readerView_.themeNames[i][sizeof(readerView_.themeNames[i]) - 1] = '\0';
+    utf8SafeCopy(readerView_.themeNames[i], themes[i].c_str(), sizeof(readerView_.themeNames[i]));
     if (themes[i] == settings.themeName) {
       readerView_.currentThemeIndex = static_cast<int>(i);
     }
@@ -783,19 +786,20 @@ void SettingsState::loadReaderSettings() {
   // Index 1: Font (FontSelect) - load available .epdfont families from SD card
   readerView_.fontCount = 0;
   readerView_.currentFontIndex = 0;
-  strncpy(readerView_.fontNames[0], "Default", sizeof(readerView_.fontNames[0]) - 1);
+  utf8SafeCopy(readerView_.fontNames[0], "Default", sizeof(readerView_.fontNames[0]));
   readerView_.fontCount = 1;
   auto fonts = FONT_MANAGER.listAvailableFonts();
   for (size_t i = 0; i < fonts.size() && readerView_.fontCount < ui::ReaderSettingsView::MAX_FONTS; i++) {
-    if (!FontManager::isBinFont(fonts[i].c_str())) {
-      int idx = readerView_.fontCount;
-      strncpy(readerView_.fontNames[idx], fonts[i].c_str(), sizeof(readerView_.fontNames[idx]) - 1);
-      readerView_.fontNames[idx][sizeof(readerView_.fontNames[idx]) - 1] = '\0';
-      if (settings.readerFont[0] && strcmp(fonts[i].c_str(), settings.readerFont) == 0) {
-        readerView_.currentFontIndex = idx;
-      }
-      readerView_.fontCount++;
+    // Include .bin fonts too (see ReaderState::loadInReaderSettings) so
+    // CJK fallback fonts like notosansjp_30x35.bin are selectable. The
+    // picker previously hid them and users were stuck on Default for
+    // Japanese / Chinese / Korean books.
+    int idx = readerView_.fontCount;
+    utf8SafeCopy(readerView_.fontNames[idx], fonts[i].c_str(), sizeof(readerView_.fontNames[idx]));
+    if (settings.readerFont[0] && strcmp(fonts[i].c_str(), settings.readerFont) == 0) {
+      readerView_.currentFontIndex = idx;
     }
+    readerView_.fontCount++;
   }
   readerView_.values[1] = 0;  // Not used for FontSelect
 
@@ -839,8 +843,7 @@ void SettingsState::saveReaderSettings() {
   // Index 0: Theme (ThemeSelect) - apply selected theme
   const char* selectedTheme = readerView_.getCurrentThemeName();
   if (strcmp(settings.themeName, selectedTheme) != 0) {
-    strncpy(settings.themeName, selectedTheme, sizeof(settings.themeName) - 1);
-    settings.themeName[sizeof(settings.themeName) - 1] = '\0';
+    utf8SafeCopy(settings.themeName, selectedTheme, sizeof(settings.themeName));
     // Use cached theme for instant switching (no file I/O)
     if (!THEME_MANAGER.applyCachedTheme(settings.themeName)) {
       THEME_MANAGER.loadTheme(settings.themeName);
@@ -850,8 +853,7 @@ void SettingsState::saveReaderSettings() {
 
   // Index 1: Font (FontSelect) - apply selected font
   const char* selectedFont = readerView_.getCurrentFontName();
-  strncpy(settings.readerFont, selectedFont, sizeof(settings.readerFont) - 1);
-  settings.readerFont[sizeof(settings.readerFont) - 1] = '\0';
+  utf8SafeCopy(settings.readerFont, selectedFont, sizeof(settings.readerFont));
 
   // Index 2: Font Size
   settings.fontSize = readerView_.values[2];
@@ -894,9 +896,15 @@ void SettingsState::loadHomeArtSettings() {
   homeArtView_.scrollOffset = 0;
   homeArtView_.needsRender = true;
   
-  // Always add "default" first (built-in PROGMEM theme)
+  // Always add "default" first (built-in PROGMEM theme).
+  // Explicit NUL termination — strncpy with sizeof-1 doesn't add it
+  // when the source is exactly that long. The buffer is currently
+  // default-init zero-filled so it would happen to work, but that's
+  // a fragile invariant if anyone reuses these slots later.
   strncpy(homeArtView_.themeNames[0], "default", sizeof(homeArtView_.themeNames[0]) - 1);
+  homeArtView_.themeNames[0][sizeof(homeArtView_.themeNames[0]) - 1] = '\0';
   strncpy(homeArtView_.displayNames[0], "Default (Built-in)", sizeof(homeArtView_.displayNames[0]) - 1);
+  homeArtView_.displayNames[0][sizeof(homeArtView_.displayNames[0]) - 1] = '\0';
   homeArtView_.themeCount = 1;
   
   // Check if default is currently applied
@@ -918,21 +926,19 @@ void SettingsState::loadHomeArtSettings() {
         // Check if it's a .bmp file
         size_t len = strlen(filename);
         if (len > 4 && strcasecmp(filename + len - 4, ".bmp") == 0) {
-          // Extract theme name (filename without extension)
+          // Extract theme name (filename without extension). Construct a
+          // std::string with the ".bmp" stripped so utf8SafeCopy can walk
+          // it back to a codepoint boundary for CJK-named themes like
+          // "桜.bmp".
+          const std::string rawName(filename, len - 4);
           char themeName[32];
-          size_t nameLen = std::min(len - 4, sizeof(themeName) - 1);
-          strncpy(themeName, filename, nameLen);
-          themeName[nameLen] = '\0';
-          
+          utf8SafeCopy(themeName, rawName.c_str(), sizeof(themeName));
+
           // Skip if it's "default" (already added)
           if (strcasecmp(themeName, "default") != 0) {
             int idx = homeArtView_.themeCount;
-            strncpy(homeArtView_.themeNames[idx], themeName, sizeof(homeArtView_.themeNames[0]) - 1);
-            homeArtView_.themeNames[idx][sizeof(homeArtView_.themeNames[0]) - 1] = '\0';
-            
-            // Display name = theme name (could be prettier but works)
-            strncpy(homeArtView_.displayNames[idx], themeName, sizeof(homeArtView_.displayNames[0]) - 1);
-            homeArtView_.displayNames[idx][sizeof(homeArtView_.displayNames[0]) - 1] = '\0';
+            utf8SafeCopy(homeArtView_.themeNames[idx], themeName, sizeof(homeArtView_.themeNames[0]));
+            utf8SafeCopy(homeArtView_.displayNames[idx], themeName, sizeof(homeArtView_.displayNames[0]));
             
             // Check if this is the currently applied theme
             if (strcmp(settings.homeArtTheme, themeName) == 0) {
@@ -963,8 +969,7 @@ void SettingsState::saveHomeArtSettings() {
   
   const char* selectedTheme = homeArtView_.getCurrentThemeName();
   if (strcmp(settings.homeArtTheme, selectedTheme) != 0) {
-    strncpy(settings.homeArtTheme, selectedTheme, sizeof(settings.homeArtTheme) - 1);
-    settings.homeArtTheme[sizeof(settings.homeArtTheme) - 1] = '\0';
+    utf8SafeCopy(settings.homeArtTheme, selectedTheme, sizeof(settings.homeArtTheme));
     homeArtView_.appliedIndex = homeArtView_.selectedIndex;
     homeArtView_.needsRender = true;
     
@@ -1001,6 +1006,9 @@ void SettingsState::loadDeviceSettings() {
 
   // Index 7: Side Buttons (Prev/Next=0, Next/Prev=1)
   deviceView_.values[7] = settings.sideButtonLayout;
+
+  // Index 8: Language (0=EN, 1=ES, ... 12=AR)
+  deviceView_.values[8] = settings.language;
 }
 
 void SettingsState::saveDeviceSettings() {
@@ -1030,6 +1038,10 @@ void SettingsState::saveDeviceSettings() {
 
   // Index 7: Side Buttons - deferred to goBack() on screen exit.
   // Same as front buttons: changing layout mid-navigation causes ghost events.
+
+  // Index 8: Language — apply to I18n singleton immediately
+  settings.language = deviceView_.values[8];
+  sumi::I18n::instance().setLanguage(static_cast<sumi::Language>(settings.language));
 }
 
 #if FEATURE_PLUGINS
@@ -1106,6 +1118,18 @@ void SettingsState::populateSystemInfo() {
 
   // SD Card status
   infoView_.addField("SD Card", SdMan.ready() ? "Ready" : "Not available");
+
+  // Reading stats
+  char statsStr[48];
+  snprintf(statsStr, sizeof(statsStr), "%u sessions, %lu min total",
+           readingStats.totalSessions,
+           (unsigned long)(readingStats.totalReadingMs / 60000));
+  infoView_.addField("Reading", statsStr);
+
+  char booksStr[32];
+  snprintf(booksStr, sizeof(booksStr), "%u started, %u finished",
+           readingStats.booksStarted, readingStats.booksFinished);
+  infoView_.addField("Books", booksStr);
 }
 
 void SettingsState::clearCache(int type, Core& core) {
@@ -1187,7 +1211,19 @@ void SettingsState::enterBleTransfer() {
   bleQueueComplete_ = false;
   bleTransferDirty_ = false;
   needsRender_ = true;
-  
+
+  // Auto-start BLE when the user opens the transfer screen. Pair with the
+  // auto-deinit in handleBack() so BLE is screen-scoped: on while the
+  // browser needs it, off as soon as the user navigates away.
+  if (!bleTransferEnabled_) {
+    // (v1 released the arena to free heap for the BLE stack. v2 keeps
+    //  the arena in .bss; NimBLE init runs from the surrounding heap.)
+    ble_transfer::init();
+    ble_transfer::startAdvertising();
+    bleTransferEnabled_ = true;
+    Serial.println("[BLE] File transfer auto-enabled on entering screen");
+  }
+
   // Register callback for real-time transfer events
   if (!bleCallbackRegistered_ && bleTransferEnabled_) {
     ble_transfer::setCallback([this](ble_transfer::TransferEvent event, const char* data) {
@@ -1272,7 +1308,7 @@ void SettingsState::renderBleTransfer() {
   renderer_.clearScreen(THEME.backgroundColor);
   const Theme& t = THEME;
   
-  ui::title(renderer_, t, t.screenMarginTop, "Wireless Transfer");
+  ui::title(renderer_, t, t.screenMarginTop, _tr(SETTINGS_WIRELESS));
   
   const int W = renderer_.getScreenWidth();   // 480
   const int H = renderer_.getScreenHeight();  // 800
@@ -1607,11 +1643,9 @@ void SettingsState::enterBluetooth() {
   btScanned_ = false;
   btConnecting_ = false;
 
-  // Release arena before BLE init — NimBLE stack needs large contiguous heap
-  // for scanning/pairing. Arena gets re-allocated on settings exit.
-  if (sumi::MemoryArena::isInitialized()) {
-    sumi::MemoryArena::release();
-  }
+  // (v1 released the arena before BLE scanning so NimBLE got a large
+  //  contig block. v2's arena is .bss-resident; NimBLE works from the
+  //  heap that remains.)
   ble::init();
 
   // Always scan — show the device list so the user can pick
@@ -1700,7 +1734,7 @@ void SettingsState::renderBluetooth() {
   const int font = t.menuFontId;
 
   // Standard title
-  ui::title(renderer_, t, t.screenMarginTop, "Bluetooth");
+  ui::title(renderer_, t, t.screenMarginTop, _tr(SETTINGS_BLUETOOTH));
 
   // Show timeout setting at bottom
   {

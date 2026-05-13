@@ -7,6 +7,7 @@
 #include <HardwareSerial.h>
 #include <ImageConverter.h>
 #include <SDCardManager.h>
+#include <Utf8.h>
 #include <esp_heap_caps.h>
 #include <expat.h>
 #include <freertos/FreeRTOS.h>
@@ -45,6 +46,14 @@ const char* SKIP_TAGS[] = {"head"};
 constexpr int NUM_SKIP_TAGS = sizeof(SKIP_TAGS) / sizeof(SKIP_TAGS[0]);
 
 bool isWhitespace(const char c) { return c == ' ' || c == '\r' || c == '\n' || c == '\t'; }
+
+// Thin wrapper with the XML_Char type the parser works in. The real
+// implementation lives in lib/Utf8 so it can be unit-tested in isolation.
+// See utf8UnicodeWhitespaceBytes() for the list of Unicode codepoints
+// recognised and the French/Spanish motivation.
+int unicodeWhitespaceBytes(const XML_Char* s, int remaining) {
+  return utf8UnicodeWhitespaceBytes(reinterpret_cast<const char*>(s), remaining);
+}
 
 // given the start and end of a tag, check to see if it matches a known tag
 bool matches(const char* tag_name, const char* possible_tags[], const int possible_tag_count) {
@@ -122,7 +131,7 @@ void XMLCALL ChapterHtmlSlimParser::startElement(void* userData, const XML_Char*
     self->depth += 1;
     return;
   }
-  if (ESP.getFreeHeap() < 8192) {
+  if (ESP.getFreeHeap() < 4096) {
     Serial.printf("[%lu] [EHP] Low memory in startElement (%zu bytes), stopping parser\n",
                   millis(), ESP.getFreeHeap());
     self->aborted_ = true;
@@ -224,7 +233,15 @@ void XMLCALL ChapterHtmlSlimParser::startElement(void* userData, const XML_Char*
             self->depth += 1;
             return;
           } else {
-            Serial.printf("[%lu] [EHP] BMP parse failed for cached image\n", millis());
+            // Cached BMP is corrupt — nuke it so the next parse re-extracts
+            // from the source. This happens when a previous cache-build
+            // attempt aborted mid-write (e.g. low-heap abort during image
+            // extraction), leaving a partial BMP on SD that `exists()`
+            // still returns true for. Without the delete we'd see
+            // `[image]` placeholders forever for that image.
+            Serial.printf("[%lu] [EHP] BMP parse failed for cached image — removing\n", millis());
+            bmpFile.close();
+            SdMan.remove(cachedPath.c_str());
           }
           bmpFile.close();
         } else {
@@ -499,9 +516,16 @@ void XMLCALL ChapterHtmlSlimParser::characterData(void* userData, const XML_Char
           if (!cell.text.empty() && cell.text.back() != ' ') {
             cell.text += ' ';
           }
-        } else {
-          cell.text += s[i];
+          continue;
         }
+        if (int skip = unicodeWhitespaceBytes(s + i, len - i)) {
+          if (!cell.text.empty() && cell.text.back() != ' ') {
+            cell.text += ' ';
+          }
+          i += skip - 1;  // loop increments i
+          continue;
+        }
+        cell.text += s[i];
       }
     }
     return;
@@ -514,9 +538,16 @@ void XMLCALL ChapterHtmlSlimParser::characterData(void* userData, const XML_Char
         if (!self->tableCaption_.empty() && self->tableCaption_.back() != ' ') {
           self->tableCaption_ += ' ';
         }
-      } else {
-        self->tableCaption_ += s[i];
+        continue;
       }
+      if (int skip = unicodeWhitespaceBytes(s + i, len - i)) {
+        if (!self->tableCaption_.empty() && self->tableCaption_.back() != ' ') {
+          self->tableCaption_ += ' ';
+        }
+        i += skip - 1;
+        continue;
+      }
+      self->tableCaption_ += s[i];
     }
     return;
   }
@@ -538,6 +569,19 @@ void XMLCALL ChapterHtmlSlimParser::characterData(void* userData, const XML_Char
         self->flushPartWordBuffer();
       }
       // Skip the whitespace char
+      continue;
+    }
+
+    // Unicode whitespace (NBSP, NARROW NBSP, EN SPACE, etc.) — same
+    // word-boundary semantics as ASCII space. Without this branch
+    // French-style NBSP-connected phrases like `mot\u00A0:` or
+    // `«\u00A0citation\u00A0»` land in the partWordBuffer as single atomic
+    // "words" and render past the right margin.
+    if (int skip = unicodeWhitespaceBytes(s + i, len - i)) {
+      if (self->partWordBufferIndex > 0) {
+        self->flushPartWordBuffer();
+      }
+      i += skip - 1;  // loop increments i
       continue;
     }
 
@@ -699,7 +743,7 @@ bool ChapterHtmlSlimParser::shouldAbort() const {
   // Check memory pressure — need room for XML buffers, strings, text blocks, page vectors.
   // Uses total free heap (not contiguous) since parser allocations are many small ones.
   const size_t freeHeap = ESP.getFreeHeap();
-  if (freeHeap < 8192) {
+  if (freeHeap < 4096) {
     Serial.printf("[%lu] [EHP] Low memory (%zu bytes free)\n", millis(), freeHeap);
     return true;
   }
@@ -731,6 +775,7 @@ bool ChapterHtmlSlimParser::initParser() {
   elementCounter_ = 0;
   cssHeapOk_ = true;
   pendingEmergencySplit_ = false;
+  pendingMaxPagesSuspend_ = false;
   aborted_ = false;
   stopRequested_ = false;
   suspended_ = false;
@@ -800,7 +845,7 @@ bool ChapterHtmlSlimParser::parseLoop() {
       // Proactive heap check — abort before OOM causes abort().
       // Uses total free heap (not contiguous) since parser does many small allocations.
       const size_t freeTotal = ESP.getFreeHeap();
-      if (freeTotal < 8192) {
+      if (freeTotal < 4096) {
         Serial.printf("[%lu] [EHP] Low memory during parse (%zu bytes), aborting\n", millis(), freeTotal);
         aborted_ = true;
         break;
@@ -817,14 +862,19 @@ bool ChapterHtmlSlimParser::parseLoop() {
       return false;
     }
 
-    size_t len = file_.read(static_cast<uint8_t*>(buf), kReadChunkSize);
-
-    if (len == 0) {
-      // len==0 is normal EOF — finalize the XML parser
+    // FsFile::read returns int; storing directly into size_t turns a -1
+    // error return into SIZE_MAX which then slips past the 'len == 0'
+    // EOF check and gets fed to dataUriStripper_.strip() as a buffer
+    // length, leading to out-of-bounds reads. Treat negative read as
+    // EOF so the XML parser is finalized cleanly.
+    const int rawLen = file_.read(static_cast<uint8_t*>(buf), kReadChunkSize);
+    if (rawLen <= 0) {
+      // rawLen==0 is normal EOF, <0 is I/O error — finalize XML parser either way.
       XML_ParseBuffer(xmlParser_, 0, 1);
       done = 1;
       break;
     }
+    size_t len = static_cast<size_t>(rawLen);
 
     // Strip data URIs BEFORE expat parses the buffer to prevent OOM on large embedded images.
     // This replaces src="data:image/..." with src="#" so expat never sees the huge base64 string.
@@ -867,7 +917,7 @@ bool ChapterHtmlSlimParser::parseLoop() {
     if (pendingEmergencySplit_ && currentTextBlock && !currentTextBlock->isEmpty()) {
       pendingEmergencySplit_ = false;
       const size_t freeHeap = ESP.getFreeHeap();
-      if (freeHeap < 8192) {
+      if (freeHeap < 4096) {
         Serial.printf("[%lu] [EHP] Low memory (%zu), aborting parse\n", millis(), freeHeap);
         aborted_ = true;
         break;
@@ -877,7 +927,18 @@ bool ChapterHtmlSlimParser::parseLoop() {
       currentTextBlock->layoutAndExtractLines(
           renderer, config.fontId, config.viewportWidth,
           [this](const std::shared_ptr<TextBlock>& textBlock) { addLineToPage(textBlock); }, false,
-          [this]() -> bool { return shouldAbort(); });
+          // shouldAbort still includes stopRequested_ for genuine aborts
+          // (low-memory / external cancel). Max-pages soft-stop is now
+          // handled separately via pendingMaxPagesSuspend_, so the loop
+          // runs to completion and no extracted-line words are dropped.
+          [this]() -> bool { return stopRequested_ || shouldAbort(); });
+
+      // pendingMaxPagesSuspend_ may have been set during the split. We do
+      // NOT call XML_StopParser here — that's only legal from inside an
+      // XML callback. The flag is naturally honoured at the next makePages
+      // call (which IS inside a callback, e.g. when startNewTextBlock for
+      // the next paragraph runs). Until then we may produce a few extra
+      // pages over budget, which the cache layer accepts.
     }
   } while (!done);
 
@@ -887,7 +948,11 @@ bool ChapterHtmlSlimParser::parseLoop() {
     if (!currentTextBlock->isEmpty()) {
       makePages();
     }
-    if (!stopRequested_ && currentPage && !currentPage->elements.empty()) {
+    // Always emit the final partial page if there's content. makePages may
+    // have set stopRequested_=true via the soft-stop path, but at EOF the
+    // suspend is moot (no more XML to parse) and would just truncate the
+    // last paragraph. Genuine aborts already returned via the outer guard.
+    if (currentPage && !currentPage->elements.empty()) {
       completePageFn(std::move(currentPage));
     }
     currentPage.reset();
@@ -923,6 +988,7 @@ bool ChapterHtmlSlimParser::resumeParsing() {
   loopCounter_ = 0;
   elementCounter_ = 0;
   stopRequested_ = false;
+  pendingMaxPagesSuspend_ = false;
   suspended_ = false;
 
   const auto status = XML_ResumeParser(xmlParser_);
@@ -952,17 +1018,15 @@ void ChapterHtmlSlimParser::addLineToPage(std::shared_ptr<TextBlock> line) {
   if (currentPageNextY + lineHeight > config.viewportHeight) {
     ++pagesCreated_;
     if (!completePageFn(std::move(currentPage))) {
-      // Preserve this line for the next batch — it's already been
-      // extracted from the text block and would be lost otherwise
-      currentPage.reset(new Page());
-      currentPageNextY = 0;
-      currentPage->elements.push_back(std::make_shared<PageLine>(line, 0, currentPageNextY));
-      currentPageNextY += lineHeight;
-      stopRequested_ = true;
-      if (xmlParser_) {
-        XML_StopParser(xmlParser_, XML_TRUE);  // Resumable suspend
-      }
-      return;
+      // Soft-stop: caller's maxPages budget hit. We do NOT suspend XML here —
+      // doing so would cause startNewTextBlock (further up the call stack) to
+      // discard the current text block while it still has un-extracted words,
+      // truncating the paragraph. Instead we keep producing pages for the
+      // remainder of this block (the wrappedCallback in EpubChapterParser
+      // accepts overflow pages); makePages() suspends XML once the block is
+      // fully drained. Bug report: paragraphs cut off at top of page after
+      // BLE upload / large EPUBs.
+      pendingMaxPagesSuspend_ = true;
     }
     parseStartTime_ = millis();
     currentPage.reset(new Page());
@@ -985,7 +1049,7 @@ void ChapterHtmlSlimParser::makePages() {
   // Layout needs ~4-6KB for text processing (DP arrays, word vectors, line extraction).
   // Uses total free heap since layout allocations are many small ones.
   const size_t freeHeap = ESP.getFreeHeap();
-  if (freeHeap < 8192) {
+  if (freeHeap < 4096) {
     Serial.printf("[%lu] [EHP] Insufficient memory for layout (%zu bytes)\n", millis(), freeHeap);
     currentTextBlock.reset();
     aborted_ = true;
@@ -1014,6 +1078,18 @@ void ChapterHtmlSlimParser::makePages() {
         break;
     }
   }
+
+  // Soft-stop deferred from addLineToPage: maxPages was hit while laying out
+  // this block, but we kept extracting so all lines made it onto pages.
+  // The block's words list is now empty; we are between blocks, a clean
+  // boundary — safe to suspend XML so the next batch can resume here.
+  if (pendingMaxPagesSuspend_ && !stopRequested_) {
+    pendingMaxPagesSuspend_ = false;
+    stopRequested_ = true;
+    if (xmlParser_) {
+      XML_StopParser(xmlParser_, XML_TRUE);  // Resumable suspend
+    }
+  }
 }
 
 std::string ChapterHtmlSlimParser::cacheImage(const std::string& src) {
@@ -1035,12 +1111,20 @@ std::string ChapterHtmlSlimParser::cacheImage(const std::string& src) {
     return "";
   }
 
-  // Skip image conversion if heap is critically low (prevents abort from malloc failure)
-  size_t freeHeap = ESP.getFreeHeap();
-  if (freeHeap < 20000) {
-    Serial.printf("[%lu] [EHP] Skipping image - low heap (%zu bytes)\n", millis(), freeHeap);
-    consecutiveImageFailures_++;
-    return "";
+  // Low-heap gate applies only to JPEG/PNG which go through libjpeg/PNGLE
+  // decoders that malloc 20 KB+ of decoder state. The BMP fast path below
+  // streams bytes directly SD → cache with a tiny I/O buffer, so skipping
+  // a BMP just because heap is below 20 KB was leaving users with [Image]
+  // placeholders on pre-dithered site output that the device was perfectly
+  // capable of extracting.
+  const bool isBmpSrc = FsHelpers::isBmpFile(src);
+  if (!isBmpSrc) {
+    size_t freeHeap = ESP.getFreeHeap();
+    if (freeHeap < 20000) {
+      Serial.printf("[%lu] [EHP] Skipping image - low heap (%zu bytes)\n", millis(), freeHeap);
+      consecutiveImageFailures_++;
+      return "";
+    }
   }
 
   // Resolve relative path from chapter base
@@ -1092,7 +1176,10 @@ std::string ChapterHtmlSlimParser::cacheImage(const std::string& src) {
       consecutiveImageFailures_++;
       return "";
     }
-    bmpFile.close();
+    // Cached BMPs are persistent and re-read on every subsequent
+    // render of the chapter. Must sync before close or SdFat can drop
+    // the tail, leaving a truncated BMP that the decoder rejects.
+    SdMan.syncAndClose(bmpFile);
     consecutiveImageFailures_ = 0;
     Serial.printf("[%lu] [EHP] Cached BMP direct: %s\n", millis(), cachedBmpPath.c_str());
     return cachedBmpPath;
@@ -1118,7 +1205,9 @@ std::string ChapterHtmlSlimParser::cacheImage(const std::string& src) {
     consecutiveImageFailures_++;
     return "";
   }
-  tempFile.close();
+  // syncAndClose so the subsequent ImageConverterFactory::convertToBmp
+  // call reads the complete file, not a truncated prefix.
+  SdMan.syncAndClose(tempFile);
 
   const int maxImageHeight = config.allowTallImages ? 2000 : config.viewportHeight;
   ImageConvertConfig convertConfig;
@@ -1163,9 +1252,8 @@ void ChapterHtmlSlimParser::addImageToPage(std::shared_ptr<ImageBlock> image) {
     // Flush current page if it has any content
     if (currentPageNextY > 0) {
       if (!completePageFn(std::move(currentPage))) {
-        stopRequested_ = true;
-        if (xmlParser_) XML_StopParser(xmlParser_, XML_TRUE);
-        return;
+        // Soft-stop: keep adding the image so it isn't lost (see addLineToPage).
+        pendingMaxPagesSuspend_ = true;
       }
       parseStartTime_ = millis();
       currentPage.reset(new Page());
@@ -1181,24 +1269,25 @@ void ChapterHtmlSlimParser::addImageToPage(std::shared_ptr<ImageBlock> image) {
 
     // Always complete the page — each image gets its own scrollable page
     if (!completePageFn(std::move(currentPage))) {
-      stopRequested_ = true;
-      if (xmlParser_) XML_StopParser(xmlParser_, XML_TRUE);
-      return;
+      pendingMaxPagesSuspend_ = true;
     }
     parseStartTime_ = millis();
     currentPage.reset(new Page());
     currentPageNextY = 0;
+
+    // Image is now safely paged — clean boundary, suspend if soft-stop deferred.
+    if (pendingMaxPagesSuspend_) {
+      pendingMaxPagesSuspend_ = false;
+      stopRequested_ = true;
+      if (xmlParser_) XML_StopParser(xmlParser_, XML_TRUE);
+    }
     return;
   }
 
   // Normal mode: tall images get a dedicated page, flush current page if it has content
   if (isTallImage && currentPageNextY > 0) {
     if (!completePageFn(std::move(currentPage))) {
-      stopRequested_ = true;
-      if (xmlParser_) {
-        XML_StopParser(xmlParser_, XML_TRUE);  // Resumable suspend
-      }
-      return;
+      pendingMaxPagesSuspend_ = true;
     }
     parseStartTime_ = millis();
     currentPage.reset(new Page());
@@ -1208,11 +1297,7 @@ void ChapterHtmlSlimParser::addImageToPage(std::shared_ptr<ImageBlock> image) {
   // Check if image fits on current page
   if (currentPageNextY + imageHeight > config.viewportHeight) {
     if (!completePageFn(std::move(currentPage))) {
-      stopRequested_ = true;
-      if (xmlParser_) {
-        XML_StopParser(xmlParser_, XML_TRUE);  // Resumable suspend
-      }
-      return;
+      pendingMaxPagesSuspend_ = true;
     }
     parseStartTime_ = millis();
     currentPage.reset(new Page());
@@ -1235,15 +1320,19 @@ void ChapterHtmlSlimParser::addImageToPage(std::shared_ptr<ImageBlock> image) {
   // Complete the page after a tall image so text continues on the next page
   if (isTallImage) {
     if (!completePageFn(std::move(currentPage))) {
-      stopRequested_ = true;
-      if (xmlParser_) {
-        XML_StopParser(xmlParser_, XML_TRUE);  // Resumable suspend
-      }
-      return;
+      pendingMaxPagesSuspend_ = true;
     }
     parseStartTime_ = millis();
     currentPage.reset(new Page());
     currentPageNextY = 0;
+  }
+
+  // Image is now safely paged into currentPage — clean boundary,
+  // suspend if soft-stop was deferred while flushing.
+  if (pendingMaxPagesSuspend_) {
+    pendingMaxPagesSuspend_ = false;
+    stopRequested_ = true;
+    if (xmlParser_) XML_StopParser(xmlParser_, XML_TRUE);
   }
 }
 

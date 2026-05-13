@@ -1,19 +1,47 @@
 import gzip
 import os
 import re
+import secrets
 
 SRC_DIR = "src"
+
+# Known limitations of this minifier (audit #51). For SUMI's curated
+# single-doc use these are theoretical, but if you reuse this script
+# for a less controlled corpus, audit accordingly:
+#
+#   1. The non-greedy `<script>...</script>` regex matches up to the
+#      first `</script>` literal it sees. JavaScript that contains
+#      `"</script>"` as a *string* will terminate early. Workaround:
+#      write `"<\/script>"` in any such string, OR move that script
+#      to an external .js file.
+#
+#   2. The `\s+` collapse-whitespace pass runs on the whole document
+#      (after preserve-block extraction) and will collapse repeated
+#      spaces inside attribute values: `alt="My  Photo"` becomes
+#      `alt="My Photo"`. Usually fine, sometimes meaningful. If it
+#      matters, embed the value as a Unicode non-breaking space or
+#      use a `<title>` tooltip instead.
+#
+#   3. Placeholder collision (audit #51 fix below): the protect-and-
+#      restore round-trip used a deterministic `__PRESERVE_BLOCK_N__`
+#      sentinel, which would collide if an HTML literal happened to
+#      contain that exact token. We now mix in a per-run random
+#      hex prefix (`secrets.token_hex(8)`) so collision is effectively
+#      impossible.
 
 def minify_html(html: str) -> str:
     # Tags where whitespace should be preserved
     preserve_tags = ['pre', 'code', 'textarea', 'script', 'style']
     preserve_regex = '|'.join(preserve_tags)
 
+    # Per-run random sentinel — eliminates the audit's collision case.
+    placeholder_token = f"__PRESERVE_BLOCK_{secrets.token_hex(8)}__"
+
     # Protect preserve blocks with placeholders
     preserve_blocks = []
     def preserve(match):
         preserve_blocks.append(match.group(0))
-        return f"__PRESERVE_BLOCK_{len(preserve_blocks)-1}__"
+        return f"{placeholder_token}_{len(preserve_blocks)-1}__"
 
     html = re.sub(rf'<({preserve_regex})[\s\S]*?</\1>', preserve, html, flags=re.IGNORECASE)
 
@@ -28,7 +56,7 @@ def minify_html(html: str) -> str:
 
     # Restore preserved blocks
     for i, block in enumerate(preserve_blocks):
-        html = html.replace(f"__PRESERVE_BLOCK_{i}__", block)
+        html = html.replace(f"{placeholder_token}_{i}__", block)
 
     return html.strip()
 

@@ -16,7 +16,7 @@ class Storage;
 
 struct Settings {
   // Sleep screen display modes
-  enum SleepScreenMode : uint8_t { SleepDark = 0, SleepLight = 1, SleepCustom = 2, SleepCover = 3 };
+  enum SleepScreenMode : uint8_t { SleepDark = 0, SleepLight = 1, SleepCustom = 2, SleepCover = 3, SleepPageOverlay = 4 };
 
   // Status bar display modes
   enum StatusBarMode : uint8_t { StatusNone = 0, StatusShow = 1 };
@@ -132,8 +132,32 @@ struct Settings {
   // Name of directory under /config/fonts/ containing regular.epdfont
   char readerFont[32] = "";
 
+  // Active dictionary name (directory key under /dictionary/).
+  // Empty = no dictionary selected / feature inactive. Dictionary::setActive()
+  // picks this up on settings load and the reader/plugin routes lookups
+  // through it.
+  char dictionaryName[32] = "";
+
+  // Text darkness: controls AA rendering intensity
+  // 0=Normal (true 4-level AA), 1=Dark, 2=Extra Dark, 3=Maximum (solid black, no AA)
+  uint8_t textDarkness = 0;
+
+  // UI language (sumi::Language enum: 0=EN, 1=ES, 2=FR, ... 12=AR)
+  uint8_t language = 0;
+
+  // Timezone offset applied to clock display (audit #47 follow-up).
+  // Minutes east of UTC: -720 (UTC-12) to +840 (UTC+14). Default 0
+  // matches the pre-Batch-9 UTC display. Read by SumiClock at boot
+  // (main.cpp wires it via SumiClock::setTimeZoneOffsetMinutes).
+  // SumiClock clamps the value, so the visitor needs no bound here.
+  int16_t timeZoneOffsetMinutes = 0;
+
   // Runtime flags (not persisted)
   bool isFirstBoot = false;  // True when /.sumi doesn't exist yet at boot
+
+  // Crash resilience: if this is > 0 at boot, the previous session crashed
+  // while opening a book. Don't re-open it automatically.
+  uint8_t readerLoadAttempts = 0;
 
   // Persistence (using drivers::Storage wrapper)
   Result<void> load(drivers::Storage& storage);
@@ -150,6 +174,8 @@ struct Settings {
     switch (autoSleepMinutes) {
       case Sleep5Min:
         return 5 * 60 * 1000;
+      case Sleep10Min:
+        return 10 * 60 * 1000;
       case Sleep15Min:
         return 15 * 60 * 1000;
       case Sleep30Min:
@@ -157,6 +183,10 @@ struct Settings {
       case SleepNever:
         return 0;
       default:
+        // Match Sleep10Min, the documented default (audit #20). Pre-fix
+        // the switch fell through to default for Sleep10Min explicitly,
+        // so reordering the enum or adding a value silently broke the
+        // 10-min default semantics.
         return 10 * 60 * 1000;
     }
   }

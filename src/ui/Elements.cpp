@@ -1,5 +1,8 @@
 #include "Elements.h"
 
+#include <I18n.h>
+#include <Utf8.h>
+
 #include <cstdio>
 #include <cstring>
 #include <string>
@@ -11,14 +14,21 @@ namespace ui {
 
 static uint8_t frontButtonLayout_ = 0;
 
+// Translate every ASCII English label we draw. Dynamic strings (book
+// titles, file names, theme names, etc.) aren't in the lookup table so
+// they pass through unchanged.
+static inline const char* trEn(const char* s) {
+  return s ? sumi::I18n::instance().trEn(s) : "";
+}
+
 void setFrontButtonLayout(uint8_t layout) { frontButtonLayout_ = layout; }
 
 void title(const GfxRenderer& r, const Theme& t, int y, const char* text) {
-  r.drawCenteredText(t.readerFontId, y, text, t.primaryTextBlack, EpdFontFamily::BOLD);
+  r.drawCenteredText(t.readerFontId, y, trEn(text), t.primaryTextBlack, EpdFontFamily::BOLD);
 }
 
 void brandTitle(const GfxRenderer& r, const Theme& t, int y, const char* text) {
-  r.drawText(t.readerFontId, 10, y, text, t.primaryTextBlack, EpdFontFamily::BOLD);
+  r.drawText(t.readerFontId, 10, y, trEn(text), t.primaryTextBlack, EpdFontFamily::BOLD);
 }
 
 void menuItem(const GfxRenderer& r, const Theme& t, int y, const char* text, bool selected) {
@@ -26,14 +36,15 @@ void menuItem(const GfxRenderer& r, const Theme& t, int y, const char* text, boo
   const int w = r.getScreenWidth() - 2 * t.screenMarginSide;
   const int h = t.menuItemHeight;
   const int textY = y + (h - r.getLineHeight(t.menuFontId)) / 2;
-  const int textW = r.getTextWidth(t.menuFontId, text);
+  const char* txt = trEn(text);
+  const int textW = r.getTextWidth(t.menuFontId, txt);
   const int textX = x + (w - textW) / 2;  // Center horizontally
 
   if (selected) {
     r.fillRect(x, y, w, h, t.selectionFillBlack);
-    r.drawText(t.menuFontId, textX, textY, text, t.selectionTextBlack);
+    r.drawText(t.menuFontId, textX, textY, txt, t.selectionTextBlack);
   } else {
-    r.drawText(t.menuFontId, textX, textY, text, t.primaryTextBlack);
+    r.drawText(t.menuFontId, textX, textY, txt, t.primaryTextBlack);
   }
 }
 
@@ -44,13 +55,16 @@ void toggle(const GfxRenderer& r, const Theme& t, int y, const char* label, bool
   const int valueX = r.getScreenWidth() - t.screenMarginSide - 50;
   const int textY = y + (h - r.getLineHeight(t.menuFontId)) / 2;
 
+  const char* txtLabel = trEn(label);
+  const char* txtValue = trEn(value ? "ON" : "OFF");
+
   if (selected) {
     r.fillRect(x, y, w, h, t.selectionFillBlack);
-    r.drawText(t.menuFontId, x + t.itemPaddingX, textY, label, t.selectionTextBlack);
-    r.drawText(t.menuFontId, valueX, textY, value ? "ON" : "OFF", t.selectionTextBlack);
+    r.drawText(t.menuFontId, x + t.itemPaddingX, textY, txtLabel, t.selectionTextBlack);
+    r.drawText(t.menuFontId, valueX, textY, txtValue, t.selectionTextBlack);
   } else {
-    r.drawText(t.menuFontId, x + t.itemPaddingX, textY, label, t.primaryTextBlack);
-    r.drawText(t.menuFontId, valueX, textY, value ? "ON" : "OFF", t.secondaryTextBlack);
+    r.drawText(t.menuFontId, x + t.itemPaddingX, textY, txtLabel, t.primaryTextBlack);
+    r.drawText(t.menuFontId, valueX, textY, txtValue, t.secondaryTextBlack);
   }
 }
 
@@ -60,35 +74,38 @@ void enumValue(const GfxRenderer& r, const Theme& t, int y, const char* label, c
   const int h = t.menuItemHeight;
   const int textY = y + (h - r.getLineHeight(t.menuFontId)) / 2;
 
-  const int valueWidth = r.getTextWidth(t.menuFontId, value);
+  const char* txtLabel = trEn(label);
+  const char* txtValue = trEn(value);
+
+  const int valueWidth = r.getTextWidth(t.menuFontId, txtValue);
   const int valueX = r.getScreenWidth() - t.screenMarginSide - valueWidth - t.itemValuePadding;
 
   if (selected) {
     r.fillRect(x, y, w, h, t.selectionFillBlack);
-    r.drawText(t.menuFontId, x + t.itemPaddingX, textY, label, t.selectionTextBlack);
-    r.drawText(t.menuFontId, valueX, textY, value, t.selectionTextBlack);
+    r.drawText(t.menuFontId, x + t.itemPaddingX, textY, txtLabel, t.selectionTextBlack);
+    r.drawText(t.menuFontId, valueX, textY, txtValue, t.selectionTextBlack);
   } else {
-    r.drawText(t.menuFontId, x + t.itemPaddingX, textY, label, t.primaryTextBlack);
-    r.drawText(t.menuFontId, valueX, textY, value, t.secondaryTextBlack);
+    r.drawText(t.menuFontId, x + t.itemPaddingX, textY, txtLabel, t.primaryTextBlack);
+    r.drawText(t.menuFontId, valueX, textY, txtValue, t.secondaryTextBlack);
   }
 }
 
 void buttonBar(const GfxRenderer& r, const Theme& t, const char* b1, const char* b2, const char* b3, const char* b4) {
+  // Translate each non-empty label. "<" and ">" aren't in the lookup so
+  // they pass through unchanged, which is what we want.
+  const char* t1 = trEn(b1);
+  const char* t2 = trEn(b2);
+  const char* t3 = trEn(b3);
+  const char* t4 = trEn(b4);
   if (frontButtonLayout_ == sumi::Settings::FrontLRBC) {
-    r.drawButtonHints(t.uiFontId, b3, b4, b1, b2, t.primaryTextBlack);
+    r.drawButtonHints(t.uiFontId, t3, t4, t1, t2, t.primaryTextBlack);
   } else {
-    r.drawButtonHints(t.uiFontId, b1, b2, b3, b4, t.primaryTextBlack);
+    r.drawButtonHints(t.uiFontId, t1, t2, t3, t4, t.primaryTextBlack);
   }
 }
 
 void buttonBar(const GfxRenderer& r, const Theme& t, const ButtonBar& buttons) {
-  if (frontButtonLayout_ == sumi::Settings::FrontLRBC) {
-    r.drawButtonHints(t.uiFontId, buttons.labels[2], buttons.labels[3], buttons.labels[0], buttons.labels[1],
-                      t.primaryTextBlack);
-  } else {
-    r.drawButtonHints(t.uiFontId, buttons.labels[0], buttons.labels[1], buttons.labels[2], buttons.labels[3],
-                      t.primaryTextBlack);
-  }
+  buttonBar(r, t, buttons.labels[0], buttons.labels[1], buttons.labels[2], buttons.labels[3]);
 }
 
 void progress(const GfxRenderer& r, const Theme& t, int y, int current, int total) {
@@ -453,7 +470,7 @@ void bookCard(const GfxRenderer& r, const Theme& t, int y, const char* titleText
 }
 
 void fileEntry(const GfxRenderer& r, const Theme& t, int y, const char* name, bool isDir, bool selected,
-               int8_t progressPercent, bool unsupported, uint8_t contentHint) {
+               int16_t progressPercent, bool unsupported, uint8_t contentHint) {
   const int x = t.screenMarginSide;
   const int w = r.getScreenWidth() - 2 * t.screenMarginSide;
   const int h = t.menuItemHeight;  // Match menu item height for consistent style
@@ -463,13 +480,15 @@ void fileEntry(const GfxRenderer& r, const Theme& t, int y, const char* name, bo
     r.fillRect(x, y, w, h, t.selectionFillBlack);
   }
 
-  // Build display name with trailing "/" for directories
+  // Build display name with trailing "/" for directories.
+  // utf8SafeCopy so a CJK filename longer than 132 bytes truncates on
+  // a codepoint boundary instead of leaving a stray continuation byte
+  // that renders as '?'.
   char displayName[132];
   if (isDir) {
     snprintf(displayName, sizeof(displayName), "%s/", name);
   } else {
-    strncpy(displayName, name, sizeof(displayName) - 1);
-    displayName[sizeof(displayName) - 1] = '\0';
+    utf8SafeCopy(displayName, name, sizeof(displayName));
   }
 
   // Reserve space for right-aligned tag (progress % or "convert" badge or content hint)
@@ -483,13 +502,15 @@ void fileEntry(const GfxRenderer& r, const Theme& t, int y, const char* name, bo
   int tagTextW = 0;
 
   if (showConvert) {
-    strncpy(tagText, "convert", sizeof(tagText));
+    // Fixed short constant, but use utf8SafeCopy to set a consistent
+    // pattern across the file and guarantee null-termination.
+    utf8SafeCopy(tagText, "convert", sizeof(tagText));
     tagTextW = r.getTextWidth(t.uiFontId, tagText) + 12;
   } else if (showHint && showProgress) {
     snprintf(tagText, sizeof(tagText), "%s %d%%", hintLabel, progressPercent);
     tagTextW = r.getTextWidth(t.uiFontId, tagText) + 12;
   } else if (showHint) {
-    strncpy(tagText, hintLabel, sizeof(tagText));
+    utf8SafeCopy(tagText, hintLabel, sizeof(tagText));
     tagTextW = r.getTextWidth(t.uiFontId, tagText) + 12;
   } else if (showProgress) {
     snprintf(tagText, sizeof(tagText), "%d%%", progressPercent);
@@ -749,14 +770,17 @@ void readerStatusBar(const GfxRenderer& r, const Theme& t, int marginLeft, int m
     std::string titleStr = data.title;
     int titleWidth = r.getTextWidth(t.smallFontId, titleStr.c_str());
 
-    // Truncate title if too wide
+    // Truncate title if too wide. pop_back() walks off the end by one byte,
+    // which on a CJK title (e.g. 小説のタイトル, 3 bytes per codepoint) would
+    // leave an orphan UTF-8 continuation byte and render '?' before the
+    // ellipsis. Drop whole codepoints instead.
     if (titleWidth > availableTextWidth && titleStr.length() > 3) {
       const int ellipsisWidth = r.getTextWidth(t.smallFontId, "...");
       if (ellipsisWidth > availableTextWidth) {
         return;  // Can't fit even ellipsis, skip title
       }
-      while (titleWidth + ellipsisWidth > availableTextWidth && titleStr.length() > 0) {
-        titleStr.pop_back();
+      while (titleWidth + ellipsisWidth > availableTextWidth && !titleStr.empty()) {
+        utf8RemoveLastChar(titleStr);
         titleWidth = r.getTextWidth(t.smallFontId, titleStr.c_str());
       }
       titleStr += "...";

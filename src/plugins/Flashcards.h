@@ -7,6 +7,10 @@
 #include <Arduino.h>
 #include <SDCardManager.h>
 #include <ArduinoJson.h>
+#include <Utf8.h>
+#include <string>
+#include <vector>
+#include <cstring>
 #include "PluginHelpers.h"
 #include "PluginInterface.h"
 #include "PluginRenderer.h"
@@ -105,7 +109,10 @@ struct DeckMetadataFile {
         memset(decks, 0, sizeof(decks));
     }
     
-    bool isValid() const { return magic == 0x444B4D54; }
+    // Validate deckCount too — a corrupt save with deckCount > 20 would
+    // cause findDeckMeta / findOrCreateDeckMeta to walk off the decks[20]
+    // array when iterating.
+    bool isValid() const { return magic == 0x444B4D54 && deckCount <= 20; }
 };
 
 // =============================================================================
@@ -766,10 +773,11 @@ public:
             d_.setFont(getCardFont());
             if (cfgFontSize == 3) d_.setTextSize(2);
             
-            // Truncate question for small card
+            // Truncate question for small card. utf8SafeCopy keeps us on
+            // a codepoint boundary so CJK front text doesn't end in a
+            // broken half-character rendered as '?'.
             char truncQ[40];
-            strncpy(truncQ, cards[cardIndex].front, 39);
-            truncQ[39] = '\0';
+            utf8SafeCopy(truncQ, cards[cardIndex].front, sizeof(truncQ));
             
             int16_t qx, qy; uint16_t qw, qh;
             d_.getTextBounds(truncQ, 0, 0, &qx, &qy, &qw, &qh);
@@ -1184,31 +1192,31 @@ public:
         const char* parenStart = strchr(text, '(');
         
         if (parenStart && parenStart != text) {
-            // Split into main text and pronunciation
+            // Split into main text and pronunciation. Typical use: Japanese
+            // kanji followed by furigana in parentheses, e.g. "漢字 (かんじ)".
+            // Copy through std::string so utf8SafeCopy sees a null-terminated
+            // source and can walk the truncation back to a codepoint boundary.
             char mainText[200];
             char pronunciation[200];
-            
-            int mainLen = parenStart - text;
-            if (mainLen > 199) mainLen = 199;
-            strncpy(mainText, text, mainLen);
-            mainText[mainLen] = '\0';
-            
-            // Trim trailing space from main text
+
+            const std::string mainStr(text, parenStart - text);
+            utf8SafeCopy(mainText, mainStr.c_str(), sizeof(mainText));
+
+            // Trim trailing space from main text (ASCII space only — any
+            // unicode whitespace is unusual here and worth preserving).
+            size_t mainLen = strlen(mainText);
             while (mainLen > 0 && mainText[mainLen - 1] == ' ') {
                 mainText[--mainLen] = '\0';
             }
-            
-            // Copy pronunciation (without outer parentheses)
+
+            // Copy pronunciation (without outer parentheses).
             const char* parenEnd = strrchr(text, ')');
-            if (parenEnd && parenEnd > parenStart) {
-                int pronLen = parenEnd - parenStart - 1;
-                if (pronLen > 199) pronLen = 199;
-                strncpy(pronunciation, parenStart + 1, pronLen);
-                pronunciation[pronLen] = '\0';
-            } else {
-                strncpy(pronunciation, parenStart + 1, 199);
-                pronunciation[199] = '\0';
-            }
+            const char* pronSrc = parenStart + 1;
+            const size_t pronSrcLen = (parenEnd && parenEnd > parenStart)
+                                          ? static_cast<size_t>(parenEnd - pronSrc)
+                                          : strlen(pronSrc);
+            const std::string pronStr(pronSrc, pronSrcLen);
+            utf8SafeCopy(pronunciation, pronStr.c_str(), sizeof(pronunciation));
             
             // Use same font for both - answer font
             d_.setFont(getCardFont());
@@ -1254,271 +1262,138 @@ public:
     }
     
     // Count how many lines wrapped text will take
+    // Count the number of wrapped lines the given text would take at the
+    // specified maxW, using the same UTF-8 aware wrap helper as
+    // drawTextAtY. This ensures countWrappedLines() and the actual render
+    // agree on line count for CJK and accented text (the old byte-wise
+    // splitter diverged badly on multi-byte sequences).
     int countWrappedLines(const char* text, int maxW) {
+        if (!text) return 1;
+        constexpr int kMaxLines = 8;
         int lineCount = 0;
-        int curLineW = 0;
-        
         const char* p = text;
-        while (*p) {
-            // Find next word
-            char word[50];
-            int wordLen = 0;
-            while (*p && *p != ' ' && *p != '\n' && wordLen < 49) {
-                word[wordLen++] = *p++;
-            }
-            word[wordLen] = '\0';
-            
-            if (wordLen > 0) {
-                int16_t tx, ty; uint16_t tw, th;
-                d_.getTextBounds(word, 0, 0, &tx, &ty, &tw, &th);
-                int wordW = tw;
-                int spaceW = (curLineW > 0) ? 8 : 0;
-                
-                if (curLineW > 0 && curLineW + spaceW + wordW > maxW) {
-                    lineCount++;
-                    curLineW = wordW;
-                } else {
-                    curLineW += spaceW + wordW;
-                }
-            }
-            
-            if (*p == '\n') {
-                lineCount++;
-                curLineW = 0;
-                p++;
-            } else if (*p == ' ') {
-                p++;
-            }
+        while (*p && lineCount < kMaxLines) {
+            const char* nl = strchr(p, '\n');
+            std::string segment = nl ? std::string(p, nl - p) : std::string(p);
+            auto wrapped = d_.wrapText(segment.c_str(), maxW, kMaxLines - lineCount);
+            lineCount += static_cast<int>(wrapped.size());
+            if (!nl) break;
+            // Empty segments (back-to-back \n) still consume a line.
+            if (wrapped.empty()) ++lineCount;
+            p = nl + 1;
         }
-        
-        if (curLineW > 0) lineCount++;
         return max(1, lineCount);
     }
     
-    // Draw text at specific Y position
+    // Draw text at specific Y position.
+    //
+    // Uses PluginRenderer::wrapText(), which in turn walks the text
+    // codepoint-by-codepoint via GfxRenderer and uses the external-font
+    // fallback path for CJK. The previous implementation split on raw
+    // ASCII bytes and stored lines in fixed char[80] buffers, so CJK
+    // flashcard fronts/backs would silently corrupt UTF-8 at buffer
+    // boundaries and render a run of '?' characters even when the
+    // external font was loaded. Explicit `\n` breaks are honoured by
+    // splitting the text into segments first.
     void drawTextAtY(const char* text, int x, int y, int maxW, int areaH, int lineH, bool center) {
-        char lines[8][80];
-        int lineWidths[8];
-        int lineCount = 0;
-        
-        char curLine[80];
-        int curLineLen = 0;
-        int curLineW = 0;
-        
+        (void)areaH;
+        if (!text) return;
+
+        constexpr int kMaxLines = 8;
+        std::vector<std::string> lines;
+        lines.reserve(kMaxLines);
+
         const char* p = text;
-        while (*p && lineCount < 8) {
-            char word[50];
-            int wordLen = 0;
-            while (*p && *p != ' ' && *p != '\n' && wordLen < 49) {
-                word[wordLen++] = *p++;
+        while (*p && static_cast<int>(lines.size()) < kMaxLines) {
+            const char* nl = strchr(p, '\n');
+            std::string segment = nl ? std::string(p, nl - p) : std::string(p);
+            auto wrapped = d_.wrapText(segment.c_str(), maxW, kMaxLines - static_cast<int>(lines.size()));
+            for (auto& line : wrapped) {
+                lines.push_back(std::move(line));
+                if (static_cast<int>(lines.size()) >= kMaxLines) break;
             }
-            word[wordLen] = '\0';
-            
-            if (wordLen > 0) {
-                int16_t tx, ty; uint16_t tw, th;
-                d_.getTextBounds(word, 0, 0, &tx, &ty, &tw, &th);
-                int wordW = tw;
-                int spaceW = (curLineLen > 0) ? 8 : 0;
-                
-                if (curLineLen > 0 && curLineW + spaceW + wordW > maxW) {
-                    curLine[curLineLen] = '\0';
-                    strncpy(lines[lineCount], curLine, 79);
-                    lines[lineCount][79] = '\0';
-                    lineWidths[lineCount] = curLineW;
-                    lineCount++;
-                    curLineLen = 0;
-                    curLineW = 0;
-                    if (lineCount >= 8) break;
-                }
-                
-                if (curLineLen > 0) {
-                    curLine[curLineLen++] = ' ';
-                    curLineW += 8;
-                }
-                for (int i = 0; i < wordLen && curLineLen < 78; i++) {
-                    curLine[curLineLen++] = word[i];
-                }
-                curLineW += wordW;
-            }
-            
-            if (*p == '\n') {
-                curLine[curLineLen] = '\0';
-                strncpy(lines[lineCount], curLine, 79);
-                lines[lineCount][79] = '\0';
-                lineWidths[lineCount] = curLineW;
-                lineCount++;
-                curLineLen = 0;
-                curLineW = 0;
-                p++;
-            } else if (*p == ' ') {
-                p++;
-            }
+            if (!nl) break;
+            p = nl + 1;
         }
-        
-        if (curLineLen > 0 && lineCount < 8) {
-            curLine[curLineLen] = '\0';
-            strncpy(lines[lineCount], curLine, 79);
-            lines[lineCount][79] = '\0';
-            lineWidths[lineCount] = curLineW;
-            lineCount++;
-        }
-        
-        // Draw lines
-        for (int i = 0; i < lineCount; i++) {
+
+        for (size_t i = 0; i < lines.size(); ++i) {
             int lineX = x;
             if (center) {
-                lineX = x + (maxW - lineWidths[i]) / 2;
+                const int lw = d_.getTextWidth(lines[i].c_str());
+                lineX = x + (maxW - lw) / 2;
                 if (lineX < x) lineX = x;
             }
-            d_.setCursor(lineX, y + i * lineH + lineH - 5);
-            d_.print(lines[i]);
+            d_.setCursor(lineX, y + static_cast<int>(i) * lineH + lineH - 5);
+            d_.print(lines[i].c_str());
         }
     }
     
-    // Simple wrapped text drawing - always wraps and centers
+    // Simple wrapped text drawing - always wraps and centers. UTF-8 aware
+    // via PluginRenderer::wrapText(); see drawTextAtY comment for why the
+    // previous byte-wise implementation was CJK-broken.
     void drawSimpleWrappedText(const char* text, int x, int y, int maxW, int maxH, bool center) {
-        // Parse text into wrapped lines
-        char lines[8][80];
-        int lineWidths[8];
-        int lineCount = 0;
-        
+        if (!text) return;
+
         int lineH = 28;  // Line height
-        // Check if textSize is 2 by measuring
         int16_t tx, ty; uint16_t tw, th;
         d_.getTextBounds("M", 0, 0, &tx, &ty, &tw, &th);
         if (th > 20) lineH = 45;  // Larger line height for bigger text
-        
-        char curLine[80];
-        int curLineLen = 0;
-        int curLineW = 0;
-        
+
+        constexpr int kMaxLines = 8;
+        std::vector<std::string> lines;
+        lines.reserve(kMaxLines);
+
         const char* p = text;
-        while (*p && lineCount < 8) {
-            // Find next word
-            char word[50];
-            int wordLen = 0;
-            while (*p && *p != ' ' && *p != '\n' && wordLen < 49) {
-                word[wordLen++] = *p++;
+        while (*p && static_cast<int>(lines.size()) < kMaxLines) {
+            const char* nl = strchr(p, '\n');
+            std::string segment = nl ? std::string(p, nl - p) : std::string(p);
+            auto wrapped = d_.wrapText(segment.c_str(), maxW, kMaxLines - static_cast<int>(lines.size()));
+            for (auto& line : wrapped) {
+                lines.push_back(std::move(line));
+                if (static_cast<int>(lines.size()) >= kMaxLines) break;
             }
-            word[wordLen] = '\0';
-            
-            if (wordLen > 0) {
-                d_.getTextBounds(word, 0, 0, &tx, &ty, &tw, &th);
-                int wordW = tw;
-                int spaceW = (curLineLen > 0) ? 8 : 0;
-                
-                // Check if word fits on current line
-                if (curLineLen > 0 && curLineW + spaceW + wordW > maxW) {
-                    // Save current line and start new one
-                    curLine[curLineLen] = '\0';
-                    strncpy(lines[lineCount], curLine, 79);
-                    lines[lineCount][79] = '\0';
-                    lineWidths[lineCount] = curLineW;
-                    lineCount++;
-                    curLineLen = 0;
-                    curLineW = 0;
-                    
-                    if (lineCount >= 8) break;
-                }
-                
-                // Add word to current line
-                if (curLineLen > 0) {
-                    curLine[curLineLen++] = ' ';
-                    curLineW += 8;
-                }
-                for (int i = 0; i < wordLen && curLineLen < 78; i++) {
-                    curLine[curLineLen++] = word[i];
-                }
-                curLineW += wordW;
-            }
-            
-            // Handle newlines and spaces
-            if (*p == '\n') {
-                curLine[curLineLen] = '\0';
-                strncpy(lines[lineCount], curLine, 79);
-                lines[lineCount][79] = '\0';
-                lineWidths[lineCount] = curLineW;
-                lineCount++;
-                curLineLen = 0;
-                curLineW = 0;
-                p++;
-            } else if (*p == ' ') {
-                p++;
-            }
+            if (!nl) break;
+            p = nl + 1;
         }
-        
-        // Save last line
-        if (curLineLen > 0 && lineCount < 8) {
-            curLine[curLineLen] = '\0';
-            strncpy(lines[lineCount], curLine, 79);
-            lines[lineCount][79] = '\0';
-            lineWidths[lineCount] = curLineW;
-            lineCount++;
-        }
-        
-        // Calculate starting Y to center vertically
-        int totalH = lineCount * lineH;
+
+        // Centre vertically
+        const int totalH = static_cast<int>(lines.size()) * lineH;
         int startY = y + (maxH - totalH) / 2;
         if (startY < y) startY = y;
-        
-        // Draw each line
-        for (int i = 0; i < lineCount; i++) {
+
+        for (size_t i = 0; i < lines.size(); ++i) {
             int lineX = x;
             if (center) {
-                // Center this line horizontally
-                lineX = x + (maxW - lineWidths[i]) / 2;
-                if (lineX < x) lineX = x;  // Don't go past left edge
+                const int lw = d_.getTextWidth(lines[i].c_str());
+                lineX = x + (maxW - lw) / 2;
+                if (lineX < x) lineX = x;
             }
-            
-            d_.setCursor(lineX, startY + i * lineH + lineH - 5);
-            d_.print(lines[i]);
+            d_.setCursor(lineX, startY + static_cast<int>(i) * lineH + lineH - 5);
+            d_.print(lines[i].c_str());
         }
     }
     
+    // UTF-8 aware replacement for the old byte-wise drawWrappedText. Wraps
+    // via GfxRenderer's codepoint-aware helper and honours explicit
+    // newlines by splitting the input around them.
     void drawWrappedText(const char* text, int x, int y, int maxWidth, int maxLines) {
-        int curX = x;
+        if (!text) return;
+        const int lineHeight = (cfgFontSize == 3) ? 50 : 28;
         int curY = y;
-        int lineHeight = (cfgFontSize == 3) ? 50 : 28;
         int lineCount = 0;
-        
-        char word[50];
-        int wordLen = 0;
-        
         const char* p = text;
         while (*p && lineCount < maxLines) {
-            if (*p == ' ' || *p == '\n' || *(p + 1) == '\0') {
-                if (*(p + 1) == '\0' && *p != ' ' && *p != '\n') {
-                    if (wordLen < 49) word[wordLen++] = *p;
-                }
-                word[wordLen] = '\0';
-                
-                if (wordLen > 0) {
-                    int16_t x1, y1; uint16_t w, h;
-                    d_.getTextBounds(word, 0, 0, &x1, &y1, &w, &h);
-                    
-                    if (curX + (int)w > x + maxWidth) {
-                        curX = x;
-                        curY += lineHeight;
-                        lineCount++;
-                        if (lineCount >= maxLines) break;
-                    }
-                    
-                    d_.setCursor(curX, curY);
-                    d_.print(word);
-                    curX += w + 8;
-                }
-                
-                if (*p == '\n') {
-                    curX = x;
-                    curY += lineHeight;
-                    lineCount++;
-                }
-                
-                wordLen = 0;
-            } else {
-                if (wordLen < 49) word[wordLen++] = *p;
+            const char* nl = strchr(p, '\n');
+            std::string segment = nl ? std::string(p, nl - p) : std::string(p);
+            auto wrapped = d_.wrapText(segment.c_str(), maxWidth, maxLines - lineCount);
+            for (const auto& line : wrapped) {
+                d_.setCursor(x, curY);
+                d_.print(line.c_str());
+                curY += lineHeight;
+                if (++lineCount >= maxLines) return;
             }
-            p++;
+            if (!nl) break;
+            p = nl + 1;
         }
     }
     
@@ -1560,13 +1435,12 @@ public:
                 continue;
             }
             
-            // Store filename
-            strncpy(decks[deckCount].name, name, 31);
-            decks[deckCount].name[31] = '\0';
-            
-            // Create display name (remove extension)
-            strncpy(decks[deckCount].displayName, name, 27);
-            decks[deckCount].displayName[27] = '\0';
+            // Store filename. Use utf8SafeCopy so a CJK filename like
+            // "日本語フラッシュカード.csv" doesn't get sliced mid-codepoint.
+            utf8SafeCopy(decks[deckCount].name, name, sizeof(decks[deckCount].name));
+
+            // Create display name (remove extension).
+            utf8SafeCopy(decks[deckCount].displayName, name, sizeof(decks[deckCount].displayName));
             char* dot = strrchr(decks[deckCount].displayName, '.');
             if (dot) *dot = '\0';
             
@@ -1780,8 +1654,11 @@ public:
             back.trim();
             
             if (front.length() > 0 && back.length() > 0) {
-                strncpy(cards[cardCount].front, front.c_str(), MAX_TEXT - 1);
-                strncpy(cards[cardCount].back, back.c_str(), MAX_TEXT - 1);
+                // UTF-8 safe: truncate at a codepoint boundary so CJK
+                // cards near MAX_TEXT don't leave a half-character at
+                // the end that renders as '?'.
+                utf8SafeCopy(cards[cardCount].front, front.c_str(), MAX_TEXT);
+                utf8SafeCopy(cards[cardCount].back, back.c_str(), MAX_TEXT);
                 cards[cardCount].seen = false;
                 cardCount++;
             }
@@ -1794,38 +1671,65 @@ public:
     bool loadCsvDeck(const char* path, char delim) {
         FsFile f = SdMan.open(path, O_RDONLY);
         if (!f) return false;
-        
+
         bool firstLine = true;
-        
+
         while (f.available() && cardCount < MAX_CARDS) {
             String line = f.readStringUntil('\n');
             line.trim();
-            
+
             if (line.length() == 0) continue;
-            
+
             // Skip header row
             if (firstLine) {
                 firstLine = false;
                 if (isHeaderRow(line.c_str())) continue;
             }
-            
-            int delimPos = line.indexOf(delim);
+
+            // Split at first delimiter NOT inside a double-quoted field.
+            // Previously this used indexOf(delim), so a card line like
+            //   "Hello, world",answer text
+            // split at the comma inside the quotes and produced
+            //   front='"Hello', back=' world",answer text' — both broken.
+            int delimPos = -1;
+            bool inQuotes = false;
+            for (int i = 0; i < (int)line.length(); i++) {
+                const char c = line[i];
+                if (c == '"') {
+                    // Doubled quotes inside a quoted field are an escaped quote,
+                    // not a toggle.
+                    if (inQuotes && i + 1 < (int)line.length() && line[i + 1] == '"') {
+                        i++;
+                        continue;
+                    }
+                    inQuotes = !inQuotes;
+                } else if (!inQuotes && c == delim) {
+                    delimPos = i;
+                    break;
+                }
+            }
             if (delimPos <= 0) continue;
-            
+
             String front = line.substring(0, delimPos);
             String back = line.substring(delimPos + 1);
-            
-            // Remove quotes
-            front.trim();
-            back.trim();
-            if (front.startsWith("\"")) front = front.substring(1);
-            if (front.endsWith("\"")) front = front.substring(0, front.length() - 1);
-            if (back.startsWith("\"")) back = back.substring(1);
-            if (back.endsWith("\"")) back = back.substring(0, back.length() - 1);
-            
+
+            // Strip surrounding double quotes and unescape embedded doubled quotes.
+            auto unquote = [](String& s) {
+                s.trim();
+                if (s.length() >= 2 && s.charAt(0) == '"' && s.charAt(s.length() - 1) == '"') {
+                    s = s.substring(1, s.length() - 1);
+                    s.replace("\"\"", "\"");
+                }
+            };
+            unquote(front);
+            unquote(back);
+
             if (front.length() > 0 && back.length() > 0) {
-                strncpy(cards[cardCount].front, front.c_str(), MAX_TEXT - 1);
-                strncpy(cards[cardCount].back, back.c_str(), MAX_TEXT - 1);
+                // UTF-8 safe: truncate at a codepoint boundary so CJK
+                // cards near MAX_TEXT don't leave a half-character at
+                // the end that renders as '?'.
+                utf8SafeCopy(cards[cardCount].front, front.c_str(), MAX_TEXT);
+                utf8SafeCopy(cards[cardCount].back, back.c_str(), MAX_TEXT);
                 cards[cardCount].seen = false;
                 cardCount++;
             }
@@ -1891,8 +1795,8 @@ public:
                         }
                         
                         if (front.length() > 0 && back.length() > 0) {
-                            strncpy(cards[cardCount].front, front.c_str(), MAX_TEXT - 1);
-                            strncpy(cards[cardCount].back, back.c_str(), MAX_TEXT - 1);
+                            utf8SafeCopy(cards[cardCount].front, front.c_str(), MAX_TEXT);
+                            utf8SafeCopy(cards[cardCount].back, back.c_str(), MAX_TEXT);
                             cards[cardCount].seen = false;
                             cardCount++;
                         }
@@ -1914,31 +1818,71 @@ public:
     }
     
     String extractJsonValue(const String& obj, const char* key) {
+        // Look for `"key"` followed by optional whitespace and `:`. Without the
+        // trailing-colon check the search could match the key name embedded
+        // inside a value (e.g. back value mentions "front"). Start at 0 and
+        // advance past any non-key hits.
         String searchKey = String("\"") + key + "\"";
-        int keyPos = obj.indexOf(searchKey);
-        if (keyPos < 0) return "";
-        
-        int colonPos = obj.indexOf(':', keyPos);
+        int from = 0;
+        int colonPos = -1;
+        while (from < (int)obj.length()) {
+            const int hit = obj.indexOf(searchKey, from);
+            if (hit < 0) return "";
+            int after = hit + searchKey.length();
+            while (after < (int)obj.length() && (obj[after] == ' ' || obj[after] == '\t')) after++;
+            if (after < (int)obj.length() && obj[after] == ':') {
+                colonPos = after;
+                break;
+            }
+            from = hit + 1;
+        }
         if (colonPos < 0) return "";
-        
+
         int valueStart = colonPos + 1;
-        while (valueStart < (int)obj.length() && (obj[valueStart] == ' ' || obj[valueStart] == '"')) {
+        while (valueStart < (int)obj.length() && (obj[valueStart] == ' ' || obj[valueStart] == '\t')) {
             valueStart++;
         }
-        
+        const bool inQuotes = (valueStart < (int)obj.length() && obj[valueStart] == '"');
+        if (inQuotes) valueStart++;
+
+        // Walk to the end of the value. For quoted strings we have to respect
+        // backslash escapes — previously the scan used `indexOf('"')` which
+        // terminated at the first `\"` inside a value (e.g. `"He said \"hi\""`
+        // would be truncated after "He said "). Build the unescaped value
+        // directly while walking.
+        String out;
         int valueEnd = valueStart;
-        bool inQuotes = (obj[valueStart - 1] == '"');
-        
         if (inQuotes) {
-            valueEnd = obj.indexOf('"', valueStart);
-        } else {
-            while (valueEnd < (int)obj.length() && obj[valueEnd] != ',' && obj[valueEnd] != '}') {
+            while (valueEnd < (int)obj.length()) {
+                const char c = obj[valueEnd];
+                if (c == '\\' && valueEnd + 1 < (int)obj.length()) {
+                    const char next = obj[valueEnd + 1];
+                    switch (next) {
+                        case '"':  out += '"'; break;
+                        case '\\': out += '\\'; break;
+                        case '/':  out += '/'; break;
+                        case 'n':  out += '\n'; break;
+                        case 't':  out += '\t'; break;
+                        case 'r':  out += '\r'; break;
+                        // \uXXXX and others: pass through unchanged — the
+                        // display path already handles raw UTF-8, and decoding
+                        // surrogate pairs here isn't worth the code size.
+                        default:   out += c; out += next; break;
+                    }
+                    valueEnd += 2;
+                    continue;
+                }
+                if (c == '"') break;
+                out += c;
                 valueEnd++;
             }
+            return out;
         }
-        
-        if (valueEnd < 0) valueEnd = obj.length();
-        
+
+        // Unquoted: number / bool / null. Stop at comma or close brace.
+        while (valueEnd < (int)obj.length() && obj[valueEnd] != ',' && obj[valueEnd] != '}') {
+            valueEnd++;
+        }
         return obj.substring(valueStart, valueEnd);
     }
     
@@ -1969,7 +1913,8 @@ public:
         // Build full path if relative
         char fullPath[128];
         if (path[0] == '/') {
-            strncpy(fullPath, path, sizeof(fullPath) - 1);
+            // path may contain CJK image filenames; strncpy cuts mid-codepoint.
+            utf8SafeCopy(fullPath, path, sizeof(fullPath));
         } else {
             snprintf(fullPath, sizeof(fullPath), "/flashcards/%s", path);
         }
@@ -2052,9 +1997,15 @@ public:
     void loadStats() {
         FsFile f = SdMan.open(FLASHCARDS_STATS_PATH, O_RDONLY);
         if (f) {
-            f.read((uint8_t*)&stats, sizeof(FlashcardStats));
+            FlashcardStats tmp = {};
+            const int bytesRead = f.read((uint8_t*)&tmp, sizeof(FlashcardStats));
             f.close();
-            if (!stats.isValid()) {
+            // Full-struct read + valid magic required. A truncated write
+            // could land a valid magic in the header but leave the tail
+            // of the struct uninitialized, producing garbage totals.
+            if (bytesRead == sizeof(FlashcardStats) && tmp.isValid()) {
+                stats = tmp;
+            } else {
                 stats = FlashcardStats();
             }
         }
@@ -2062,19 +2013,27 @@ public:
     
     void saveStats() {
         SdMan.mkdir("/.sumi");
-        FsFile f = SdMan.open(FLASHCARDS_STATS_PATH, O_WRONLY | O_CREAT | O_TRUNC);
-        if (f) {
-            f.write((uint8_t*)&stats, sizeof(FlashcardStats));
-            f.close();
+        // Atomic — see docs/ATOMIC_WRITE_DESIGN.md. Flashcard stats
+        // accumulate across study sessions; a power loss mid-save would
+        // wipe the streak / cards-studied / correct-rate history.
+        FsFile f;
+        if (!SdMan.atomicOpenWrite("FCD", FLASHCARDS_STATS_PATH, f)) return;
+        f.write((uint8_t*)&stats, sizeof(FlashcardStats));
+        if (!SdMan.atomicCommit(f, FLASHCARDS_STATS_PATH)) {
+            SdMan.atomicAbort(f, FLASHCARDS_STATS_PATH);
         }
     }
-    
+
     void loadDeckMeta() {
         FsFile f = SdMan.open(FLASHCARDS_DECKMETA_PATH, O_RDONLY);
         if (f) {
-            f.read((uint8_t*)&deckMeta, sizeof(DeckMetadataFile));
+            DeckMetadataFile tmp = {};
+            const int bytesRead = f.read((uint8_t*)&tmp, sizeof(DeckMetadataFile));
             f.close();
-            if (!deckMeta.isValid()) {
+            // Same rationale as loadStats: full read + valid before commit.
+            if (bytesRead == sizeof(DeckMetadataFile) && tmp.isValid()) {
+                deckMeta = tmp;
+            } else {
                 deckMeta = DeckMetadataFile();
             }
         }
@@ -2082,13 +2041,15 @@ public:
     
     void saveDeckMeta() {
         SdMan.mkdir("/.sumi");
-        FsFile f = SdMan.open(FLASHCARDS_DECKMETA_PATH, O_WRONLY | O_CREAT | O_TRUNC);
-        if (f) {
-            f.write((uint8_t*)&deckMeta, sizeof(DeckMetadataFile));
-            f.close();
+        // Atomic — see saveStats comment.
+        FsFile f;
+        if (!SdMan.atomicOpenWrite("FCD", FLASHCARDS_DECKMETA_PATH, f)) return;
+        f.write((uint8_t*)&deckMeta, sizeof(DeckMetadataFile));
+        if (!SdMan.atomicCommit(f, FLASHCARDS_DECKMETA_PATH)) {
+            SdMan.atomicAbort(f, FLASHCARDS_DECKMETA_PATH);
         }
     }
-    
+
     DeckMetadata* findDeckMeta(const char* filename) {
         for (int i = 0; i < deckMeta.deckCount; i++) {
             if (strcmp(deckMeta.decks[i].filename, filename) == 0) {
@@ -2106,7 +2067,9 @@ public:
         
         dm = &deckMeta.decks[deckMeta.deckCount++];
         memset(dm, 0, sizeof(DeckMetadata));
-        strncpy(dm->filename, filename, 31);
+        // UTF-8 safe so CJK deck filenames stored in persisted metadata
+        // don't end in a broken codepoint.
+        utf8SafeCopy(dm->filename, filename, sizeof(dm->filename));
         return dm;
     }
     

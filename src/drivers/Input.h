@@ -26,6 +26,11 @@ class Input {
   // Time since last input activity (ms)
   uint32_t idleTimeMs() const;
 
+  // Mark the device as active right now. Used by non-input activity
+  // paths (BLE file transfer, long renders) to prevent the auto-sleep
+  // timer from firing immediately after they finish.
+  void markActivity();
+
   // Direct state queries (for hold detection)
   bool isPressed(Button btn) const;
 

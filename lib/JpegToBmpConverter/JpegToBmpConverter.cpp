@@ -422,21 +422,28 @@ bool JpegToBmpConverter::jpegFileToBmpStreamInternal(FsFile& jpegFile, Print& bm
                 millis(), totalNeeded, outWidth, outHeight);
   
   // Create ditherer if not in quick mode
-  // Use arena-backed memory when available to avoid heap fragmentation
+  // Use arena-backed memory when available to avoid heap fragmentation.
+  // nothrow keeps a heap-exhausted dither alloc from aborting the
+  // device — the per-pixel callback already null-checks g_ditherer /
+  // g_1bitDitherer and falls through to simple thresholding when
+  // either is nullptr, so a failed alloc just degrades the output
+  // rather than crashing.
   if (!quickMode) {
     if (oneBit) {
       if (sumi::MemoryArena::isInitialized() && sumi::MemoryArena::ditherRegion) {
-        g_1bitDitherer = new Atkinson1BitDitherer(outWidth, sumi::MemoryArena::ditherRegion,
-                                                   sumi::MemoryArena::DITHER_REGION_SIZE);
+        g_1bitDitherer = new (std::nothrow) Atkinson1BitDitherer(
+            outWidth, sumi::MemoryArena::ditherRegion,
+            sumi::MemoryArena::DITHER_REGION_SIZE);
       } else {
-        g_1bitDitherer = new Atkinson1BitDitherer(outWidth);
+        g_1bitDitherer = new (std::nothrow) Atkinson1BitDitherer(outWidth);
       }
     } else {
       if (sumi::MemoryArena::isInitialized() && sumi::MemoryArena::ditherRegion) {
-        g_ditherer = new AtkinsonDitherer(outWidth, sumi::MemoryArena::ditherRegion,
-                                          sumi::MemoryArena::DITHER_REGION_SIZE);
+        g_ditherer = new (std::nothrow) AtkinsonDitherer(
+            outWidth, sumi::MemoryArena::ditherRegion,
+            sumi::MemoryArena::DITHER_REGION_SIZE);
       } else {
-        g_ditherer = new AtkinsonDitherer(outWidth);
+        g_ditherer = new (std::nothrow) AtkinsonDitherer(outWidth);
       }
     }
   }

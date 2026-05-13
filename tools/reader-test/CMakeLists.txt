@@ -47,6 +47,13 @@ add_executable(reader-test
   ${PROJECT_ROOT}/lib/ScriptDetector/ScriptDetector.cpp
   ${PROJECT_ROOT}/lib/Utf8/Utf8.cpp
   ${PROJECT_ROOT}/lib/FsHelpers/FsHelpers.cpp
+
+  # Core runtime needed by content parsers
+  ${PROJECT_ROOT}/src/core/MemoryArena.cpp
+  ${PROJECT_ROOT}/lib/Epub/Epub/hyphenation/Hyphenator.cpp
+  ${PROJECT_ROOT}/lib/Epub/Epub/hyphenation/HyphenationCommon.cpp
+  ${PROJECT_ROOT}/lib/Epub/Epub/hyphenation/LanguageRegistry.cpp
+  ${PROJECT_ROOT}/lib/Epub/Epub/hyphenation/LiangHyphenation.cpp
 )
 
 # Mock headers take priority over real ones
@@ -74,6 +81,7 @@ target_include_directories(reader-test PRIVATE
   ${PROJECT_ROOT}/lib/Html5
   ${PROJECT_ROOT}/lib/miniz
   ${PROJECT_ROOT}/lib/ImageConverter
+  ${PROJECT_ROOT}/lib/Epub/Epub/hyphenation
 )
 
 # Force-include Arduino.h like PlatformIO does (provides cstdint, Print, etc.)

@@ -62,7 +62,13 @@ struct Theme {
  */
 inline Theme getBuiltinLightTheme() {
   Theme theme = {};
-  strncpy(theme.displayName, "Light", sizeof(theme.displayName));
+  // Theme is zero-init (= {}) so any unwritten trailing byte is NUL,
+  // but use the safer strncpy(... , sizeof - 1) + explicit NUL pattern
+  // here too — the literal "Light" is short enough that the un-init
+  // tail stays untouched, but the overall pattern in the codebase
+  // should be uniform.
+  strncpy(theme.displayName, "Light", sizeof(theme.displayName) - 1);
+  theme.displayName[sizeof(theme.displayName) - 1] = '\0';
   theme.invertedMode = false;
   theme.selectionFillBlack = true;
   theme.selectionTextBlack = false;
@@ -96,7 +102,8 @@ inline Theme getBuiltinLightTheme() {
  */
 inline Theme getBuiltinDarkTheme() {
   Theme theme = {};
-  strncpy(theme.displayName, "Dark", sizeof(theme.displayName));
+  strncpy(theme.displayName, "Dark", sizeof(theme.displayName) - 1);
+  theme.displayName[sizeof(theme.displayName) - 1] = '\0';
   theme.invertedMode = true;
   theme.selectionFillBlack = false;
   theme.selectionTextBlack = true;

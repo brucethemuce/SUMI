@@ -5,6 +5,7 @@
 #if FEATURE_PLUGINS
 
 #include <Arduino.h>
+#include <Utf8.h>
 #include <FsHelpers.h>
 #include <ImageConverter.h>
 #include <SDCardManager.h>
@@ -303,13 +304,19 @@ void MapsApp::drawBrowser() {
         d_.print(map.isTileMap ? "T" : "I");
 
         d_.setCursor(60, y + 18);
+        // UTF-8 safe truncation: naive memcpy at byte 20 would cut a
+        // CJK map name mid-codepoint (each CJK char is 3 bytes), leaving
+        // a stray continuation byte that renders as '?'. utf8SafeCopy
+        // walks by codepoint and stops on the last full glyph that fits.
         char shortName[24];
         if (strlen(map.name) > 20) {
-          memcpy(shortName, map.name, 20);
-          memcpy(shortName + 20, "...", 4);
+          utf8SafeCopy(shortName, map.name, 21);  // leaves 3 bytes for "..."
+          const size_t pos = strlen(shortName);
+          if (pos + 3 < sizeof(shortName)) {
+            memcpy(shortName + pos, "...", 4);
+          }
         } else {
-          strncpy(shortName, map.name, 23);
-          shortName[23] = '\0';
+          utf8SafeCopy(shortName, map.name, sizeof(shortName));
         }
         d_.print(shortName);
 
@@ -440,8 +447,8 @@ void MapsApp::scanMaps() {
         if (name[0] == '.') { entry.close(); continue; }
 
         MapEntry& map = _maps[_mapCount];
-        strncpy(map.name, name, MAX_NAME_LEN - 1);
-        map.name[MAX_NAME_LEN - 1] = '\0';
+        // UTF-8 safe so CJK map names aren't sliced mid-codepoint.
+        utf8SafeCopy(map.name, name, MAX_NAME_LEN);
 
         if (entry.isDirectory()) {
             map.isTileMap = true;
@@ -523,13 +530,14 @@ void MapsApp::openMap(int idx) {
             config.logTag = "MAP";
 
             if (ImageConverterFactory::convertToBmp(path, MAPS_TMP_IMG, config)) {
-                strncpy(_imgBmpPath, MAPS_TMP_IMG, sizeof(_imgBmpPath) - 1);
+                utf8SafeCopy(_imgBmpPath, MAPS_TMP_IMG, sizeof(_imgBmpPath));
                 loadImageInfo(_imgBmpPath);
             } else {
                 loadImageInfo(path);
             }
         } else {
-            strncpy(_imgBmpPath, path, sizeof(_imgBmpPath) - 1);
+            // path may contain CJK map filenames; strncpy cuts mid-codepoint.
+            utf8SafeCopy(_imgBmpPath, path, sizeof(_imgBmpPath));
             loadImageInfo(path);
         }
 
@@ -585,19 +593,22 @@ void MapsApp::drawBmpAt(const char* bmpPath, int screenX, int screenY, int maxW,
             free(row);
         }
     } else if (bpp == 24) {
-        int rowBytes = ((width * 3 + 3) / 4) * 4;
-        uint8_t* row = (uint8_t*)malloc(min(rowBytes, 768));
+        // Previously this capped the row buffer at 768 bytes (= 256 pixels
+        // of BGR), silently truncating any BMP wider than 256 px — so a
+        // 400×300 map would render as a 256×300 slice. Allocate the real
+        // row size instead; ESP32-C3 heap accommodates the extra KB fine.
+        const int rowBytes = ((width * 3 + 3) / 4) * 4;
+        uint8_t* row = (uint8_t*)malloc(rowBytes);
         if (row) {
             for (int y = 0; y < drawH; y++) {
                 int imgY = flipV ? (height - 1 - y) : y;
                 f.seek(dataOffset + imgY * rowBytes);
-                f.read(row, min(rowBytes, 768));
+                f.read(row, rowBytes);
                 for (int x = 0; x < drawW; x++) {
-                    if (x * 3 + 2 < min(rowBytes, 768)) {
-                        int idx = x * 3;
-                        int gray = (row[idx] + row[idx+1] + row[idx+2]) / 3;
-                        d_.drawPixel(screenX + x, screenY + y, gray > 128 ? GxEPD_WHITE : GxEPD_BLACK);
-                    }
+                    const int idx = x * 3;
+                    if (idx + 2 >= rowBytes) break;
+                    const int gray = (row[idx] + row[idx + 1] + row[idx + 2]) / 3;
+                    d_.drawPixel(screenX + x, screenY + y, gray > 128 ? GxEPD_WHITE : GxEPD_BLACK);
                 }
             }
             free(row);
@@ -709,19 +720,19 @@ void MapsApp::drawImageRegion(const char* path, int srcX, int srcY, int zoom) {
                 free(row);
             }
         } else {
-            int rowBytes = ((width * 3 + 3) / 4) * 4;
-            uint8_t* row = (uint8_t*)malloc(min(rowBytes, 2400));
+            // Full row width — see the other 24bpp path for rationale.
+            const int rowBytes = ((width * 3 + 3) / 4) * 4;
+            uint8_t* row = (uint8_t*)malloc(rowBytes);
             if (row) {
                 for (int y = 0; y < drawH; y++) {
                     int imgY = flipV ? (height - 1 - y) : y;
                     f.seek(dataOffset + imgY * rowBytes);
-                    f.read(row, min(rowBytes, 2400));
+                    f.read(row, rowBytes);
                     for (int x = 0; x < drawW; x++) {
-                        if (x * 3 + 2 < min(rowBytes, 2400)) {
-                            int idx = x * 3;
-                            int gray = (row[idx] + row[idx+1] + row[idx+2]) / 3;
-                            d_.drawPixel(offsetX + x, offsetY + y, gray > 128 ? GxEPD_WHITE : GxEPD_BLACK);
-                        }
+                        const int idx = x * 3;
+                        if (idx + 2 >= rowBytes) break;
+                        const int gray = (row[idx] + row[idx + 1] + row[idx + 2]) / 3;
+                        d_.drawPixel(offsetX + x, offsetY + y, gray > 128 ? GxEPD_WHITE : GxEPD_BLACK);
                     }
                 }
                 free(row);
@@ -751,21 +762,20 @@ void MapsApp::drawImageRegion(const char* path, int srcX, int srcY, int zoom) {
                 free(row);
             }
         } else {
-            int rowBytes = ((width * 3 + 3) / 4) * 4;
-            uint8_t* row = (uint8_t*)malloc(min(rowBytes, 2400));
+            const int rowBytes = ((width * 3 + 3) / 4) * 4;
+            uint8_t* row = (uint8_t*)malloc(rowBytes);
             if (row) {
                 for (int sy = 0; sy < viewH && sy + srcY < (int)height; sy++) {
                     int imgY = flipV ? (height - 1 - (srcY + sy)) : (srcY + sy);
                     f.seek(dataOffset + imgY * rowBytes);
-                    f.read(row, min(rowBytes, 2400));
+                    f.read(row, rowBytes);
                     int screenY = sy * zoom;
                     for (int sx = 0; sx < viewW && sx + srcX < (int)width; sx++) {
-                        int imgX = srcX + sx;
-                        if (imgX * 3 + 2 < min(rowBytes, 2400)) {
-                            int idx = imgX * 3;
-                            int gray = (row[idx] + row[idx+1] + row[idx+2]) / 3;
-                            if (gray <= 128) d_.fillRect(sx * zoom, screenY, zoom, zoom, GxEPD_BLACK);
-                        }
+                        const int imgX = srcX + sx;
+                        const int idx = imgX * 3;
+                        if (idx + 2 >= rowBytes) break;
+                        const int gray = (row[idx] + row[idx + 1] + row[idx + 2]) / 3;
+                        if (gray <= 128) d_.fillRect(sx * zoom, screenY, zoom, zoom, GxEPD_BLACK);
                     }
                 }
                 free(row);

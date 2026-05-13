@@ -1,5 +1,7 @@
 #pragma once
 
+#include <cstdint>  // uint8_t / int16_t used by CssTextDecoration and textIndentPx
+
 /**
  * Text alignment values supported by the reader
  */

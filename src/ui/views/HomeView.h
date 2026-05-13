@@ -2,6 +2,7 @@
 
 #include <GfxRenderer.h>
 #include <Theme.h>
+#include <Utf8.h>
 
 #include <cstdint>
 #include <cstring>
@@ -51,7 +52,12 @@ struct HomeView {
   // Book progress (from LibraryIndex)
   uint16_t bookCurrentPage = 0;
   uint16_t bookTotalPages = 0;
-  int8_t bookProgress = -1;  // 0-100, or -1 if unknown
+  int16_t bookProgress = -1;  // 0-100, or -1 if unknown.
+                              // Widened from int8_t in Batch 7 alongside
+                              // LibraryIndex::Entry::progressPercent (audit
+                              // #35). The -1 sentinel still fits; the wider
+                              // type documents that we trust LibraryIndex's
+                              // [0,100] clamp rather than the int8_t range.
   bool isChapterBased = false;  // true for EPUB (spine-based progress)
 
   // Cover image (external pointer - not owned)
@@ -88,12 +94,11 @@ struct HomeView {
   bool inLibraryMode = false;  // When true, show carousel at bottom
 
   void setBook(const char* title, const char* author, const char* path) {
-    strncpy(bookTitle, title, MAX_TITLE_LEN - 1);
-    bookTitle[MAX_TITLE_LEN - 1] = '\0';
-    strncpy(bookAuthor, author, MAX_AUTHOR_LEN - 1);
-    bookAuthor[MAX_AUTHOR_LEN - 1] = '\0';
-    strncpy(bookPath, path, MAX_PATH_LEN - 1);
-    bookPath[MAX_PATH_LEN - 1] = '\0';
+    // UTF-8 safe: a CJK title/author that would be sliced mid-codepoint
+    // by strncpy shows up on Home as '?' at the break.
+    utf8SafeCopy(bookTitle, title, MAX_TITLE_LEN);
+    utf8SafeCopy(bookAuthor, author, MAX_AUTHOR_LEN);
+    utf8SafeCopy(bookPath, path, MAX_PATH_LEN);
     hasBook = true;
     needsRender = true;
   }
@@ -133,15 +138,12 @@ struct HomeView {
                      const char* thumbPath = nullptr) {
     if (recentBookCount >= MAX_RECENT_BOOKS) return;
     auto& entry = recentBooks[recentBookCount];
-    strncpy(entry.title, title, MAX_TITLE_LEN - 1);
-    entry.title[MAX_TITLE_LEN - 1] = '\0';
-    strncpy(entry.author, author, MAX_AUTHOR_LEN - 1);
-    entry.author[MAX_AUTHOR_LEN - 1] = '\0';
-    strncpy(entry.path, path, MAX_PATH_LEN - 1);
-    entry.path[MAX_PATH_LEN - 1] = '\0';
+    // UTF-8 safe: these are the carousel entries on the Home view.
+    utf8SafeCopy(entry.title, title, MAX_TITLE_LEN);
+    utf8SafeCopy(entry.author, author, MAX_AUTHOR_LEN);
+    utf8SafeCopy(entry.path, path, MAX_PATH_LEN);
     if (thumbPath && thumbPath[0] != '\0') {
-      strncpy(entry.thumbPath, thumbPath, MAX_THUMB_LEN - 1);
-      entry.thumbPath[MAX_THUMB_LEN - 1] = '\0';
+      utf8SafeCopy(entry.thumbPath, thumbPath, MAX_THUMB_LEN);
     } else {
       entry.thumbPath[0] = '\0';
     }
@@ -223,8 +225,10 @@ struct FileListView {
 
   bool addFile(const char* name, bool isDir) {
     if (fileCount < MAX_FILES) {
-      strncpy(files[fileCount].name, name, NAME_LEN - 1);
-      files[fileCount].name[NAME_LEN - 1] = '\0';
+      // UTF-8 safe: a CJK filename longer than NAME_LEN-1 bytes would
+      // otherwise be sliced mid-codepoint and render as '?' in the
+      // file list. NAME_LEN=48 fits only ~15 CJK characters.
+      utf8SafeCopy(files[fileCount].name, name, NAME_LEN);
       files[fileCount].isDirectory = isDir;
       fileCount++;
       return true;
@@ -233,8 +237,9 @@ struct FileListView {
   }
 
   void setPath(const char* path) {
-    strncpy(currentPath, path, PATH_LEN - 1);
-    currentPath[PATH_LEN - 1] = '\0';
+    // Paths are ASCII-safe, but directory names on FAT32 LFN can be
+    // UTF-8 encoded — use utf8SafeCopy for consistency.
+    utf8SafeCopy(currentPath, path, PATH_LEN);
     needsRender = true;
   }
 
@@ -326,8 +331,9 @@ struct ChapterListView {
 
   bool addChapter(const char* title, uint16_t pageNum, uint8_t depth = 0) {
     if (chapterCount < MAX_CHAPTERS) {
-      strncpy(chapters[chapterCount].title, title, TITLE_LEN - 1);
-      chapters[chapterCount].title[TITLE_LEN - 1] = '\0';
+      // UTF-8 safe: chapter titles in CJK books like 「第一章」 etc.
+      // would otherwise be sliced mid-codepoint near the buffer limit.
+      utf8SafeCopy(chapters[chapterCount].title, title, TITLE_LEN);
       chapters[chapterCount].pageNum = pageNum;
       chapters[chapterCount].depth = depth;
       chapterCount++;
@@ -337,6 +343,19 @@ struct ChapterListView {
   }
 
   void setCurrentChapter(uint8_t idx) {
+    // Clamp to valid range. The caller (populateTocView path) is expected
+    // to pass an index < chapterCount, but defensive bounds prevent a
+    // stale `idx` past the new list size from leaving `selected` past
+    // chapters[chapterCount - 1] (which subsequent rendering would
+    // dereference out-of-bounds).
+    if (chapterCount == 0) {
+      currentChapter = 0;
+      selected = 0;
+      scrollOffset = 0;
+      needsRender = true;
+      return;
+    }
+    if (idx >= chapterCount) idx = chapterCount - 1;
     currentChapter = idx;
     selected = idx;
     scrollOffset = idx;  // Start with current chapter at top

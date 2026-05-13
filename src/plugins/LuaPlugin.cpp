@@ -6,6 +6,9 @@
 
 #include <Arduino.h>
 #include <SDCardManager.h>
+#include <Utf8.h>
+
+#include <string>
 
 extern "C" {
 #include <lua.h>
@@ -17,34 +20,65 @@ extern "C" {
 #include "LuaBindings.h"
 #include "PluginHelpers.h"
 
+#if FEATURE_BLUETOOTH
+#include "LuaBridgeBindings.h"
+#include "../ble/BleBridge.h"
+#endif
+
 namespace sumi {
 
 // ---------------------------------------------------------------------------
 // Custom allocator with memory cap
 // ---------------------------------------------------------------------------
+//
+// Lua's allocator contract: nsize == 0 means free; otherwise (re)allocate to
+// nsize bytes. The previous implementation computed `delta = nsize - osize`
+// in unsigned arithmetic and applied the limit check unconditionally. When
+// Lua shrinks (nsize < osize) — which the GC does routinely on table
+// compactions and string-buffer trimming — that subtraction underflowed to
+// a huge size_t. The limit check then either spuriously denied the shrink
+// (Lua VM panics on a denied alloc) or, after `memUsed_ + delta` wrapped,
+// permanently poisoned `memUsed_`. Either way the 40 KB cap was unreliable
+// and Lua plugins would die mid-session on innocuous garbage collection.
+//
+// Fix: branch on grow vs. shrink. Apply the limit check only when growing.
+// Shrinks always succeed (realloc-down is defined to succeed in practice).
+// Account each direction with positive arithmetic; defensively clamp the
+// shrink path against `memUsed_` so a future drift can't underflow.
 void* LuaPlugin::luaAlloc(void* ud, void* ptr, size_t osize, size_t nsize) {
   auto* self = static_cast<LuaPlugin*>(ud);
 
   if (nsize == 0) {
-    // Free
+    // Free path. Lua passes the real osize per spec.
     if (ptr) {
-      self->memUsed_ -= osize;
+      // Defensive: never let memUsed_ underflow if osize is somehow stale.
+      self->memUsed_ = (osize > self->memUsed_) ? 0 : self->memUsed_ - osize;
       free(ptr);
     }
     return nullptr;
   }
 
-  // Check memory limit
-  size_t delta = nsize - (ptr ? osize : 0);
-  if (self->memUsed_ + delta > LUA_MEM_LIMIT) {
-    Serial.printf("[LUA] Memory limit reached (%zu + %zu > %zu)\n",
-                  self->memUsed_, delta, LUA_MEM_LIMIT);
-    return nullptr;  // Allocation denied
+  const size_t oldSize = ptr ? osize : 0;
+
+  // Limit check only when growing. Shrinks always succeed.
+  if (nsize > oldSize) {
+    const size_t growth = nsize - oldSize;
+    if (self->memUsed_ + growth > LUA_MEM_LIMIT) {
+      Serial.printf("[LUA] Memory limit reached (%zu + %zu > %zu)\n",
+                    self->memUsed_, growth, LUA_MEM_LIMIT);
+      return nullptr;
+    }
   }
 
   void* newPtr = realloc(ptr, nsize);
   if (newPtr) {
-    self->memUsed_ += delta;
+    if (nsize > oldSize) {
+      self->memUsed_ += (nsize - oldSize);
+    } else if (oldSize > nsize) {
+      const size_t shrink = oldSize - nsize;
+      self->memUsed_ = (shrink > self->memUsed_) ? 0 : self->memUsed_ - shrink;
+    }
+    // nsize == oldSize: realloc may relocate, accounting unchanged.
   }
   return newPtr;
 }
@@ -62,17 +96,20 @@ void LuaPlugin::luaHook(lua_State* L, lua_Debug* ar) {
 // ---------------------------------------------------------------------------
 LuaPlugin::LuaPlugin(PluginRenderer& renderer, const char* scriptPath)
     : renderer_(renderer) {
-  strncpy(scriptPath_, scriptPath, sizeof(scriptPath_) - 1);
-  scriptPath_[sizeof(scriptPath_) - 1] = '\0';
+  // UTF-8 safe: CJK-named Lua scripts would otherwise lose their last
+  // character in the plugin list.
+  utf8SafeCopy(scriptPath_, scriptPath, sizeof(scriptPath_));
 
   // Derive name from filename: "/custom/my_game.lua" → "my_game"
   const char* slash = strrchr(scriptPath_, '/');
   const char* base = slash ? slash + 1 : scriptPath_;
   const char* dot = strrchr(base, '.');
-  size_t len = dot ? (size_t)(dot - base) : strlen(base);
-  if (len >= sizeof(name_)) len = sizeof(name_) - 1;
-  memcpy(name_, base, len);
-  name_[len] = '\0';
+  const size_t baseLen = dot ? (size_t)(dot - base) : strlen(base);
+  // Use utf8SafeCopy via a temporary std::string so a CJK display name
+  // lands on a codepoint boundary rather than the raw byte limit.
+  const std::string baseStr(base, baseLen);
+  utf8SafeCopy(name_, baseStr.c_str(), sizeof(name_));
+  const size_t len = strlen(name_);
 
   // Replace underscores with spaces for display
   for (size_t i = 0; i < len; i++) {
@@ -103,12 +140,10 @@ void LuaPlugin::init(int screenW, int screenH) {
   Serial.printf("[LUA] Heap before: free=%lu, largest=%lu\n",
                 (unsigned long)ESP.getFreeHeap(), (unsigned long)ESP.getMaxAllocHeap());
 
-  // Release MemoryArena to free 80KB for Lua VM
-  if (MemoryArena::isInitialized()) {
-    MemoryArena::release();
-    Serial.printf("[LUA] Arena released, heap: free=%lu, largest=%lu\n",
-                  (unsigned long)ESP.getFreeHeap(), (unsigned long)ESP.getMaxAllocHeap());
-  }
+  // (v1 used to release MemoryArena here to free 80 KB for the Lua VM.
+  //  v2's arena is .bss-resident and never freed; the LUA_MEM_LIMIT cap
+  //  caps Lua's appetite to 40 KB out of the heap that remains after
+  //  arena + NimBLE.)
 
   // Create Lua state with custom allocator
   memUsed_ = 0;
@@ -139,8 +174,46 @@ void LuaPlugin::init(int screenW, int screenH) {
   lua_pushinteger(L_, screenH);
   lua_setfield(L_, LUA_REGISTRYINDEX, "sumi_screenH");
 
+  // Store sandbox directory in registry: "/custom/myplugin.lua" -> "/custom/myplugin_data/"
+  {
+    const char* slash = strrchr(scriptPath_, '/');
+    const char* base = slash ? slash + 1 : scriptPath_;
+    const char* dot = strrchr(base, '.');
+    char sandboxDir[80];
+    // Build prefix (directory part including trailing slash)
+    size_t prefixLen = (size_t)(base - scriptPath_);
+    if (prefixLen >= sizeof(sandboxDir)) prefixLen = sizeof(sandboxDir) - 1;
+    memcpy(sandboxDir, scriptPath_, prefixLen);
+    // Append basename without extension + "_data/"
+    size_t baseLen = dot ? (size_t)(dot - base) : strlen(base);
+    int wrote = snprintf(sandboxDir + prefixLen, sizeof(sandboxDir) - prefixLen,
+                         "%.*s_data/", (int)baseLen, base);
+    if (wrote > 0 && prefixLen + (size_t)wrote < sizeof(sandboxDir)) {
+      lua_pushstring(L_, sandboxDir);
+    } else {
+      lua_pushstring(L_, "/custom/_fallback_data/");
+    }
+    lua_setfield(L_, LUA_REGISTRYINDEX, "sumi_plugin_dir");
+  }
+
   // Register all SUMI drawing bindings
   lua_bind::registerAll(L_);
+
+#if FEATURE_BLUETOOTH
+  // Register the `bridge` global table and install the inbound dispatcher.
+  // The underlying BLE service is NOT brought up here — the bindings
+  // lazy-initialize it on the first bridge.publish / bridge.on /
+  // bridge.keep_awake call. A pure drawing plugin (Chess, 2048, etc.)
+  // that never touches bridge.* pays zero heap/battery cost for BLE.
+  lua_bridge_bind::registerInto(L_);
+  {
+    lua_State* L_ref = L_;
+    ble_bridge::setInboundHandler(
+      [L_ref](const char* topic, const char* json) {
+        lua_bridge_bind::dispatchInbound(L_ref, topic, json);
+      });
+  }
+#endif  // FEATURE_BLUETOOTH
 
   // Set SCREEN_W and SCREEN_H constants
   lua_pushinteger(L_, screenW); lua_setglobal(L_, "SCREEN_W");
@@ -172,17 +245,23 @@ void LuaPlugin::init(int screenW, int screenH) {
 }
 
 void LuaPlugin::cleanup() {
+#if FEATURE_BLUETOOTH
+  // Drop the inbound handler before closing L_ — otherwise a late BLE
+  // inbound message could call into a freed Lua state.
+  ble_bridge::setInboundHandler(nullptr);
+  // Clear the keep-awake window so the next plugin doesn't inherit it.
+  ble_bridge::keepAwake(0);
+#endif
+
   if (L_) {
     lua_close(L_);
     L_ = nullptr;
     memUsed_ = 0;
-    Serial.printf("[LUA] VM closed, reclaiming arena\n");
+    Serial.printf("[LUA] VM closed\n");
   }
 
-  // Reclaim MemoryArena
-  if (!MemoryArena::isInitialized()) {
-    MemoryArena::init();
-  }
+  // (v1 used to reclaim the MemoryArena here. v2 never released it, so
+  //  there is nothing to reclaim.)
 
   Serial.printf("[LUA] Cleanup done, heap: free=%lu\n", (unsigned long)ESP.getFreeHeap());
 }
@@ -219,8 +298,18 @@ bool LuaPlugin::loadScript() {
     return false;
   }
 
-  size_t bytesRead = f.read(reinterpret_cast<uint8_t*>(buf), fileSize);
+  // FsFile::read returns int — -1 on error. Clamp to avoid SIZE_MAX
+  // becoming the terminator index and writing far out of bounds.
+  const int rawRead = f.read(reinterpret_cast<uint8_t*>(buf), fileSize);
   f.close();
+  if (rawRead <= 0) {
+    snprintf(errorMsg_, sizeof(errorMsg_), "Read failed for script");
+    hasError_ = true;
+    Serial.printf("[LUA] ERROR: %s\n", errorMsg_);
+    free(buf);
+    return false;
+  }
+  const size_t bytesRead = static_cast<size_t>(rawRead);
   buf[bytesRead] = '\0';
 
   Serial.printf("[LUA] Loaded %zu bytes from %s\n", bytesRead, scriptPath_);
@@ -344,6 +433,10 @@ bool LuaPlugin::handleInput(PluginButton btn) {
 // Update (10Hz tick)
 // ---------------------------------------------------------------------------
 bool LuaPlugin::update() {
+  // Bridge ticking happens unconditionally in main.cpp's main loop so
+  // plugins without update() still get inbound dispatch and outbound
+  // notifications.
+
   if (!hasUpdate_ || hasError_ || !L_) return false;
 
   lua_getglobal(L_, "update");

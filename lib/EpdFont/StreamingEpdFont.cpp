@@ -210,9 +210,12 @@ bool StreamingEpdFont::loadGlyphBitmap(uint32_t glyphIndex, CachedBitmap& entry)
     return false;
   }
 
-  // Read bitmap data - return false on partial read (SD card error)
-  size_t bytesRead = _fontFile.read(entry.bitmap, dataLen);
-  if (bytesRead != dataLen) {
+  // Read bitmap data - return false on partial read (SD card error).
+  // FsFile::read returns int: -1 on I/O failure. Storing that in size_t
+  // would wrap to SIZE_MAX and slip past any plain '!=' comparison with
+  // a subsequent arithmetic use. Keep it as int and reject negative.
+  const int bytesRead = _fontFile.read(entry.bitmap, dataLen);
+  if (bytesRead < 0 || static_cast<size_t>(bytesRead) != dataLen) {
     return false;
   }
 

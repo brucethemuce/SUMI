@@ -1,6 +1,8 @@
 #pragma once
 
 #include <BackgroundTask.h>
+#include <BookOverrides.h>
+#include <Bookmarks.h>
 
 #include <cstdint>
 #include <memory>
@@ -8,7 +10,9 @@
 #include "../content/ReaderNavigation.h"
 #include "../core/Types.h"
 #include "../rendering/XtcPageRenderer.h"
+#include "../ui/views/DictionaryViews.h"
 #include "../ui/views/HomeView.h"
+#include "../ui/views/ReaderViews.h"
 #include "../ui/views/SettingsViews.h"
 #include "State.h"
 
@@ -141,6 +145,17 @@ class ReaderState : public State {
   static void saveAnchorMap(const ContentParser& parser, const std::string& cachePath);
   static int loadAnchorPage(const std::string& cachePath, const std::string& anchor);
 
+  // Per-book reader setting overrides
+  sumi::BookOverrides bookOverrides_;
+
+  // Snapshot of global defaults taken before per-book overrides are applied.
+  // Used by applyInReaderSettings to determine which fields are overridden.
+  uint8_t globalFontSize_ = 0;
+  uint8_t globalLineSpacing_ = 0;
+  uint8_t globalHyphenation_ = 0;
+  uint8_t globalShowImages_ = 0;
+  uint8_t globalTextDarkness_ = 0;
+
   // Source state (where reader was opened from)
   StateId sourceState_ = StateId::Home;
 
@@ -176,6 +191,53 @@ class ReaderState : public State {
   // Exit reader back to UI (Home or FileList)
   void exitToUI(Core& core);
   StateId exitTarget_ = StateId::Reader;  // Set by exitToUI to trigger transition
+
+  // ── Dictionary lookup history viewer ────────────────────────
+  ui::DictHistoryView historyView_;
+  bool historyMode_ = false;
+
+  void handleHistoryInput(Core& core, const Event& e);
+
+  // ── Dictionary overlay modes ────────────────────────────────
+  // The in-reader dictionary is a three-stage overlay: word-select
+  // (pick a word on the current page), definition (show the entry),
+  // and suggestions ("did you mean?" fuzzy list). Only one is active
+  // at a time. Launched from Settings → "Look up Word".
+  enum class DictStage : uint8_t { None, WordSelect, Definition, Suggestions };
+  DictStage dictStage_ = DictStage::None;
+  ui::DictWordSelectView dictWordSelectView_;
+  ui::DictDefinitionView dictDefinitionView_;
+  ui::DictSuggestionsView dictSuggestionsView_;
+
+  // Page kept alive for the duration of the word-select overlay. We don't
+  // want to re-parse the cache underneath us while the user is navigating
+  // word cells, so we snapshot the rendered page here on entry.
+  std::unique_ptr<Page> dictSelectedPage_;
+
+  void enterDictWordSelect(Core& core);
+  void exitDictOverlay(Core& core);
+  void handleDictInput(Core& core, const Event& e);
+  void renderDictOverlay(Core& core);
+
+  // Triggered from the word-select view on Confirm. Runs Dictionary::lookup,
+  // with a stem-variant fallback and a findSimilar fallback; transitions
+  // into Definition or Suggestions, or shows "Not found" and stays in
+  // WordSelect. The word argument is already cleaned.
+  void performDictLookup(Core& core, const std::string& cleaned);
+
+  // ── Bookmark list overlay ──────────────────────────────────
+  bool bookmarkListMode_ = false;
+  ui::BookmarkListView bookmarkView_;
+
+  void handleBookmarkListInput(Core& core, const Event& e);
+  void enterBookmarkList(Core& core);
+
+  // ── Global bookmark index overlay ─────────────────────────
+  bool globalBookmarkMode_ = false;
+  ui::GlobalBookmarkListView globalBookmarkView_;
+
+  void handleGlobalBookmarkInput(Core& core, const Event& e);
+  void enterGlobalBookmarkList(Core& core);
 };
 
 }  // namespace sumi

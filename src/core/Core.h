@@ -27,10 +27,12 @@ struct Core {
   EventQueue events;
 
   // === Shared buffers (pre-allocated, reused) ===
+  // Path + text scratch strings for state transitions. The older
+  // `decompress` field was an 8 KB buffer declared but never referenced
+  // — removed to recover 8 KB of static DRAM.
   struct Buffers {
     char path[BufferSize::Path];
     char text[BufferSize::Text];
-    uint8_t decompress[BufferSize::Decompress];
   } buf;
 
   // === Lifecycle ===

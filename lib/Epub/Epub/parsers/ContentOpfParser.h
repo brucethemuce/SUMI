@@ -1,7 +1,6 @@
 #pragma once
 #include <Print.h>
 
-#include <unordered_map>
 #include <vector>
 
 #include "Epub.h"
@@ -34,7 +33,11 @@ class ContentOpfParser final : public Print {
   ParserState state = START;
   BookMetadataCache* cache;
   FsFile tempItemStore;
-  std::unordered_map<std::string, std::string> manifestIndex;  // itemId -> href
+  // Manifest lookup during spine walk is streamed from tempItemStore on
+  // demand — we used to hold an unordered_map<string,string> here but
+  // on big EPUBs (War and Peace: 500+ manifest entries) building the
+  // map blew std::bad_alloc on a fragmented heap. Streaming trades a
+  // bit of SD time for being able to open any book.
   std::string coverItemId;
   std::vector<std::string> cssFiles_;
 

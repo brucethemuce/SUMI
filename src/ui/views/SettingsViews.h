@@ -2,6 +2,7 @@
 
 #include <GfxRenderer.h>
 #include <Theme.h>
+#include <Utf8.h>
 
 #include <algorithm>
 #include <cstdint>
@@ -151,7 +152,7 @@ struct SystemInfoView {
     char value[MAX_VALUE_LEN];
   };
 
-  static constexpr int MAX_FIELDS = 8;
+  static constexpr int MAX_FIELDS = 10;
   ButtonBar buttons{"Back", "", "", ""};
   InfoField fields[MAX_FIELDS] = {};
   uint8_t fieldCount = 0;
@@ -164,10 +165,8 @@ struct SystemInfoView {
 
   void addField(const char* label, const char* value) {
     if (fieldCount < MAX_FIELDS) {
-      strncpy(fields[fieldCount].label, label, sizeof(InfoField::label) - 1);
-      fields[fieldCount].label[sizeof(InfoField::label) - 1] = '\0';
-      strncpy(fields[fieldCount].value, value, MAX_VALUE_LEN - 1);
-      fields[fieldCount].value[MAX_VALUE_LEN - 1] = '\0';
+      utf8SafeCopy(fields[fieldCount].label, label, sizeof(InfoField::label));
+      utf8SafeCopy(fields[fieldCount].value, value, MAX_VALUE_LEN);
       fieldCount++;
       needsRender = true;
     }
@@ -315,12 +314,21 @@ struct InReaderSettingsView {
     SettingType type;
     const char* const* enumValues;
     uint8_t enumCount;
+    // True for settings that have any effect on a pre-rendered XTC book.
+    // Reflow-time choices (font, size, line spacing, hyphenation, etc.)
+    // are baked into the XTC at process time and ignored at read time —
+    // those get validForXtc=false so the in-reader settings overlay
+    // doesn't show menu entries that silently do nothing. Initialized
+    // explicitly per-entry in the DEFS table (no default member
+    // initializer here, to keep this an aggregate under pre-C++17
+    // toolchains).
+    bool validForXtc;
   };
 
 #if FEATURE_BLUETOOTH
-  static constexpr int SETTING_COUNT = 10;
+  static constexpr int SETTING_COUNT = 16;
 #else
-  static constexpr int SETTING_COUNT = 9;
+  static constexpr int SETTING_COUNT = 15;
 #endif
   static constexpr int MAX_FONTS = 16;
   static constexpr int VISIBLE_ITEMS = 10;
@@ -337,15 +345,46 @@ struct InReaderSettingsView {
   int8_t selected = 0;
   int8_t scrollOffset = 0;
   bool needsRender = true;
+  // Set by ReaderState when populating the view, from
+  // core.content.metadata().type. True iff the current book is XTC
+  // (pre-rendered). Filters DEFS through validForXtc on render + nav.
+  bool isXtc = false;
+
+  bool isVisible(int defsIdx) const {
+    if (defsIdx < 0 || defsIdx >= SETTING_COUNT) return false;
+    return !isXtc || DEFS[defsIdx].validForXtc;
+  }
+
+  int visibleCount() const {
+    int n = 0;
+    for (int i = 0; i < SETTING_COUNT; i++) if (isVisible(i)) n++;
+    return n;
+  }
+
+  int slotOf(int defsIdx) const {
+    int n = 0;
+    for (int i = 0; i < defsIdx; i++) if (isVisible(i)) n++;
+    return n;
+  }
 
   void moveUp() {
-    selected = (selected == 0) ? SETTING_COUNT - 1 : selected - 1;
+    int next = selected;
+    for (int step = 0; step < SETTING_COUNT; step++) {
+      next = (next == 0) ? SETTING_COUNT - 1 : next - 1;
+      if (isVisible(next)) break;
+    }
+    selected = next;
     ensureVisible();
     needsRender = true;
   }
 
   void moveDown() {
-    selected = (selected + 1) % SETTING_COUNT;
+    int next = selected;
+    for (int step = 0; step < SETTING_COUNT; step++) {
+      next = (next + 1) % SETTING_COUNT;
+      if (isVisible(next)) break;
+    }
+    selected = next;
     ensureVisible();
     needsRender = true;
   }
@@ -366,8 +405,15 @@ struct InReaderSettingsView {
     needsRender = true;
   }
 
-  // Action status text (set externally by reader state)
+  // Action status text (set externally by reader state). Legacy single
+  // slot used by the Bluetooth action; the dictionary action uses a
+  // separate slot so the two don't stomp on each other's display.
   char actionStatus[24] = "Connect";
+  char dictActionStatus[24] = "None";
+  char historyActionStatus[24] = "";
+  char bookmarkToggleStatus[24] = "";
+  char bookmarkListStatus[24] = "";
+  char globalBookmarkStatus[24] = "";
 
   const char* getCurrentValueStr(int index) const {
     const auto& def = DEFS[index];
@@ -381,6 +427,17 @@ struct InReaderSettingsView {
       return "Default";
     }
     if (def.type == SettingType::Action) {
+      // Dictionary lookup shows the active dictionary's display name so the
+      // user sees what will be searched; Bluetooth shows its connection
+      // state. Both are set externally by ReaderState in loadInReaderSettings.
+      if (def.label != nullptr && def.label[0] == 'L') {
+        // Distinguish "Look up Word" (label[7]=='W') from "Lookup History" (label[7]=='H')
+        if (def.label[7] == 'H') return historyActionStatus;
+        return dictActionStatus;
+      }
+      if (def.label != nullptr && def.label[0] == 'T') return bookmarkToggleStatus;
+      if (def.label != nullptr && def.label[0] == 'V') return bookmarkListStatus;
+      if (def.label != nullptr && def.label[0] == 'A') return globalBookmarkStatus;
       return actionStatus;
     }
     if (def.enumCount == 0 || values[index] >= def.enumCount) {
@@ -398,8 +455,12 @@ struct InReaderSettingsView {
   }
 
   void ensureVisible() {
-    if (selected < scrollOffset) scrollOffset = selected;
-    if (selected >= scrollOffset + VISIBLE_ITEMS) scrollOffset = selected - VISIBLE_ITEMS + 1;
+    // scrollOffset is a *slot* index (post-hiding), not a DEFS index. The
+    // selected DEFS index gets mapped to its visible slot before clamping
+    // so the row math matches what render() actually draws.
+    const int slot = slotOf(selected);
+    if (slot < scrollOffset) scrollOffset = slot;
+    if (slot >= scrollOffset + VISIBLE_ITEMS) scrollOffset = slot - VISIBLE_ITEMS + 1;
   }
 };
 
@@ -411,13 +472,18 @@ void render(const GfxRenderer& r, const Theme& t, const InReaderSettingsView& v)
 
 struct DeviceSettingsView {
   static constexpr const char* const SLEEP_TIMEOUT_VALUES[] = {"5 min", "10 min", "15 min", "30 min", "Never"};
-  static constexpr const char* const SLEEP_SCREEN_VALUES[] = {"Dark", "Light", "Custom", "Cover"};
+  static constexpr const char* const SLEEP_SCREEN_VALUES[] = {"Dark", "Light", "Custom", "Cover", "Last Page"};
   static constexpr const char* const STARTUP_VALUES[] = {"Last Document", "Home"};
   static constexpr const char* const SHORT_PWR_VALUES[] = {"Ignore", "Sleep", "Page Turn", "Refresh"};
   static constexpr const char* const PAGES_REFRESH_VALUES[] = {"1", "5", "10", "15", "30", "Never"};
   static constexpr const char* const TOGGLE_VALUES[] = {"OFF", "ON"};
   static constexpr const char* const FRONT_BUTTON_VALUES[] = {"B/C/L/R", "L/R/B/C"};
   static constexpr const char* const SIDE_BUTTON_VALUES[] = {"Prev/Next", "Next/Prev"};
+  static constexpr const char* const LANGUAGE_VALUES[] = {
+    "English", "Espanol", "Francais", "Deutsch", "Portugues",
+    "Italiano", "Russkij", "Polski", "Nederlands",
+    "Nihongo", "Zhongwen", "Hangugeo", "Arabiy"
+  };
 
   struct SettingDef {
     const char* label;
@@ -426,9 +492,9 @@ struct DeviceSettingsView {
   };
 
 #if FEATURE_PLUGINS
-  static constexpr int SETTING_COUNT = 9;
+  static constexpr int SETTING_COUNT = 10;
 #else
-  static constexpr int SETTING_COUNT = 8;
+  static constexpr int SETTING_COUNT = 9;
 #endif
   static const SettingDef DEFS[SETTING_COUNT];
 
@@ -520,6 +586,51 @@ void render(const GfxRenderer& r, const Theme& t, const AppVisibilityView& v);
 #endif  // FEATURE_PLUGINS
 
 // ============================================================================
+// FileActionMenuView - 3-option file action picker (Right-press popup in
+// the file browser). Replaces the previous straight-to-confirm-delete
+// flow with a small menu offering "Index for faster reading", "Delete",
+// and "Cancel". "Index" is the discoverability hook for sumi.page/process
+// — even on books where indexing isn't supported on-device, surfacing
+// the option here teaches users the path exists.
+// ============================================================================
+
+struct FileActionMenuView {
+  static constexpr int MAX_TITLE_LEN = 64;
+  static constexpr int ITEM_COUNT = 3;
+
+  // Stable order; Index first so it's the default-highlighted row when
+  // the menu opens — most users will press Center expecting "the usual"
+  // (delete) and the menu briefly shows them the new option. Cancel last
+  // matches the same pattern as ConfirmDialogView's "No" default.
+  enum Action : uint8_t { ActionIndex = 0, ActionDelete = 1, ActionCancel = 2 };
+
+  ButtonBar buttons{"Back", "Confirm", "", ""};
+  char title[MAX_TITLE_LEN] = "";
+  uint8_t selected = ActionIndex;
+  bool needsRender = true;
+
+  void setup(const char* fileLabel) {
+    utf8SafeCopy(title, fileLabel, MAX_TITLE_LEN);
+    selected = ActionIndex;
+    needsRender = true;
+  }
+
+  void moveUp() {
+    selected = (selected == 0) ? ITEM_COUNT - 1 : selected - 1;
+    needsRender = true;
+  }
+
+  void moveDown() {
+    selected = static_cast<uint8_t>((selected + 1) % ITEM_COUNT);
+    needsRender = true;
+  }
+
+  Action currentAction() const { return static_cast<Action>(selected); }
+};
+
+void render(const GfxRenderer& r, const Theme& t, const FileActionMenuView& v);
+
+// ============================================================================
 // ConfirmDialogView - Yes/No confirmation dialog (matches old ConfirmActionActivity)
 // ============================================================================
 
@@ -535,13 +646,10 @@ struct ConfirmDialogView {
   bool needsRender = true;
 
   void setup(const char* t, const char* l1, const char* l2) {
-    strncpy(title, t, MAX_TITLE_LEN - 1);
-    title[MAX_TITLE_LEN - 1] = '\0';
-    strncpy(line1, l1, MAX_LINE_LEN - 1);
-    line1[MAX_LINE_LEN - 1] = '\0';
+    utf8SafeCopy(title, t, MAX_TITLE_LEN);
+    utf8SafeCopy(line1, l1, MAX_LINE_LEN);
     if (l2) {
-      strncpy(line2, l2, MAX_LINE_LEN - 1);
-      line2[MAX_LINE_LEN - 1] = '\0';
+      utf8SafeCopy(line2, l2, MAX_LINE_LEN);
     } else {
       line2[0] = '\0';
     }

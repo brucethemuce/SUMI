@@ -71,7 +71,11 @@ bool G5ImageCache::compressToFile(const uint8_t* bitmap, int width, int height, 
     return false;
   }
 
-  outFile.close();
+  // syncAndClose so the compressed (multi-sector) payload is committed to
+  // disk. SdFat will silently truncate a bare close() on multi-sector
+  // writes; a dirty shutdown after this path would leave a half-written
+  // .g5 file that then fails magic/size checks on next open.
+  SdMan.syncAndClose(outFile);
   delete[] compressBuffer;
   return true;
 }
@@ -94,6 +98,25 @@ bool G5ImageCache::decompressFromFile(const char* path, std::function<void(const
   }
 
   if (header.magic != G5_MAGIC) {
+    inFile.close();
+    return false;
+  }
+
+  // Sanity-cap untrusted header fields before allocating. A corrupted
+  // .g5c cache with compressedSize = 0xFFFFFFFF would try to allocate
+  // ~4 GB on a 380KB-heap ESP32-C3 and abort() the device. Real Group5
+  // images top out around 50-100 KB compressed; 512 KB is a generous
+  // ceiling that still catches the pathological case. Width/height
+  // come from the same header so they need bounds too — max SUMI
+  // screen dimensions are 800×800 at worst (landscape+overscan), so
+  // 4096 is conservatively huge.
+  constexpr uint32_t kMaxCompressedSize = 512u * 1024u;
+  constexpr uint32_t kMaxDimension = 4096u;
+  if (header.compressedSize == 0 || header.compressedSize > kMaxCompressedSize ||
+      header.width == 0 || header.width > kMaxDimension ||
+      header.height == 0 || header.height > kMaxDimension) {
+    Serial.printf("[G5C] Implausible header: w=%u h=%u cs=%u — discarding cache\n",
+                  header.width, header.height, header.compressedSize);
     inFile.close();
     return false;
   }

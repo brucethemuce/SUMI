@@ -189,10 +189,11 @@ size_t Markdown::readContent(uint8_t* buffer, size_t offset, size_t length) cons
     file.seek(offset);
   }
 
-  size_t bytesRead = file.read(buffer, length);
+  // FsFile::read returns int — -1 on error. Clamp negative to 0 so the
+  // caller never sees SIZE_MAX as a byte count.
+  const int rawRead = file.read(buffer, length);
   file.close();
-
-  return bytesRead;
+  return rawRead > 0 ? static_cast<size_t>(rawRead) : 0;
 }
 
 bool Markdown::extractTitleFromContent() {
@@ -258,8 +259,25 @@ bool Markdown::extractTitleFromContent() {
 
   if (extracted.empty()) return false;
 
-  // Truncate to fit buffer
-  if (extracted.length() > 127) extracted.resize(127);
+  // Truncate to fit the 128-byte cache buffer, respecting UTF-8 boundaries.
+  // A naive resize(127) can slice a 3-byte CJK codepoint mid-sequence,
+  // which would then be cached as a broken lead byte + NUL and rendered
+  // as '?' in the file list.
+  if (extracted.length() > 127) {
+    extracted.resize(127);
+    // Drop any trailing continuation bytes plus the lead byte of the
+    // partial sequence they belong to.
+    while (!extracted.empty()
+           && (static_cast<unsigned char>(extracted.back()) & 0xC0) == 0x80) {
+      extracted.pop_back();
+    }
+    if (!extracted.empty()) {
+      const unsigned char lead = static_cast<unsigned char>(extracted.back());
+      // If the final byte is a multi-byte lead (>= 0xC0), it was the lead
+      // of the now-stripped partial codepoint — drop it too.
+      if (lead >= 0xC0) extracted.pop_back();
+    }
+  }
 
   // Update title
   title = extracted;
@@ -269,7 +287,7 @@ bool Markdown::extractTitleFromContent() {
   FsFile file;
   if (SdMan.openFileForWrite("MD ", titleCachePath, file)) {
     file.write(reinterpret_cast<const uint8_t*>(title.c_str()), title.length());
-    file.close();
+    SdMan.syncAndClose(file);
   }
 
   return true;

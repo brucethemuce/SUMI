@@ -2,6 +2,7 @@
 
 #include <GfxRenderer.h>
 #include <Theme.h>
+#include <Utf8.h>
 
 #include <cstdint>
 #include <cstring>
@@ -22,8 +23,7 @@ struct MessageView {
   bool needsRender = true;
 
   void setMessage(const char* msg) {
-    strncpy(message, msg, MAX_MSG_LEN - 1);
-    message[MAX_MSG_LEN - 1] = '\0';
+    utf8SafeCopy(message, msg, MAX_MSG_LEN);
     needsRender = true;
   }
 };
@@ -45,13 +45,11 @@ struct ConfirmView {
   bool needsRender = true;
 
   void setTitle(const char* t) {
-    strncpy(title, t, MAX_TITLE_LEN - 1);
-    title[MAX_TITLE_LEN - 1] = '\0';
+    utf8SafeCopy(title, t, MAX_TITLE_LEN);
   }
 
   void setMessage(const char* msg) {
-    strncpy(message, msg, MAX_MSG_LEN - 1);
-    message[MAX_MSG_LEN - 1] = '\0';
+    utf8SafeCopy(message, msg, MAX_MSG_LEN);
     needsRender = true;
   }
 
@@ -95,8 +93,7 @@ struct KeyboardView {
   bool needsRender = true;
 
   void setTitle(const char* t) {
-    strncpy(title, t, MAX_TITLE_LEN - 1);
-    title[MAX_TITLE_LEN - 1] = '\0';
+    utf8SafeCopy(title, t, MAX_TITLE_LEN);
   }
 
   void setPassword(bool pw) { isPassword = pw; }

@@ -1,11 +1,17 @@
 #include "BleFileTransfer.h"
 #include "../config.h"
+#include "BleHostCallbacks.h"
 
 #if FEATURE_BLUETOOTH
 
 #include <NimBLEDevice.h>
 #include <SdFat.h>
 #include <SDCardManager.h>
+#include <SumiClock.h>
+#include <Utf8.h>
+
+#include <errno.h>
+#include <stdlib.h>
 
 // Use types from ble_transfer namespace
 using ble_transfer::TransferEvent;
@@ -30,10 +36,19 @@ bool _connected = false;
 bool _transferring = false;
 TransferCallback _callback = nullptr;
 
-// Transfer state
+// Transfer state.
+//
+// _folder bumped from 32 to 64 in Batch 6: allowed prefixes include
+// "config/fonts/<family>" and "dictionary/<dict>" where <family>/<dict>
+// can be up to 32 chars per the validator below, plus the 13-char
+// "config/fonts/" prefix = 45 chars + NUL. The previous 32-byte buffer
+// silently truncated those at parseJsonString. Audit #23.
+//
+// _fullPath bumped to 224 to accommodate the wider folder + 128-byte
+// filename + "/<folder>/<filename>" overhead (1 + 64 + 1 + 128 + NUL = 195).
 char _filename[128] = {0};
-char _folder[32] = {0};
-char _fullPath[192] = {0};
+char _folder[64] = {0};
+char _fullPath[224] = {0};
 uint32_t _expectedSize = 0;
 uint32_t _receivedBytes = 0;
 uint32_t _lastAckBytes = 0;  // Bytes at last ACK
@@ -53,6 +68,21 @@ uint8_t _queueReceived = 0; // Files successfully received
 // Result state (persists after transfer for UI display)
 bool _hasResult = false;
 TransferResult _result = {};
+
+// Per-module spinlock guarding the compound state transitions where
+// _transferring flips to false at the same instant the name buffers,
+// byte counters and _result are mutated. Without this, a UI render that
+// sees _transferring==true can read a half-zeroed _filename if
+// resetTransfer() interleaves between the two reads — e.g. CJK book
+// names torn at a multi-byte codepoint boundary.
+//
+// What goes INSIDE the lock: the small window of state mutation
+// (~5 integer stores + a memcpy < 192 B). What stays OUTSIDE: SD I/O
+// like _file.close() and SdMan.remove(), which can take many ms and
+// must not block the priority-5 NimBLE host task under a critical
+// section. The close/remove happens just before we acquire the lock,
+// the state flip happens inside it. CONCURRENCY.md C4. Audit #C3.
+portMUX_TYPE _state_mux = portMUX_INITIALIZER_UNLOCKED;
 
 // BLE objects
 NimBLEServer* _server = nullptr;
@@ -78,10 +108,19 @@ bool parseJsonString(const char* json, const char* key, char* out, size_t outLen
     start += strlen(pattern);
     const char* end = strchr(start, '"');
     if (!end) return false;
-    size_t len = end - start;
-    if (len >= outLen) len = outLen - 1;
-    strncpy(out, start, len);
-    out[len] = '\0';
+
+    // NUL-terminate the source range in a stack temp (paths fit in 256)
+    // then utf8SafeCopy to the output. This ensures a CJK filename
+    // arriving from the BLE transfer protocol lands on a codepoint
+    // boundary even when it overflows `out` — previously a 3-byte CJK
+    // char split mid-sequence left an orphan continuation byte that
+    // the reader rendered as '?'.
+    char tmp[384];
+    const size_t len = end - start;
+    const size_t copyLen = len < sizeof(tmp) - 1 ? len : sizeof(tmp) - 1;
+    memcpy(tmp, start, copyLen);
+    tmp[copyLen] = '\0';
+    utf8SafeCopy(out, tmp, outLen);
     return true;
 }
 
@@ -91,8 +130,52 @@ bool parseJsonInt(const char* json, const char* key, uint32_t* out) {
     const char* start = strstr(json, pattern);
     if (!start) return false;
     start += strlen(pattern);
-    while (*start == ' ') start++;
-    *out = strtoul(start, nullptr, 10);
+    while (*start == ' ' || *start == '\t') start++;
+    // Reject explicit negatives. strtoul on "-1" returns ULONG_MAX-style
+    // wrap which silently inflates a queue index or epoch — audit #16.
+    if (*start == '-' || *start == '+') return false;
+    if (*start < '0' || *start > '9') return false;
+    char* end = nullptr;
+    errno = 0;
+    unsigned long v = strtoul(start, &end, 10);
+    if (end == start) return false;          // no digits parsed
+    if (errno == ERANGE) return false;        // overflow vs unsigned long
+    if (v > 0xFFFFFFFFUL) return false;       // overflow vs uint32_t
+    *out = (uint32_t)v;
+    return true;
+}
+
+// Filename validator. Returns true if `name` is safe to use as a
+// flat (non-traversing) FAT/exFAT filename:
+//   * length 1..127 (we copy into char _filename[128]; leave NUL room)
+//   * no path separators (`/`, `\`)
+//   * no control chars (< 0x20)
+//   * no FAT-reserved chars (`?`, `*`, `:`, `"`, `<`, `>`, `|`)
+//   * not "." or ".." (component-aware)
+//   * doesn't end in space or dot (Windows rewrites these silently)
+// Audit #5.
+bool isValidFatFilename(const char* name) {
+    if (!name) return false;
+    const size_t len = strlen(name);
+    if (len == 0 || len > 127) return false;
+
+    if (strcmp(name, ".") == 0 || strcmp(name, "..") == 0) return false;
+
+    const char last = name[len - 1];
+    if (last == ' ' || last == '.') return false;
+
+    for (size_t i = 0; i < len; ++i) {
+        const unsigned char c = (unsigned char)name[i];
+        if (c < 0x20) return false;            // control char
+        switch (c) {
+            case '/': case '\\':
+            case '?': case '*': case ':':
+            case '"': case '<': case '>': case '|':
+                return false;
+            default:
+                break;
+        }
+    }
     return true;
 }
 
@@ -109,87 +192,99 @@ bool parseJsonBool(const char* json, const char* key) {
 // ── Result Storage ──────────────────────────────────────────────
 
 void storeResult(bool success, float speedKBs, const char* errorMsg) {
+    // Hold _state_mux across the whole result population so a UI
+    // reading lastResult() never sees a half-written struct (e.g.
+    // _result.filename mid-utf8SafeCopy with a UTF-8 continuation byte
+    // already overwritten but the leading byte not yet). utf8SafeCopy
+    // does no I/O or allocation — safe inside a critical section.
+    portENTER_CRITICAL(&_state_mux);
     _result.success = success;
-    strncpy(_result.filename, _filename, sizeof(_result.filename) - 1);
-    _result.filename[sizeof(_result.filename) - 1] = '\0';
+    // UTF-8 safe: a CJK-named file transferred over BLE would otherwise
+    // render with a broken character in the transfer-complete summary.
+    utf8SafeCopy(_result.filename, _filename, sizeof(_result.filename));
     _result.fileSize = _receivedBytes;
     _result.speedKBs = speedKBs;
     _result.queueIndex = _queueIndex;
     _result.queueTotal = _queueTotal;
     if (errorMsg) {
-        strncpy(_result.errorMsg, errorMsg, sizeof(_result.errorMsg) - 1);
-        _result.errorMsg[sizeof(_result.errorMsg) - 1] = '\0';
+        utf8SafeCopy(_result.errorMsg, errorMsg, sizeof(_result.errorMsg));
     } else {
         _result.errorMsg[0] = '\0';
     }
     _hasResult = true;
+    portEXIT_CRITICAL(&_state_mux);
 }
 
-// ── Server Callbacks ────────────────────────────────────────────────
+// ── Server Callbacks (now subscribed via BleHostCallbacks fan-out) ──
+//
+// These used to live on a NimBLEServerCallbacks subclass that
+// BleFileTransfer registered with `_server->setCallbacks(&...)`. NimBLE
+// 2.x's "last setter wins" meant if BleBridge or any future service
+// registered after, the file-transfer callbacks silently went away.
+// Audit #50 routes everything through `ble_host::install` + subscribe;
+// the underlying NimBLEServerCallbacks is now the shared dispatcher in
+// src/ble/BleHostCallbacks.cpp, and we just register handlers as free
+// functions.
 
-class ServerCallbacks : public NimBLEServerCallbacks {
-    void onConnect(NimBLEServer* pServer, NimBLEConnInfo& connInfo) override {
-        _connected = true;
-        _mtu = pServer->getPeerMTU(connInfo.getConnHandle()) - 3;
-        if (_mtu < 20) _mtu = 20;
-        if (_mtu > 509) _mtu = 509;
-        Serial.printf("[BLE-FT] ══════════════════════════════════════\n");
-        Serial.printf("[BLE-FT] CLIENT CONNECTED\n");
-        Serial.printf("[BLE-FT] MTU: %d bytes\n", _mtu);
-        Serial.printf("[BLE-FT] Free heap: %lu\n", (unsigned long)ESP.getFreeHeap());
-        Serial.printf("[BLE-FT] ══════════════════════════════════════\n");
-        
-        // Reset queue state on new connection
-        _queueIndex = 0;
-        _queueTotal = 0;
-        _queueReceived = 0;
-        
-        notifyCallback(TransferEvent::CONNECTED, nullptr);
+void onServerConnect(NimBLEServer* pServer, NimBLEConnInfo& connInfo, void*) {
+    _connected = true;
+    _mtu = pServer->getPeerMTU(connInfo.getConnHandle()) - 3;
+    if (_mtu < 20) _mtu = 20;
+    if (_mtu > 509) _mtu = 509;
+    Serial.printf("[BLE-FT] ══════════════════════════════════════\n");
+    Serial.printf("[BLE-FT] CLIENT CONNECTED\n");
+    Serial.printf("[BLE-FT] MTU: %d bytes\n", _mtu);
+    Serial.printf("[BLE-FT] Free heap: %lu\n", (unsigned long)ESP.getFreeHeap());
+    Serial.printf("[BLE-FT] ══════════════════════════════════════\n");
+
+    // Reset queue state on new connection
+    _queueIndex = 0;
+    _queueTotal = 0;
+    _queueReceived = 0;
+
+    notifyCallback(TransferEvent::CONNECTED, nullptr);
+}
+
+void onServerDisconnect(NimBLEServer* /*pServer*/, NimBLEConnInfo& /*connInfo*/, int reason, void*) {
+    Serial.printf("[BLE-FT] ══════════════════════════════════════\n");
+    Serial.printf("[BLE-FT] CLIENT DISCONNECTED (reason=%d)\n", reason);
+    if (_transferring) {
+        Serial.printf("[BLE-FT] WARNING: Transfer interrupted!\n");
+        Serial.printf("[BLE-FT] Received %lu / %lu bytes (%d%%)\n",
+                      _receivedBytes, _expectedSize,
+                      _expectedSize > 0 ? (int)((_receivedBytes * 100) / _expectedSize) : 0);
+        if (_file.isOpen()) {
+            _file.close();
+            SdMan.remove(_fullPath);
+            Serial.printf("[BLE-FT] Removed partial file: %s\n", _fullPath);
+        }
+        storeResult(false, 0, "Connection lost");
+        resetTransfer();
+        notifyCallback(TransferEvent::TRANSFER_ERROR, "Connection lost");
     }
 
-    void onDisconnect(NimBLEServer* pServer, NimBLEConnInfo& connInfo, int reason) override {
-        Serial.printf("[BLE-FT] ══════════════════════════════════════\n");
-        Serial.printf("[BLE-FT] CLIENT DISCONNECTED (reason=%d)\n", reason);
-        if (_transferring) {
-            Serial.printf("[BLE-FT] WARNING: Transfer interrupted!\n");
-            Serial.printf("[BLE-FT] Received %lu / %lu bytes (%d%%)\n", 
-                          _receivedBytes, _expectedSize, 
-                          _expectedSize > 0 ? (int)((_receivedBytes * 100) / _expectedSize) : 0);
-            if (_file.isOpen()) {
-                _file.close();
-                SdMan.remove(_fullPath);
-                Serial.printf("[BLE-FT] Removed partial file: %s\n", _fullPath);
-            }
-            storeResult(false, 0, "Connection lost");
-            resetTransfer();
-            notifyCallback(TransferEvent::TRANSFER_ERROR, "Connection lost");
-        }
-        
-        // If we were in a queue, fire queue complete with what we got
-        if (_queueTotal > 0 && _queueReceived > 0) {
-            char buf[8];
-            snprintf(buf, sizeof(buf), "%d", _queueReceived);
-            notifyCallback(TransferEvent::QUEUE_COMPLETE, buf);
-        }
-        
-        Serial.printf("[BLE-FT] ══════════════════════════════════════\n");
-        
-        _connected = false;
-        notifyCallback(TransferEvent::DISCONNECTED, nullptr);
-        if (_advertising_ptr && _advertising) {
-            _advertising_ptr->start();
-        }
+    // If we were in a queue, fire queue complete with what we got
+    if (_queueTotal > 0 && _queueReceived > 0) {
+        char buf[8];
+        snprintf(buf, sizeof(buf), "%d", _queueReceived);
+        notifyCallback(TransferEvent::QUEUE_COMPLETE, buf);
     }
 
-    void onMTUChange(uint16_t mtu, NimBLEConnInfo& connInfo) override {
-        _mtu = mtu - 3;
-        if (_mtu < 20) _mtu = 20;
-        if (_mtu > 509) _mtu = 509;
-        Serial.printf("[BLE-FT] MTU negotiated: %d (payload=%d)\n", mtu, _mtu);
-    }
-};
+    Serial.printf("[BLE-FT] ══════════════════════════════════════\n");
 
-static ServerCallbacks _serverCallbacks;
+    _connected = false;
+    notifyCallback(TransferEvent::DISCONNECTED, nullptr);
+    if (_advertising_ptr && _advertising) {
+        _advertising_ptr->start();
+    }
+}
+
+void onServerMtuChange(uint16_t mtu, NimBLEConnInfo& /*connInfo*/, void*) {
+    _mtu = mtu - 3;
+    if (_mtu < 20) _mtu = 20;
+    if (_mtu > 509) _mtu = 509;
+    Serial.printf("[BLE-FT] MTU negotiated: %d (payload=%d)\n", mtu, _mtu);
+}
 
 // ── Metadata Characteristic Callbacks ──────────────────────────────
 
@@ -207,16 +302,35 @@ class MetadataCallbacks : public NimBLECharacteristicCallbacks {
         if (parseJsonBool(value.c_str(), "queueComplete")) {
             Serial.printf("[BLE-FT] Queue complete signal received\n");
             Serial.printf("[BLE-FT] Received %d / %d files\n", _queueReceived, _queueTotal);
-            
+
             char status[96];
-            snprintf(status, sizeof(status), "{\"state\":\"queueDone\",\"received\":%d,\"total\":%d}", 
+            snprintf(status, sizeof(status), "{\"state\":\"queueDone\",\"received\":%d,\"total\":%d}",
                      _queueReceived, _queueTotal);
             sendStatus(status);
-            
+
             char buf[8];
             snprintf(buf, sizeof(buf), "%d", _queueReceived);
             notifyCallback(TransferEvent::QUEUE_COMPLETE, buf);
             return;
+        }
+
+        // Check for time sync command: {"syncTime": <epoch_seconds>}.
+        // Sanity-bracket the epoch — lower 1700000000 (Nov 2023, post
+        // build date) and upper 4000000000 (~Oct 2096, before uint32_t
+        // overflow at 4294967295 / Feb 2106). Either bound failing
+        // means a corrupt or malicious sync; we ignore it. Audit #16.
+        {
+            uint32_t epoch = 0;
+            if (parseJsonInt(value.c_str(), "syncTime", &epoch) &&
+                epoch > 1700000000 && epoch < 4000000000) {
+                sumi::SumiClock::setTime(epoch);
+                Serial.printf("[BLE-FT] Time synced: epoch=%u\n", epoch);
+                char status[64];
+                snprintf(status, sizeof(status),
+                         "{\"state\":\"timeSynced\",\"epoch\":%u}", epoch);
+                sendStatus(status);
+                return;  // Don't process as file transfer metadata
+            }
         }
 
         if (!parseJsonString(value.c_str(), "name", _filename, sizeof(_filename))) {
@@ -233,12 +347,26 @@ class MetadataCallbacks : public NimBLECharacteristicCallbacks {
             strcpy(_folder, "books");
         }
 
-        // Parse queue info
+        // Parse queue info. Reject values that would silently truncate
+        // when cast to uint8_t — a sender that sends queueTotal=300 would
+        // appear to start a queue of "44" and lose 256 files. Audit #24.
         uint32_t qi = 0, qt = 0;
         if (parseJsonInt(value.c_str(), "queue", &qi)) {
+            if (qi > 255) {
+                Serial.printf("[BLE-FT] ERROR: queue index %lu out of range\n",
+                              (unsigned long)qi);
+                sendStatus("{\"state\":\"error\",\"msg\":\"Queue index out of range\"}");
+                return;
+            }
             _queueIndex = (uint8_t)qi;
         }
         if (parseJsonInt(value.c_str(), "queueTotal", &qt)) {
+            if (qt > 255) {
+                Serial.printf("[BLE-FT] ERROR: queueTotal %lu out of range\n",
+                              (unsigned long)qt);
+                sendStatus("{\"state\":\"error\",\"msg\":\"Queue total out of range\"}");
+                return;
+            }
             if (_queueTotal == 0 && qt > 0) {
                 // First file in a new queue
                 _queueTotal = (uint8_t)qt;
@@ -255,8 +383,10 @@ class MetadataCallbacks : public NimBLECharacteristicCallbacks {
             Serial.printf("[BLE-FT] Queue: file %d of %d\n", _queueIndex, _queueTotal);
         }
 
-        // Validate folder
-        const char* validFolders[] = {"books", "comics", "images", "sleep", "flashcards", "notes", "maps", "custom", "games", "config/fonts", "config/themes"};
+        // Validate folder. sumi.page's allowlist (sumi-epub-engine.js) must
+        // stay in sync with this list -- a mismatch means the site sends
+        // files the firmware then silently rejects as "Invalid folder".
+        const char* validFolders[] = {"books", "comics", "images", "sleep", "flashcards", "notes", "maps", "custom", "games", "dictionary", "config/fonts", "config/themes"};
         bool folderValid = false;
         for (const char* vf : validFolders) {
             if (strcmp(_folder, vf) == 0) { folderValid = true; break; }
@@ -268,15 +398,29 @@ class MetadataCallbacks : public NimBLECharacteristicCallbacks {
                 folderValid = true;
             }
         }
+        // Allow dictionary/<name>/ subfolders for per-dictionary StarDict
+        // packages (each dictionary lives in its own folder).
+        if (!folderValid && strncmp(_folder, "dictionary/", 11) == 0) {
+            const char* sub = _folder + 11;
+            if (strlen(sub) > 0 && strlen(sub) < 32 && !strchr(sub, '/') && !strstr(sub, "..")) {
+                folderValid = true;
+            }
+        }
         if (!folderValid) {
             Serial.printf("[BLE-FT] ERROR: Invalid folder\n");
             sendStatus("{\"state\":\"error\",\"msg\":\"Invalid folder\"}");
             return;
         }
 
-        // Validate filename
-        if (strchr(_filename, '/') || strchr(_filename, '\\') || strstr(_filename, "..")) {
-            Serial.printf("[BLE-FT] ERROR: Invalid filename\n");
+        // Validate filename. The previous check was a substring scan
+        // (`strstr("..", _filename)` etc.), which missed FAT-reserved
+        // chars and trailing-dot/space rewriting and over-rejected
+        // legitimate names containing ".." (e.g. "Foo..Vol1.epub").
+        // isValidFatFilename is component-aware: rejects exactly "."
+        // and "..", every reserved char, control chars, oversize names,
+        // and trailing space / dot. Audit #5.
+        if (!isValidFatFilename(_filename)) {
+            Serial.printf("[BLE-FT] ERROR: Invalid filename: %s\n", _filename);
             sendStatus("{\"state\":\"error\",\"msg\":\"Invalid filename\"}");
             return;
         }
@@ -324,6 +468,12 @@ class MetadataCallbacks : public NimBLECharacteristicCallbacks {
     }
 };
 
+// File-static — NimBLE 2.x stores raw pointers to callback objects, so
+// any deinit→init cycle that re-registers them must not invalidate the
+// objects between calls. file-static-storage gives the right lifetime
+// (program-wide) and the same address every init. If anyone refactors
+// these to heap-allocated, NimBLE may dereference stale pointers after
+// deinit and use-after-free. Audit #25.
 static MetadataCallbacks _metadataCallbacks;
 
 // ── Data Characteristic Callbacks ──────────────────────────────────
@@ -341,8 +491,15 @@ class DataCallbacks : public NimBLECharacteristicCallbacks {
 
         // Empty write = end of transfer
         if (value.empty()) {
-            _file.flush();
-            _file.close();
+            // flush() alone drains the user buffer but doesn't force
+            // SdFat to persist the file's directory entry and data
+            // sectors — that's what sync() does. Without this, a BLE
+            // transfer can report SUCCESS but the file shows up as 0
+            // bytes (or truncated) on next boot. Hit repeatedly during
+            // the the emulator dict fixture bring-up; same bug class on real
+            // hardware under a sudden power-off between transfer
+            // completion and the next filesystem write.
+            SdMan.syncAndClose(_file);
             
             uint32_t elapsed = millis() - _transferStartTime;
             float kbps = elapsed > 0 ? (_receivedBytes / 1024.0f) / (elapsed / 1000.0f) : 0;
@@ -397,7 +554,12 @@ class DataCallbacks : public NimBLECharacteristicCallbacks {
                 notifyCallback(TransferEvent::TRANSFER_ERROR, "Size mismatch");
             }
             
-            // Reset transfer state but keep queue state and result
+            // Reset transfer state but keep queue state and result.
+            // Same lock as resetTransfer() so the UI sees a coherent
+            // "in-progress -> completed" transition (transferring=true
+            // with current name -> transferring=false with same name +
+            // populated _result), never a half-flipped intermediate.
+            portENTER_CRITICAL(&_state_mux);
             _transferring = false;
             _receivedBytes = 0;
             _lastAckBytes = 0;
@@ -405,6 +567,7 @@ class DataCallbacks : public NimBLECharacteristicCallbacks {
             _chunksReceived = 0;
             // Don't clear filename/path - result screen needs them
             // Don't clear queue state - more files may follow
+            portEXIT_CRITICAL(&_state_mux);
             
             // Signal readiness for next file after a brief delay
             // NOTE: Do NOT send idle from here. The done status sent above
@@ -486,7 +649,13 @@ void notifyCallback(TransferEvent event, const char* data) {
 }
 
 void resetTransfer() {
+    // Close OUTSIDE the lock — _file.close() does SD I/O (potentially
+    // many ms of SPI) which must not block the priority-5 NimBLE host
+    // task under a critical section. The state-flip + memsets below run
+    // INSIDE the lock so a UI render mid-tear-down sees a coherent
+    // snapshot, never a half-zeroed _filename. Audit #C3 / CONCURRENCY.md C4.
     if (_file.isOpen()) _file.close();
+    portENTER_CRITICAL(&_state_mux);
     _transferring = false;
     _receivedBytes = 0;
     _lastAckBytes = 0;
@@ -495,6 +664,7 @@ void resetTransfer() {
     memset(_filename, 0, sizeof(_filename));
     memset(_folder, 0, sizeof(_folder));
     memset(_fullPath, 0, sizeof(_fullPath));
+    portEXIT_CRITICAL(&_state_mux);
 }
 
 }  // anonymous namespace
@@ -517,7 +687,13 @@ void init() {
     NimBLEDevice::setPower(3);
 
     _server = NimBLEDevice::createServer();
-    _server->setCallbacks(&_serverCallbacks);
+    // Audit #50: route through the shared callback dispatcher instead
+    // of `_server->setCallbacks(...)` directly. NimBLE 2.x's "last
+    // setter wins" used to mean any other module that set its own
+    // callbacks (e.g. a future plugin) would silently drop the file-
+    // transfer hooks. The dispatcher fans out to every subscriber.
+    ble_host::install(_server);
+    ble_host::subscribe(ble_host::Subscriber(onServerConnect, onServerDisconnect, onServerMtuChange, nullptr));
 
     _service = _server->createService(FILE_TRANSFER_SERVICE_UUID);
 
@@ -561,7 +737,14 @@ void init() {
 
 void deinit() {
     if (!_initialized) return;
-    
+
+    // Unsubscribe from the shared dispatcher BEFORE NimBLEDevice::deinit
+    // — the callback functions are about to leave scope (well, free
+    // functions live forever, but the state they touch goes invalid),
+    // and we don't want a stale subscriber lingering if init() fires
+    // again later from a different code path.
+    ble_host::unsubscribe(ble_host::Subscriber(onServerConnect, onServerDisconnect, onServerMtuChange, nullptr));
+
     stopAdvertising();
     resetTransfer();
     _queueIndex = 0;
@@ -569,11 +752,19 @@ void deinit() {
     _queueReceived = 0;
     _hasResult = false;
     _connected = false;
-    
+
     // Fully shut down NimBLE stack — frees all BLE resources.
     // Without this, re-init returns stale server/service/characteristic
     // objects whose notification descriptors are dead. The client can
     // write to characteristics but never receives status notifications.
+    //
+    // the emulator's BLE emulation can't service the controller-side free that
+    // NimBLEDevice::deinit(true) triggers: we've seen
+    //   "assert failed: heap_caps_free heap_caps.c:381 (heap != NULL ...)"
+    // fire on the auto-disable path the instant Back is pressed after
+    // entering the transfer screen. Skip the full teardown on the
+    // emulator — advertising is already stopped so the browser can't
+    // reach the device, and the leaked stack is fine for a test build.
     NimBLEDevice::deinit(true);
     _server = nullptr;
     _service = nullptr;
@@ -581,7 +772,7 @@ void deinit() {
     _dataChar = nullptr;
     _statusChar = nullptr;
     _advertising_ptr = nullptr;
-    
+
     _initialized = false;
     _advertising = false;
     Serial.println("[BLE-FT] Deinit (NimBLE stack released)");

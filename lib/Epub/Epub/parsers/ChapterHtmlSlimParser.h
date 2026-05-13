@@ -60,6 +60,13 @@ class ChapterHtmlSlimParser {
   // XML parser handle for stopping mid-parse
   XML_Parser xmlParser_ = nullptr;
   bool stopRequested_ = false;
+  // Soft-stop flag: caller's batch budget (maxPages) was reached, but we keep
+  // extracting lines from the current text block to avoid losing words still
+  // in the words list. XML is suspended at the next clean boundary (end of
+  // makePages / addImageToPage), so currentTextBlock is empty when the
+  // outer XML callback returns and startNewTextBlock can safely reset it.
+  // See paragraph-truncation bug report.
+  bool pendingMaxPagesSuspend_ = false;
   bool pendingEmergencySplit_ = false;
   bool pendingRtl_ = false;
   int rtlUntilDepth_ = INT_MAX;

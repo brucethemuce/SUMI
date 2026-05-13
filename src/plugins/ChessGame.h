@@ -400,9 +400,11 @@ public:
         // Always reset to portrait mode for chess
         d_.setRotation(3);
         // orientation handled by host
-        
-        screenW = 480;  // Portrait dimensions
-        screenH = 800;
+
+        // Use runtime dimensions (X4=480x800, X3=528x792) instead of
+        // X4 hardcodes — previously Chess drew outside the panel on X3.
+        screenW = w;
+        screenH = h;
         
         // Calculate board layout - maximize board size and center it
         int headerH = 40;       // Slightly smaller header
@@ -455,13 +457,18 @@ public:
     
     void saveSettings() {
         SdMan.mkdir("/.sumi");
-        FsFile f = SdMan.open(CHESS_SETTINGS_PATH, (O_WRONLY | O_CREAT | O_TRUNC));
-        if (f) {
-            f.write((uint8_t*)&settings, sizeof(ChessSettings));
-            f.close();
+        // Atomic write — see docs/ATOMIC_WRITE_DESIGN.md. Pre-fix this
+        // used O_TRUNC + raw write; a power loss mid-save left the
+        // settings file empty and the next load reset the user's
+        // chess settings (difficulty/colour/etc.) to defaults.
+        FsFile f;
+        if (!SdMan.atomicOpenWrite("CHESS", CHESS_SETTINGS_PATH, f)) return;
+        f.write((uint8_t*)&settings, sizeof(ChessSettings));
+        if (!SdMan.atomicCommit(f, CHESS_SETTINGS_PATH)) {
+            SdMan.atomicAbort(f, CHESS_SETTINGS_PATH);
         }
     }
-    
+
     void loadStats() {
         stats = ChessStats();
         FsFile f = SdMan.open(CHESS_STATS_PATH, O_RDONLY);
@@ -474,13 +481,15 @@ public:
     
     void saveStats() {
         SdMan.mkdir("/.sumi");
-        FsFile f = SdMan.open(CHESS_STATS_PATH, (O_WRONLY | O_CREAT | O_TRUNC));
-        if (f) {
-            f.write((uint8_t*)&stats, sizeof(ChessStats));
-            f.close();
+        // Atomic — see saveSettings comment.
+        FsFile f;
+        if (!SdMan.atomicOpenWrite("CHESS", CHESS_STATS_PATH, f)) return;
+        f.write((uint8_t*)&stats, sizeof(ChessStats));
+        if (!SdMan.atomicCommit(f, CHESS_STATS_PATH)) {
+            SdMan.atomicAbort(f, CHESS_STATS_PATH);
         }
     }
-    
+
     void recordGameResult(int result) {
         stats.gamesPlayed++;
         if (result > 0) stats.wins++;
@@ -494,9 +503,14 @@ public:
     // ==========================================================================
     bool saveGame() {
         SdMan.mkdir("/.sumi");
-        FsFile f = SdMan.open(CHESS_SAVE_PATH, (O_WRONLY | O_CREAT | O_TRUNC));
-        if (!f) return false;
-        
+        // Atomic — power-loss mid-save would otherwise wipe the user's
+        // saved game. The 3-rename rotation in atomicOpenWrite/Commit
+        // guarantees at least one valid copy of CHESS_SAVE_PATH exists
+        // on disk at every point; recoverAtomicWrites at next boot
+        // promotes any orphan left by a crash.
+        FsFile f;
+        if (!SdMan.atomicOpenWrite("CHESS", CHESS_SAVE_PATH, f)) return false;
+
         ChessSaveData save;
         memcpy(save.board, board, sizeof(board));
         save.whiteTurn = whiteTurn;
@@ -515,9 +529,12 @@ public:
         save.blackCapturedCount = blackCapturedCount;
         save.moveHistoryCount = min(moveHistoryCount, 50);
         memcpy(save.moveHistory, moveHistory, sizeof(MoveRecord) * save.moveHistoryCount);
-        
+
         f.write((uint8_t*)&save, sizeof(ChessSaveData));
-        f.close();
+        if (!SdMan.atomicCommit(f, CHESS_SAVE_PATH)) {
+            SdMan.atomicAbort(f, CHESS_SAVE_PATH);
+            return false;
+        }
         hasSavedGame = true;
         return true;
     }
@@ -525,12 +542,15 @@ public:
     bool loadGame() {
         FsFile f = SdMan.open(CHESS_SAVE_PATH, O_RDONLY);
         if (!f) return false;
-        
-        ChessSaveData save;
-        f.read((uint8_t*)&save, sizeof(ChessSaveData));
+
+        ChessSaveData save = {};
+        const int bytesRead = f.read((uint8_t*)&save, sizeof(ChessSaveData));
         f.close();
-        
-        if (!save.isValid()) {
+
+        // Require a full, valid read. A truncated save would otherwise
+        // land a valid magic in the header and feed uninitialized tail
+        // bytes into memcpy down below.
+        if (bytesRead != sizeof(ChessSaveData) || !save.isValid()) {
             deleteSavedGame();
             return false;
         }
@@ -548,9 +568,20 @@ public:
         settings.difficulty = (Difficulty)save.difficulty;
         memcpy(whiteCaptured, save.whiteCaptured, sizeof(whiteCaptured));
         memcpy(blackCaptured, save.blackCaptured, sizeof(blackCaptured));
-        whiteCapturedCount = save.whiteCapturedCount;
-        blackCapturedCount = save.blackCapturedCount;
+        // Clamp captured counts. The save has uint8_t fields (0..255) but
+        // the arrays are sized 16. A corrupt/downgraded save with
+        // whiteCapturedCount=200 would cause the existing
+        // `if (whiteCapturedCount < 16) whiteCaptured[whiteCapturedCount++]`
+        // guard in move handling to never fire (always >= 16), and the
+        // render code reads [0..whiteCapturedCount) past the array.
+        whiteCapturedCount = save.whiteCapturedCount > 16 ? 16 : save.whiteCapturedCount;
+        blackCapturedCount = save.blackCapturedCount > 16 ? 16 : save.blackCapturedCount;
+        // Clamp the persisted history length. isValid() only checks
+        // magic/version; a corrupted or truncated save file could leave
+        // moveHistoryCount >50 and the memcpy would overflow both the
+        // source and destination fixed arrays.
         moveHistoryCount = save.moveHistoryCount;
+        if (moveHistoryCount > 50) moveHistoryCount = 50;
         memcpy(moveHistory, save.moveHistory, sizeof(MoveRecord) * moveHistoryCount);
         
         curR = playerIsWhite ? 6 : 1;

@@ -185,8 +185,8 @@ size_t Txt::readContent(uint8_t* buffer, size_t offset, size_t length) const {
     file.seek(offset);
   }
 
-  size_t bytesRead = file.read(buffer, length);
+  // FsFile::read returns int — clamp -1 to 0 so callers never see SIZE_MAX.
+  const int rawRead = file.read(buffer, length);
   file.close();
-
-  return bytesRead;
+  return rawRead > 0 ? static_cast<size_t>(rawRead) : 0;
 }

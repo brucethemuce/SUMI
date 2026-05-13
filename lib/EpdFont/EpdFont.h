@@ -1,11 +1,13 @@
 #pragma once
 #include "EpdFontData.h"
 
-// Direct-mapped glyph cache for O(1) lookup of hot glyphs
-// 64 entries * 8 bytes = 512 bytes per font
+// Direct-mapped glyph cache for O(1) lookup of hot glyphs.
+// Reduced from 64 to 16 entries (512 → 128 bytes per font) to recover
+// RAM across the ~15 font instances. Miss cost is one binary search
+// (~10 instructions), invisible at e-ink refresh rates.
 class GlyphCache {
  public:
-  static constexpr int CACHE_SIZE = 64;
+  static constexpr int CACHE_SIZE = 16;
 
   GlyphCache() { clear(); }
 

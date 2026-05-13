@@ -6,20 +6,43 @@
 namespace sumi {
 
 /**
- * Pre-allocated memory arena - 76KB for image/cache and text layout operations.
- * Split into three independent allocations (32KB + 20KB + 24KB) to avoid requiring
- * large contiguous heap blocks, which fail when BLE fragments memory.
+ * Pre-allocated memory arena — 76 KB total, .bss-resident.
  *
- * Layout:
- *   Primary    (32KB): ZIP LZ77 decompression dictionary
- *   Work       (20KB): scratch (8KB) + dither (8KB) + image rows (4KB)
- *   Task Stack (24KB): PageCache background task stack (for xTaskCreateStatic)
+ * Design: a single 76 KB `static uint8_t` array in .bss, zeroed by the
+ * IDF startup code before main(). Sub-regions live at offsets within
+ * the block. The block is never freed — there is nothing to free; .bss
+ * is part of the firmware image's address space. After init() runs once
+ * at boot, every pointer below is permanently valid for the firmware's
+ * lifetime.
  *
- * The arena can be released when not needed (e.g., BLE transfer, emulator)
- * to free heap for other operations, then reclaimed when needed again.
+ *   Discipline borrowed from the X4 emulator's `emuBlock` pattern:
+ *   reserve the biggest thing you need at link time and never give
+ *   it back. Everything else (BLE, plugins, emulators) works from the
+ *   ~120 KB of heap that remains after boot.
  *
- * Bump allocator: The 8KB scratch region can be used as a temporary scratch pool
- * via scratchAlloc(). Used by text layout (DP arrays). Use ArenaScratch for RAII.
+ * LAYOUT (offsets into the single block, total 76 KB):
+ *   [0..32KB)       Primary — ZIP LZ77 decompression dictionary
+ *   [32..40KB)      Scratch — 8 KB bump allocator
+ *   [40..48KB)      Dither  — 8 KB Atkinson dither error rows
+ *   [48..52KB)      Image row scratch (4 KB)
+ *   [52..76KB)      PageCache background task stack (24 KB, xTaskCreateStatic)
+ *
+ * Bump allocator: the 8 KB scratch region via scratchAlloc() /
+ * ArenaScratch RAII. Text-layout DP arrays and PNG-decode row buffers
+ * use it (both with heap fallback).
+ *
+ * v1 → v2 migration history (kept here so future readers don't reinvent
+ * the wheel): v1 allocated three separate heap blocks and exposed
+ * release()/releasePrimary()/reclaimPrimary() so callers (BLE, Lua,
+ * Game Boy emulator) could free the arena transiently. The release +
+ * reclaim ping-pong became the dominant fragmentation source — NimBLE
+ * scattered ~15 small allocs through the hole and reclaim() couldn't
+ * find 32 KB contiguous. v2 moved everything to a single .bss block,
+ * and the old release/reclaim API was removed entirely once all call
+ * sites were swept (see Batch 2 of docs/AUDIT_PLAN.md). v1's
+ * `fallbackBuffer` (a framebuffer alias used as a ZIP fallback when the
+ * arena was unavailable) is similarly gone — the arena is always
+ * available now, so there is nothing to fall back from.
  */
 class MemoryArena {
  public:
@@ -43,27 +66,21 @@ class MemoryArena {
   // Legacy size constants (for Epub.cpp zipBuffer reference)
   static constexpr size_t ZIP_BUFFER_SIZE = 32 * 1024;
 
-  // Buffer pointers (valid after init(), nullptr after release())
+  // Buffer pointers (wired by init(); the backing memory lives in .bss
+  // for the firmware lifetime).
   static uint8_t* primaryBuffer;   // 32KB - ZIP LZ77 dictionary
   static uint8_t* zipBuffer;       // Alias for primaryBuffer (first 32KB used by LZ77)
   static uint8_t* scratchBuffer;   // 8KB - bump allocator region
   static uint8_t* ditherRegion;    // 8KB - ditherer error rows
   static uint8_t* imageRowRegion;  // 4KB - bitmap row buffers
   static uint8_t* taskStackRegion; // 24KB - background task stack (for xTaskCreateStatic)
-  static uint8_t* fallbackBuffer;  // Framebuffer fallback for ZIP when arena unavailable
 
-  // Initialize arena (allocates memory)
+  // Wire pointers to the .bss-resident block. Cheap, idempotent, never
+  // fails — kept as a function (rather than a constructor) so boot
+  // order stays explicit in main().
   static bool init();
 
-  // Release arena (frees memory for other uses like BLE transfer, emulator)
-  static void release();
-
-  // Temporarily release/reclaim just the 32KB primary buffer.
-  // Used to free heap for parsing when BLE is connected (parser uses framebuffer as ZIP dict).
-  static void releasePrimary();
-  static bool reclaimPrimary();
-
-  // Check if arena is currently allocated
+  // Check if arena is currently allocated. Always true post-init().
   static bool isInitialized() { return initialized_; }
 
   // --- Bump allocator for temporary scratch allocations ---

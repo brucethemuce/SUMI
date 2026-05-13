@@ -2,6 +2,8 @@
 
 #include <SDCardManager.h>
 
+#include <Utf8.h>
+
 #include <cstring>
 #include <functional>
 #include <string>
@@ -20,15 +22,15 @@ Result<void> ComicProvider::open(const char* path, const char* cacheDir) {
   meta.type = ContentType::Comic;
   meta.hint = reader.isRTL() ? ContentHint::ComicRtl : ContentHint::Comic;
 
+  // UTF-8 safe copy — a CJK manga filename would otherwise get sliced mid-codepoint.
   const std::string& title = reader.title();
   if (!title.empty()) {
-    strncpy(meta.title, title.c_str(), sizeof(meta.title) - 1);
+    utf8SafeCopy(meta.title, title.c_str(), sizeof(meta.title));
   } else {
     const char* lastSlash = strrchr(path, '/');
     const char* filename = lastSlash ? lastSlash + 1 : path;
-    strncpy(meta.title, filename, sizeof(meta.title) - 1);
+    utf8SafeCopy(meta.title, filename, sizeof(meta.title));
   }
-  meta.title[sizeof(meta.title) - 1] = '\0';
 
   meta.author[0] = '\0';
 

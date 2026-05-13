@@ -10,6 +10,30 @@
 
 #include <cassert>
 
+#ifdef ARDUINO
+TaskHandle_t GfxRenderer::s_cacheTaskHandle_ = nullptr;
+#endif
+
+void GfxRenderer::warnIfNonOwner(const char* methodName) {
+#ifdef ARDUINO
+  TaskHandle_t bg = s_cacheTaskHandle_;
+  if (!bg) return;
+  if (xTaskGetCurrentTaskHandle() == bg) return;  // legitimate cacheTask call
+  // Rate-limit to once every 5 s. Without this, a render-loop bug would
+  // flood the serial console — and the same bug fires on every frame.
+  static uint32_t lastWarnMs = 0;
+  uint32_t now = millis();
+  if (now - lastWarnMs < 5000) return;
+  lastWarnMs = now;
+  Serial.printf(
+      "[GFX] BUG: %s called from main task while cacheTask is still active. "
+      "Caller forgot stopBackgroundCaching(). CONCURRENCY.md C1.\n",
+      methodName);
+#else
+  (void)methodName;
+#endif
+}
+
 void GfxRenderer::insertFont(const int fontId, EpdFontFamily font) { fontMap.insert({fontId, font}); }
 
 void GfxRenderer::removeFont(const int fontId) {
@@ -19,30 +43,30 @@ void GfxRenderer::removeFont(const int fontId) {
 }
 
 static inline void rotateCoordinates(const GfxRenderer::Orientation orientation, const int x, const int y,
+                                     const int panelWidth, const int panelHeight,
                                      int* rotatedX, int* rotatedY) {
+  // Panel dimensions are runtime values (X4=800x480, X3=792x528).
   switch (orientation) {
     case GfxRenderer::Portrait: {
-      // Logical portrait (480x800) → panel (800x480)
-      // Rotation: 90 degrees clockwise
+      // Logical portrait → panel landscape. Rotation: 90 degrees clockwise
       *rotatedX = y;
-      *rotatedY = EInkDisplay::DISPLAY_HEIGHT - 1 - x;
+      *rotatedY = panelHeight - 1 - x;
       break;
     }
     case GfxRenderer::LandscapeClockwise: {
-      // Logical landscape (800x480) rotated 180 degrees (swap top/bottom and left/right)
-      *rotatedX = EInkDisplay::DISPLAY_WIDTH - 1 - x;
-      *rotatedY = EInkDisplay::DISPLAY_HEIGHT - 1 - y;
+      // Logical landscape rotated 180 degrees (swap top/bottom and left/right)
+      *rotatedX = panelWidth - 1 - x;
+      *rotatedY = panelHeight - 1 - y;
       break;
     }
     case GfxRenderer::PortraitInverted: {
-      // Logical portrait (480x800) → panel (800x480)
-      // Rotation: 90 degrees counter-clockwise
-      *rotatedX = EInkDisplay::DISPLAY_WIDTH - 1 - y;
+      // Logical portrait → panel landscape. Rotation: 90 degrees counter-clockwise
+      *rotatedX = panelWidth - 1 - y;
       *rotatedY = x;
       break;
     }
     case GfxRenderer::LandscapeCounterClockwise: {
-      // Logical landscape (800x480) aligned with panel orientation
+      // Logical landscape aligned with panel orientation
       *rotatedX = x;
       *rotatedY = y;
       break;
@@ -63,18 +87,23 @@ void GfxRenderer::begin() {
 }
 
 void GfxRenderer::drawPixel(const int x, const int y, const bool state) const {
+  // Runtime panel dimensions (X4=800x480, X3=792x528)
+  const int panelWidth = einkDisplay.getDisplayWidth();
+  const int panelHeight = einkDisplay.getDisplayHeight();
+  const int panelWidthBytes = einkDisplay.getDisplayWidthBytes();
+
   int rotatedX = 0;
   int rotatedY = 0;
-  rotateCoordinates(orientation, x, y, &rotatedX, &rotatedY);
+  rotateCoordinates(orientation, x, y, panelWidth, panelHeight, &rotatedX, &rotatedY);
 
   // Bounds checking against physical panel dimensions
-  if (rotatedX < 0 || rotatedX >= EInkDisplay::DISPLAY_WIDTH || rotatedY < 0 ||
-      rotatedY >= EInkDisplay::DISPLAY_HEIGHT) {
+  if (rotatedX < 0 || rotatedX >= panelWidth || rotatedY < 0 ||
+      rotatedY >= panelHeight) {
     return;
   }
 
   // Calculate byte position and bit position
-  const uint16_t byteIndex = rotatedY * EInkDisplay::DISPLAY_WIDTH_BYTES + (rotatedX / 8);
+  const uint16_t byteIndex = rotatedY * panelWidthBytes + (rotatedX / 8);
   const uint8_t bitPosition = 7 - (rotatedX % 8);  // MSB first
 
   if (state) {
@@ -85,6 +114,7 @@ void GfxRenderer::drawPixel(const int x, const int y, const bool state) const {
 }
 
 int GfxRenderer::getTextWidth(const int fontId, const char* text, const EpdFontFamily::Style style) const {
+  warnIfNonOwner("getTextWidth");
   if (!text || !*text) return 0;
 
   if (fontMap.count(fontId) == 0) {
@@ -119,12 +149,29 @@ int GfxRenderer::getTextWidth(const int fontId, const char* text, const EpdFontF
         const int extWidth = getExternalGlyphWidth(cp);
         if (extWidth > 0) {
           w += extWidth;
-        } else {
-          // Fall back to '?' glyph width
-          const EpdGlyph* fallback = font.getGlyph('?', style);
-          if (fallback) {
-            w += fallback->advanceX;
+          continue;
+        }
+        // Unicode whitespace: measure as a space (1x or 2x) to match
+        // renderChar's fallback, so width measurement and rendering stay
+        // in sync — otherwise a line measured as N '?'s wide would
+        // actually render as N spaces wide and layout breaks.
+        const bool isUnicodeWhitespace = (cp == 0x00A0) ||
+                                         (cp >= 0x2000 && cp <= 0x200A) ||
+                                         (cp == 0x202F) ||
+                                         (cp == 0x205F) ||
+                                         (cp == 0x3000);
+        if (isUnicodeWhitespace) {
+          const EpdGlyph* spaceGlyph = font.getGlyph(' ', style);
+          if (spaceGlyph) {
+            w += spaceGlyph->advanceX;
+            if (cp == 0x2003 || cp == 0x3000) w += spaceGlyph->advanceX;
+            continue;
           }
+        }
+        // Fall back to '?' glyph width
+        const EpdGlyph* fallback = font.getGlyph('?', style);
+        if (fallback) {
+          w += fallback->advanceX;
         }
       }
     }
@@ -133,12 +180,18 @@ int GfxRenderer::getTextWidth(const int fontId, const char* text, const EpdFontF
     fontMap.at(fontId).getTextDimensions(text, &w, &h, style);
   }
 
-  // Limit cache size to prevent heap fragmentation
-  if (wordWidthCache.size() >= MAX_WIDTH_CACHE_SIZE) {
-    wordWidthCache.clear();
+  // FIFO eviction (audit #42). At capacity, drop the oldest entry —
+  // not the whole cache. Pre-Batch-9-followup the bulk clear() trashed
+  // 256 entries on every overflow and hit-rate dropped to ~0% on
+  // long pages; FIFO keeps the most recent N warm.
+  if (wordWidthCache.size() >= MAX_WIDTH_CACHE_SIZE && !wordWidthOrder.empty()) {
+    const uint64_t oldest = wordWidthOrder.front();
+    wordWidthOrder.pop_front();
+    wordWidthCache.erase(oldest);
   }
 
-  wordWidthCache[key] = static_cast<int16_t>(w);
+  wordWidthCache[key] = static_cast<int32_t>(w);
+  wordWidthOrder.push_back(key);
   return w;
 }
 
@@ -150,6 +203,7 @@ void GfxRenderer::drawCenteredText(const int fontId, const int y, const char* te
 
 void GfxRenderer::drawText(const int fontId, const int x, const int y, const char* text, const bool black,
                            const EpdFontFamily::Style style) const {
+  warnIfNonOwner("drawText");
   // cannot draw a NULL / empty string
   if (text == nullptr || *text == '\0') {
     return;
@@ -223,10 +277,12 @@ void GfxRenderer::fillRect(const int x, const int y, const int width, const int 
 }
 
 void GfxRenderer::drawImage(const uint8_t bitmap[], const int x, const int y, const int width, const int height) const {
+  warnIfNonOwner("drawImage");
   // TODO: Rotate bits
   int rotatedX = 0;
   int rotatedY = 0;
-  rotateCoordinates(orientation, x, y, &rotatedX, &rotatedY);
+  rotateCoordinates(orientation, x, y, einkDisplay.getDisplayWidth(), einkDisplay.getDisplayHeight(),
+                    &rotatedX, &rotatedY);
   einkDisplay.drawImage(bitmap, rotatedX, rotatedY, width, height);
 }
 
@@ -295,6 +351,7 @@ void GfxRenderer::drawBitmap(const Bitmap& bitmap, const int x, const int y, con
 static unsigned long renderStartMs = 0;
 
 void GfxRenderer::clearScreen(const uint8_t color) const {
+  warnIfNonOwner("clearScreen");
   renderStartMs = millis();
   einkDisplay.clearScreen(color);
 }
@@ -304,17 +361,21 @@ void GfxRenderer::clearArea(const int x, const int y, const int width, const int
     return;
   }
 
+  // Runtime panel dimensions (X4=800x480, X3=792x528)
+  const int panelWidth = einkDisplay.getDisplayWidth();
+  const int panelHeight = einkDisplay.getDisplayHeight();
+  const int panelWidthBytes = einkDisplay.getDisplayWidthBytes();
+
   // Validate bounds - region entirely outside display
-  if (x >= static_cast<int>(EInkDisplay::DISPLAY_WIDTH) || y >= static_cast<int>(EInkDisplay::DISPLAY_HEIGHT) ||
-      x + width <= 0 || y + height <= 0) {
+  if (x >= panelWidth || y >= panelHeight || x + width <= 0 || y + height <= 0) {
     return;
   }
 
   // Clamp to display boundaries
   const int x_start = std::max(x, 0);
   const int y_start = std::max(y, 0);
-  const int x_end = std::min(x + width - 1, static_cast<int>(EInkDisplay::DISPLAY_WIDTH - 1));
-  const int y_end = std::min(y + height - 1, static_cast<int>(EInkDisplay::DISPLAY_HEIGHT - 1));
+  const int x_end = std::min(x + width - 1, panelWidth - 1);
+  const int y_end = std::min(y + height - 1, panelHeight - 1);
 
   // Calculate byte boundaries (8 pixels per byte)
   const int x_byte_start = x_start / 8;
@@ -323,18 +384,20 @@ void GfxRenderer::clearArea(const int x, const int y, const int width, const int
 
   // Clear each row in the region
   for (int row = y_start; row <= y_end; row++) {
-    const uint32_t buffer_offset = row * EInkDisplay::DISPLAY_WIDTH_BYTES + x_byte_start;
+    const uint32_t buffer_offset = row * panelWidthBytes + x_byte_start;
     memset(&frameBuffer[buffer_offset], color, byte_width);
   }
 }
 
 void GfxRenderer::invertScreen() const {
-  for (int i = 0; i < EInkDisplay::BUFFER_SIZE; i++) {
+  const uint32_t bufSize = einkDisplay.getBufferSize();
+  for (uint32_t i = 0; i < bufSize; i++) {
     frameBuffer[i] = ~frameBuffer[i];
   }
 }
 
 void GfxRenderer::displayBuffer(EInkDisplay::RefreshMode refreshMode, bool turnOffScreen) const {
+  warnIfNonOwner("displayBuffer");
   if (renderStartMs > 0) {
     Serial.printf("[%lu] [GFX] Render took %lu ms\n", millis(), millis() - renderStartMs);
     renderStartMs = 0;
@@ -354,6 +417,7 @@ void GfxRenderer::displayBuffer(EInkDisplay::RefreshMode refreshMode, bool turnO
 }
 
 void GfxRenderer::displayWindow(int x, int y, int width, int height, bool turnOffScreen) const {
+  warnIfNonOwner("displayWindow");
   einkDisplay.displayWindow(x, y, width, height, turnOffScreen || fadingFix_);
 }
 
@@ -452,9 +516,15 @@ std::vector<std::string> GfxRenderer::wrapTextWithHyphenation(const int fontId, 
     std::string lineAtBreak;
 
     while (*ptr) {
-      // Skip to end of current word
+      // Skip to end of current word. Stop at ASCII space or any unicode
+      // whitespace codepoint (NBSP, narrow NBSP, EN/EM/thin space, etc.)
+      // so French/Spanish typography splits at its actual word boundaries
+      // instead of accumulating 'mot\u202F:' as a single monster word
+      // that then trips breakWordWithHyphenation.
       const char* wordEnd = ptr;
       while (*wordEnd && *wordEnd != ' ') {
+        const int uws = utf8UnicodeWhitespaceBytes(wordEnd, 4);
+        if (uws > 0) break;
         utf8NextCodepoint(reinterpret_cast<const uint8_t**>(&wordEnd));
       }
 
@@ -473,10 +543,13 @@ std::vector<std::string> GfxRenderer::wrapTextWithHyphenation(const int fontId, 
         lastBreakPoint = wordEnd;
         lineAtBreak = currentLine;
 
-        // Move past the word and any spaces
+        // Move past the word and any whitespace (ASCII or unicode).
         ptr = wordEnd;
-        while (*ptr == ' ') {
-          ptr++;
+        while (*ptr) {
+          if (*ptr == ' ') { ptr++; continue; }
+          const int uws = utf8UnicodeWhitespaceBytes(ptr, 4);
+          if (uws > 0) { ptr += uws; continue; }
+          break;
         }
       } else {
         // Word doesn't fit
@@ -486,18 +559,25 @@ std::vector<std::string> GfxRenderer::wrapTextWithHyphenation(const int fontId, 
           for (size_t i = 0; i < wordChunks.size() && static_cast<int>(lines.size()) < maxLines; i++) {
             lines.push_back(wordChunks[i]);
           }
-          // Update remaining to skip past the word
+          // Update remaining to skip past the word and any whitespace.
           ptr = wordEnd;
-          while (*ptr == ' ') ptr++;
+          while (*ptr) {
+            if (*ptr == ' ') { ptr++; continue; }
+            const int uws = utf8UnicodeWhitespaceBytes(ptr, 4);
+            if (uws > 0) { ptr += uws; continue; }
+            break;
+          }
           remaining = ptr;
           break;
         } else if (lastBreakPoint) {
           // Line has content, break at last good point
           lines.push_back(lineAtBreak);
-          // Skip spaces after break point
           const char* nextStart = lastBreakPoint;
-          while (*nextStart == ' ') {
-            nextStart++;
+          while (*nextStart) {
+            if (*nextStart == ' ') { nextStart++; continue; }
+            const int uws = utf8UnicodeWhitespaceBytes(nextStart, 4);
+            if (uws > 0) { nextStart += uws; continue; }
+            break;
           }
           remaining = nextStart;
           break;
@@ -539,31 +619,38 @@ std::vector<std::string> GfxRenderer::wrapTextWithHyphenation(const int fontId, 
 
 // Note: Internal driver treats screen in command orientation; this library exposes a logical orientation
 int GfxRenderer::getScreenWidth() const {
+  // Native panel dimensions at runtime — X4 = 800x480, X3 = 792x528.
+  // Portrait rotates so "screen width" is panel height and vice versa.
+  const int panelWidth = einkDisplay.getDisplayWidth();
+  const int panelHeight = einkDisplay.getDisplayHeight();
   switch (orientation) {
     case Portrait:
     case PortraitInverted:
-      // 480px wide in portrait logical coordinates
-      return EInkDisplay::DISPLAY_HEIGHT;
+      // Portrait: X4=480 wide, X3=528 wide (panel height becomes logical width)
+      return panelHeight;
     case LandscapeClockwise:
     case LandscapeCounterClockwise:
-      // 800px wide in landscape logical coordinates
-      return EInkDisplay::DISPLAY_WIDTH;
+      // Landscape: X4=800 wide, X3=792 wide (panel width = logical width)
+      return panelWidth;
   }
-  return EInkDisplay::DISPLAY_HEIGHT;
+  return panelHeight;
 }
 
 int GfxRenderer::getScreenHeight() const {
+  // Native panel dimensions at runtime — X4 = 800x480, X3 = 792x528.
+  const int panelWidth = einkDisplay.getDisplayWidth();
+  const int panelHeight = einkDisplay.getDisplayHeight();
   switch (orientation) {
     case Portrait:
     case PortraitInverted:
-      // 800px tall in portrait logical coordinates
-      return EInkDisplay::DISPLAY_WIDTH;
+      // Portrait: X4=800 tall, X3=792 tall (panel width becomes logical height)
+      return panelWidth;
     case LandscapeClockwise:
     case LandscapeCounterClockwise:
-      // 480px tall in landscape logical coordinates
-      return EInkDisplay::DISPLAY_HEIGHT;
+      // Landscape: X4=480 tall, X3=528 tall (panel height = logical height)
+      return panelHeight;
   }
-  return EInkDisplay::DISPLAY_WIDTH;
+  return panelWidth;
 }
 
 int GfxRenderer::getSpaceWidth(const int fontId) const {
@@ -628,7 +715,7 @@ void GfxRenderer::drawButtonHints(const int fontId, const char* btn1, const char
 
 uint8_t* GfxRenderer::getFrameBuffer() const { return frameBuffer; }
 
-size_t GfxRenderer::getBufferSize() { return EInkDisplay::BUFFER_SIZE; }
+size_t GfxRenderer::getBufferSize() const { return einkDisplay.getBufferSize(); }
 
 void GfxRenderer::grayscaleRevert() const { einkDisplay.grayscaleRevert(); }
 
@@ -737,12 +824,23 @@ void GfxRenderer::renderChar(const EpdFontFamily& fontFamily, const uint32_t cp,
       return;
     }
 
-    // For whitespace characters missing from font, advance by space width instead of rendering '?'
-    if (cp == 0x2002 || cp == 0x2003 || cp == 0x00A0) {  // EN SPACE, EM SPACE, NBSP
+    // For whitespace characters missing from font, advance by space width
+    // instead of rendering '?'. Covers the full set of Unicode whitespace
+    // codepoints that lib/Utf8::utf8UnicodeWhitespaceBytes recognises, so
+    // even if a parser misses one the glyph path still degrades gracefully.
+    //   U+00A0 NBSP, U+2000..U+200A (en/em/thin/hair), U+202F narrow NBSP,
+    //   U+205F medium math, U+3000 ideographic.
+    const bool isUnicodeWhitespace = (cp == 0x00A0) ||
+                                     (cp >= 0x2000 && cp <= 0x200A) ||
+                                     (cp == 0x202F) ||
+                                     (cp == 0x205F) ||
+                                     (cp == 0x3000);
+    if (isUnicodeWhitespace) {
       const EpdGlyph* spaceGlyph = fontFamily.getGlyph(' ', style);
       if (spaceGlyph) {
         *x += spaceGlyph->advanceX;
-        if (cp == 0x2003) *x += spaceGlyph->advanceX;  // EM SPACE = 2x width
+        // U+2003 (EM SPACE) and U+3000 (IDEOGRAPHIC SPACE) are ~2x wide.
+        if (cp == 0x2003 || cp == 0x3000) *x += spaceGlyph->advanceX;
         return;
       }
     }
@@ -798,7 +896,21 @@ void GfxRenderer::renderChar(const EpdFontFamily& fontFamily, const uint32_t cp,
           // the direct bit from the font is 0 -> white, 1 -> light gray, 2 -> dark gray, 3 -> black
           // we swap this to better match the way images and screen think about colors:
           // 0 -> black, 1 -> dark grey, 2 -> light grey, 3 -> white
-          const uint8_t bmpVal = 3 - ((byte >> bit_index) & 0x3);
+          uint8_t bmpVal = 3 - ((byte >> bit_index) & 0x3);
+
+          // Text darkness: shift gray levels toward black
+          // 0=Normal: no change
+          // 1=Dark: light gray(2) -> dark gray(1)
+          // 2=Extra Dark: light gray(2) -> black(0), dark gray(1) -> black(0)
+          // 3=Maximum: all non-white -> black(0)
+          if (textDarkness_ >= 3) {
+            if (bmpVal < 3) bmpVal = 0;
+          } else if (textDarkness_ == 2) {
+            if (bmpVal == 2) bmpVal = 0;
+            else if (bmpVal == 1) bmpVal = 0;
+          } else if (textDarkness_ == 1) {
+            if (bmpVal == 2) bmpVal = 1;
+          }
 
           if (renderMode == BW && bmpVal < 3) {
             // Black (also paints over the grays in BW mode)
@@ -1074,7 +1186,17 @@ void GfxRenderer::renderThaiCluster(const EpdFontFamily& fontFamily, const ThaiS
         if (is2Bit) {
           const uint8_t byte = bitmap[pixelPosition / 4];
           const uint8_t bit_index = (3 - pixelPosition % 4) * 2;
-          const uint8_t bmpVal = 3 - ((byte >> bit_index) & 0x3);
+          uint8_t bmpVal = 3 - ((byte >> bit_index) & 0x3);
+
+          // Text darkness: shift gray levels toward black (same as renderChar)
+          if (textDarkness_ >= 3) {
+            if (bmpVal < 3) bmpVal = 0;
+          } else if (textDarkness_ == 2) {
+            if (bmpVal == 2) bmpVal = 0;
+            else if (bmpVal == 1) bmpVal = 0;
+          } else if (textDarkness_ == 1) {
+            if (bmpVal == 2) bmpVal = 1;
+          }
 
           if (renderMode == BW && bmpVal < 3) {
             drawPixel(screenX, screenY, pixelState);

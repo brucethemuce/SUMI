@@ -22,6 +22,8 @@
 #include <cmath>
 #include <cstdarg>
 #include <algorithm>
+#include <string>
+#include <vector>
 
 #include "../config.h"
 
@@ -149,6 +151,18 @@ class PluginRenderer {
   int getTextWidth(const char* text) { return gfx_.getTextWidth(pluginFontId_, text); }
 
   int getLineHeight() { return gfx_.getLineHeight(pluginFontId_); }
+
+  // UTF-8 aware word-wrap suitable for CJK/accented/Cyrillic text. Returns
+  // a vector of lines that each fit within maxWidth pixels using the
+  // current plugin font. Forwards to GfxRenderer which walks the text
+  // codepoint-by-codepoint and uses the same external-font fallback path
+  // used for EPUB rendering, so CJK glyphs load from /config/fonts/*.bin
+  // correctly. Plugins that roll their own byte-level word wrap (looking
+  // at you, Flashcards) should prefer this helper.
+  std::vector<std::string> wrapText(const char* text, int maxWidth, int maxLines = 32) {
+    if (!text) return {};
+    return gfx_.wrapTextWithHyphenation(pluginFontId_, text, maxWidth, maxLines);
+  }
 
   // --- Drawing primitives ---
   void drawRect(int x, int y, int w, int h, bool color) { gfx_.drawRect(x, y, w, h, color); }

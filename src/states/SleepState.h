@@ -28,6 +28,7 @@ class SleepState : public State {
   void renderCustomSleepScreen(const Core& core) const;
   void renderCoverSleepScreen(Core& core) const;
   void renderBitmapSleepScreen(const Bitmap& bitmap) const;
+  void renderPageOverlaySleepScreen() const;
   void waitForPowerRelease() const;
 };
 

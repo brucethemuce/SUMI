@@ -8,7 +8,7 @@ src/
 ├── config.h                 # Build configuration, feature flags
 │
 ├── core/                    # Core systems
-│   ├── MemoryArena.h/cpp    # Pre-allocated buffer pool (76KB: 32+20+24) + bump allocator
+│   ├── MemoryArena.h/cpp    # 76 KB single-block .bss arena (primary 32K + work 20K + task stack 24K) + bump allocator
 │   ├── Core.h/cpp           # Global state container
 │   ├── StateMachine.h/cpp   # State transitions
 │   ├── EventQueue.h         # Input event queue

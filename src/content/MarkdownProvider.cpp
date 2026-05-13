@@ -2,6 +2,8 @@
 
 #include <cstring>
 
+#include <Utf8.h>
+
 namespace sumi {
 
 Result<void> MarkdownProvider::open(const char* path, const char* cacheDir) {
@@ -18,20 +20,11 @@ Result<void> MarkdownProvider::open(const char* path, const char* cacheDir) {
   meta.clear();
   meta.type = ContentType::Markdown;
 
-  const std::string& title = markdown->getTitle();
-  strncpy(meta.title, title.c_str(), sizeof(meta.title) - 1);
-  meta.title[sizeof(meta.title) - 1] = '\0';
-
+  // UTF-8 safe copy — titles may contain CJK; see EpubProvider for rationale.
+  utf8SafeCopy(meta.title, markdown->getTitle().c_str(), sizeof(meta.title));
   meta.author[0] = '\0';  // Markdown doesn't have author
-
-  const std::string& cachePath = markdown->getCachePath();
-  strncpy(meta.cachePath, cachePath.c_str(), sizeof(meta.cachePath) - 1);
-  meta.cachePath[sizeof(meta.cachePath) - 1] = '\0';
-
-  // Cover path
-  std::string coverPath = markdown->getCoverBmpPath();
-  strncpy(meta.coverPath, coverPath.c_str(), sizeof(meta.coverPath) - 1);
-  meta.coverPath[sizeof(meta.coverPath) - 1] = '\0';
+  utf8SafeCopy(meta.cachePath, markdown->getCachePath().c_str(), sizeof(meta.cachePath));
+  utf8SafeCopy(meta.coverPath, markdown->getCoverBmpPath().c_str(), sizeof(meta.coverPath));
 
   // Markdown uses file size, not pages
   meta.totalPages = 1;  // Will be updated by reader

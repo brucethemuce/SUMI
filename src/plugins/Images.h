@@ -5,6 +5,7 @@
 #if FEATURE_PLUGINS
 
 #include <Arduino.h>
+#include <Utf8.h>
 #include <FsHelpers.h>
 #include <ImageConverter.h>
 #include <SDCardManager.h>
@@ -252,8 +253,8 @@ void ImagesApp::scanImages() {
                             strcasecmp(ext, ".jpg") == 0 ||
                             strcasecmp(ext, ".jpeg") == 0);
             if (supported) {
-                strncpy(_images[_imageCount], name, MAX_NAME_LEN - 1);
-                _images[_imageCount][MAX_NAME_LEN - 1] = '\0';
+                // UTF-8 safe so CJK image filenames aren't sliced.
+                utf8SafeCopy(_images[_imageCount], name, MAX_NAME_LEN);
                 _imageCount++;
             }
         }
@@ -309,7 +310,7 @@ void ImagesApp::prepareImage() {
         Serial.printf("[IMAGES] Converting %s to BMP...\n", _images[_cursor]);
 
         if (ImageConverterFactory::convertToBmp(srcPath, IMAGES_TMP_BMP, config)) {
-            strncpy(_bmpPath, IMAGES_TMP_BMP, sizeof(_bmpPath) - 1);
+            utf8SafeCopy(_bmpPath, IMAGES_TMP_BMP, sizeof(_bmpPath));
             readBmpDimensions(_bmpPath);
             Serial.printf("[IMAGES] Converted: %dx%d\n", _imgW, _imgH);
         } else {
@@ -320,7 +321,8 @@ void ImagesApp::prepareImage() {
         }
     } else {
         _needsConvert = false;
-        strncpy(_bmpPath, srcPath, sizeof(_bmpPath) - 1);
+        // srcPath may contain CJK filenames; strncpy cuts mid-codepoint.
+        utf8SafeCopy(_bmpPath, srcPath, sizeof(_bmpPath));
 
         const char* ext = strrchr(_images[_cursor], '.');
         if (ext && strcasecmp(ext, ".raw") == 0) {
@@ -515,24 +517,26 @@ void ImagesApp::drawBMPRegion(const char* path, int srcX, int srcY, int zoom) {
                 free(row);
             }
         } else if (bpp == 24) {
-            int rowBytes = ((width * 3 + 3) / 4) * 4;
-            uint8_t* row = (uint8_t*)malloc(min(rowBytes, 2400));  // Limit alloc
+            // Previously capped at 2400 bytes (800 px) which truncated wider
+            // images to the left slice. Allocate the real row size — ESP32-C3
+            // heap has the headroom.
+            const int rowBytes = ((width * 3 + 3) / 4) * 4;
+            uint8_t* row = (uint8_t*)malloc(rowBytes);
             if (row) {
                 for (int sy = 0; sy < viewH && sy + srcY < (int)height; sy++) {
                     int imgY = flipV ? (height - 1 - (srcY + sy)) : (srcY + sy);
                     f.seek(dataOffset + imgY * rowBytes);
-                    f.read(row, min(rowBytes, 2400));
+                    f.read(row, rowBytes);
 
                     int screenY = sy * zoom;
                     for (int sx = 0; sx < viewW && sx + srcX < (int)width; sx++) {
-                        int imgX = srcX + sx;
-                        if (imgX * 3 + 2 < min(rowBytes, 2400)) {
-                            int idx = imgX * 3;
-                            int gray = (row[idx] + row[idx+1] + row[idx+2]) / 3;
-                            if (gray <= 128) {
-                                int screenX = sx * zoom;
-                                d_.fillRect(screenX, screenY, zoom, zoom, GxEPD_BLACK);
-                            }
+                        const int imgX = srcX + sx;
+                        const int idx = imgX * 3;
+                        if (idx + 2 >= rowBytes) break;
+                        const int gray = (row[idx] + row[idx + 1] + row[idx + 2]) / 3;
+                        if (gray <= 128) {
+                            int screenX = sx * zoom;
+                            d_.fillRect(screenX, screenY, zoom, zoom, GxEPD_BLACK);
                         }
                     }
                 }

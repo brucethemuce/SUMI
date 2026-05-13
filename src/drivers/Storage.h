@@ -26,6 +26,13 @@ class Storage {
   Result<void> mkdir(const char* path);
   Result<void> rmdir(const char* path);
 
+  // Atomic write protocol — see docs/ATOMIC_WRITE_DESIGN.md.
+  // Thin wrappers around SDCardManager's atomicOpenWrite/Commit/Abort
+  // so consumers using the Storage API stay on it.
+  Result<void> atomicOpenWrite(const char* path, FsFile& out);
+  Result<void> atomicCommit(FsFile& file, const char* path);
+  void         atomicAbort(FsFile& file, const char* path);
+
   // Directory operations
   Result<void> openDir(const char* path, FsFile& out);
 

@@ -52,7 +52,11 @@ class SDCardManager {
   bool mkdir(const char* path) {
     struct stat st;
     if (stat(path, &st) == 0) return true;
+#ifdef _WIN32
+    return ::mkdir(path) == 0;
+#else
     return ::mkdir(path, 0755) == 0;
+#endif
   }
 
   static SDCardManager& getInstance() {

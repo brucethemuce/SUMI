@@ -4,6 +4,22 @@
 
 #include <iostream>
 
+// ──────────────────────────────────────────────────────────────────────
+// On-disk endianness contract
+// ──────────────────────────────────────────────────────────────────────
+//
+// writePod / readPod copy raw bytes between memory and a stream. They
+// do NOT swap bytes. The on-disk representation is therefore the host's
+// NATIVE byte order at the time of write.
+//
+// SUMI ships exclusively on ESP32-C3 (RISC-V, little-endian). Every
+// .bin file format on disk is little-endian. If the firmware is ever
+// ported to a big-endian target, all multi-byte writePod / readPod call
+// sites must be wrapped in explicit htole32 / le32toh helpers BEFORE the
+// new firmware ships, or files written by existing C3 devices will read
+// with byte-swapped numerics on the BE host. Audit #22.
+// ──────────────────────────────────────────────────────────────────────
+
 namespace serialization {
 template <typename T>
 static void writePod(std::ostream& os, const T& value) {
@@ -22,7 +38,15 @@ static void readPod(std::istream& is, T& value) {
 
 template <typename T>
 static void readPod(FsFile& file, T& value) {
-  file.read(reinterpret_cast<uint8_t*>(&value), sizeof(T));
+  // Zero-initialize before read so a partial/failed read leaves a
+  // deterministic value instead of stack garbage. The return value
+  // is not checked here (callers validate), but SIZE_MAX-from-memset
+  // is still better than random stack bits.
+  T temp{};
+  if (file.read(reinterpret_cast<uint8_t*>(&temp), sizeof(T)) == static_cast<int>(sizeof(T))) {
+    value = temp;
+  }
+  // On failure: `value` retains its prior default (from the struct initializer).
 }
 
 template <typename T>
@@ -80,8 +104,15 @@ static void writeString(FsFile& file, const std::string& s) {
 
 template <typename T>
 static void readPodValidated(FsFile& file, T& value, T maxValue) {
-  T temp;
-  file.read(reinterpret_cast<uint8_t*>(&temp), sizeof(T));
+  T temp = 0;
+  // Only commit the read if it actually filled the full type. A truncated
+  // read would leave `temp` uninitialized and any subsequent < maxValue
+  // check would be comparing against stack garbage; if the garbage happened
+  // to be below the max, we'd write corrupted bytes into the live setting.
+  const int bytesRead = file.read(reinterpret_cast<uint8_t*>(&temp), sizeof(T));
+  if (bytesRead != static_cast<int>(sizeof(T))) {
+    return;  // Leave `value` at its prior default.
+  }
   if (temp < maxValue) {
     value = temp;
   }

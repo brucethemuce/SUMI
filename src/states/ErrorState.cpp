@@ -3,6 +3,7 @@
 #include <Arduino.h>
 #include <GfxRenderer.h>
 
+#include <Utf8.h>
 #include <cstring>
 
 #include "../core/Core.h"
@@ -16,11 +17,9 @@ ErrorState::ErrorState(GfxRenderer& renderer) : renderer_(renderer), needsRender
 void ErrorState::setError(Error err, const char* message) {
   error_ = err;
   if (message) {
-    strncpy(message_, message, sizeof(message_) - 1);
-    message_[sizeof(message_) - 1] = '\0';
+    utf8SafeCopy(message_, message, sizeof(message_));
   } else {
-    strncpy(message_, errorToString(err), sizeof(message_) - 1);
-    message_[sizeof(message_) - 1] = '\0';
+    utf8SafeCopy(message_, errorToString(err), sizeof(message_));
   }
   needsRender_ = true;
 }
@@ -28,8 +27,7 @@ void ErrorState::setError(Error err, const char* message) {
 void ErrorState::enter(Core& core) {
   // Check for error message from shared buffer (e.g., from ReaderState)
   if (core.buf.text[0] != '\0') {
-    strncpy(message_, core.buf.text, sizeof(message_) - 1);
-    message_[sizeof(message_) - 1] = '\0';
+    utf8SafeCopy(message_, core.buf.text, sizeof(message_));
     core.buf.text[0] = '\0';  // Clear after reading
   }
   Serial.printf("[STATE] ErrorState::enter - %s\n", message_);

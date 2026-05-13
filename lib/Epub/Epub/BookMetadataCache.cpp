@@ -30,7 +30,7 @@ bool BookMetadataCache::beginContentOpfPass() {
 }
 
 bool BookMetadataCache::endContentOpfPass() {
-  spineFile.close();
+  SdMan.syncAndClose(spineFile);
   return true;
 }
 
@@ -60,8 +60,8 @@ bool BookMetadataCache::beginTocPass() {
 }
 
 bool BookMetadataCache::endTocPass() {
-  tocFile.close();
-  spineFile.close();
+  SdMan.syncAndClose(tocFile);
+  spineFile.close();  // was opened for read, no sync needed
 
   // Free cached spine hrefs memory - swap idiom to release bucket memory
   std::unordered_map<std::string, int>().swap(spineHrefIndex);
@@ -177,9 +177,9 @@ bool BookMetadataCache::buildBookBin(const std::string& epubPath, const BookMeta
     writeTocEntry(bookFile, tocEntry);
   }
 
-  bookFile.close();
-  spineFile.close();
-  tocFile.close();
+  SdMan.syncAndClose(bookFile);  // writer — must sync
+  spineFile.close();              // reader — no sync needed
+  tocFile.close();                // reader — no sync needed
 
   Serial.printf("[%lu] [BMC] Successfully built book.bin\n", millis());
   return true;
@@ -225,6 +225,29 @@ void BookMetadataCache::createSpineEntry(const std::string& href) {
   spineCount++;
 }
 
+void BookMetadataCache::generateSyntheticToc() {
+  if (!buildMode || !tocFile || !spineFile) {
+    Serial.printf("[%lu] [BMC] generateSyntheticToc called but not in build mode\n", millis());
+    return;
+  }
+
+  if (tocCount > 0) {
+    return;  // Already have TOC entries
+  }
+
+  Serial.printf("[%lu] [BMC] Generating synthetic TOC from %d spine items\n", millis(), spineCount);
+
+  // Read spine entries sequentially and create a TOC entry for each
+  spineFile.seek(0);
+  for (int i = 0; i < spineCount; i++) {
+    auto entry = readSpineEntry(spineFile);
+    std::string title = "Chapter " + std::to_string(i + 1);
+    createTocEntry(title, entry.href, "", 0);
+  }
+
+  Serial.printf("[%lu] [BMC] Generated %d synthetic TOC entries\n", millis(), tocCount);
+}
+
 void BookMetadataCache::createTocEntry(const std::string& title, const std::string& href, const std::string& anchor,
                                        const uint8_t level) {
   if (!buildMode || !tocFile) {
@@ -267,6 +290,18 @@ bool BookMetadataCache::load() {
   serialization::readPod(bookFile, spineCount);
   serialization::readPod(bookFile, tocCount);
 
+  // Plausibility caps. Both fields are uint16_t so a corrupted cache could
+  // set them near 65535, and getSpineEntry/getTocEntry use them as upper
+  // bounds for lutOffset + 4*index seeks. A wild value would read garbage
+  // from random file offsets and return corrupt entries.
+  constexpr uint16_t kMaxSpineOrToc = 8192;
+  if (spineCount > kMaxSpineOrToc || tocCount > kMaxSpineOrToc) {
+    Serial.printf("[%lu] [BMC] Implausible counts spine=%u toc=%u, discarding cache\n",
+                  millis(), spineCount, tocCount);
+    bookFile.close();
+    return false;
+  }
+
   if (!serialization::readString(bookFile, coreMetadata.title) ||
       !serialization::readString(bookFile, coreMetadata.author) ||
       !serialization::readString(bookFile, coreMetadata.subject) ||
@@ -274,6 +309,9 @@ bool BookMetadataCache::load() {
       !serialization::readString(bookFile, coreMetadata.coverItemHref) ||
       !serialization::readString(bookFile, coreMetadata.textReferenceHref)) {
     Serial.printf("[%lu] [BMC] Failed to read metadata strings\n", millis());
+    // Sister error paths at 285 and 301 close bookFile before returning;
+    // this one used to leak the handle until the next mount cycle.
+    bookFile.close();
     return false;
   }
 

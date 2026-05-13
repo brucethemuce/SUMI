@@ -23,6 +23,26 @@ void EpdFont::getTextBounds(const char* string, const int startX, const int star
     const EpdGlyph* glyph = getGlyph(cp);
 
     if (!glyph) {
+      // Unicode whitespace (NBSP, narrow NBSP, EN/EM/thin spaces,
+      // ideographic space): measure as a space to stay in sync with
+      // GfxRenderer::renderChar's whitespace fallback (b7d227d).
+      // Without this, getTextDimensions reported '?' widths for
+      // codepoints that render as spaces — so lines measured against
+      // a maxWidth bound could ship text past the right margin.
+      const bool isUnicodeWhitespace = (cp == 0x00A0) ||
+                                       (cp >= 0x2000 && cp <= 0x200A) ||
+                                       (cp == 0x202F) ||
+                                       (cp == 0x205F) ||
+                                       (cp == 0x3000);
+      if (isUnicodeWhitespace) {
+        const EpdGlyph* space = getGlyph(' ');
+        if (space) {
+          const int advance = space->advanceX * ((cp == 0x2003 || cp == 0x3000) ? 2 : 1);
+          cursorX += advance;
+          *maxX = max(*maxX, cursorX);
+          continue;
+        }
+      }
       // TODO: Replace with fallback glyph property?
       glyph = getGlyph('?');
     }

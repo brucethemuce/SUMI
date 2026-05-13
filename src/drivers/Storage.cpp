@@ -15,6 +15,12 @@ Result<void> Storage::init() {
   }
 
   mounted_ = true;
+
+  // Boot-time recovery for atomic-write rotations interrupted by a
+  // previous crash. See docs/ATOMIC_WRITE_DESIGN.md. Cheap — one /.sumi/
+  // directory scan.
+  SdMan.recoverAtomicWrites();
+
   return Ok();
 }
 
@@ -45,6 +51,34 @@ Result<void> Storage::openWrite(const char* path, FsFile& out) {
   }
 
   return Ok();
+}
+
+Result<void> Storage::atomicOpenWrite(const char* path, FsFile& out) {
+  if (!mounted_) {
+    return ErrVoid(Error::SdCardNotFound);
+  }
+
+  if (!SdMan.atomicOpenWrite("DRV", path, out)) {
+    return ErrVoid(Error::IOError);
+  }
+
+  return Ok();
+}
+
+Result<void> Storage::atomicCommit(FsFile& file, const char* path) {
+  if (!mounted_) {
+    return ErrVoid(Error::SdCardNotFound);
+  }
+
+  if (!SdMan.atomicCommit(file, path)) {
+    return ErrVoid(Error::IOError);
+  }
+
+  return Ok();
+}
+
+void Storage::atomicAbort(FsFile& file, const char* path) {
+  SdMan.atomicAbort(file, path);
 }
 
 Result<bool> Storage::exists(const char* path) {

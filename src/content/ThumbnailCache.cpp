@@ -59,11 +59,11 @@ bool ThumbnailCache::load(uint32_t bookHash, uint8_t* buffer) {
     return false;
   }
 
-  size_t bytesRead = file.read(buffer, DATA_SIZE);
+  const int bytesRead = file.read(buffer, DATA_SIZE);
   file.close();
 
-  if (bytesRead != DATA_SIZE) {
-    Serial.printf("[%lu] [THUMB] Read failed: %zu/%zu bytes\n", millis(), bytesRead, DATA_SIZE);
+  if (bytesRead < 0 || static_cast<size_t>(bytesRead) != DATA_SIZE) {
+    Serial.printf("[%lu] [THUMB] Read failed: %d/%zu bytes\n", millis(), bytesRead, DATA_SIZE);
     return false;
   }
 
@@ -99,8 +99,17 @@ void ThumbnailCache::clear() {
     String name = entry.name();
     entry.close();
 
+    // Some LittleFS builds return entry.name() as a full path (e.g.
+    // "/.sumi/thumbcache/AB12CD34.thb"), others return just the basename.
+    // Always work from the basename so snprintf doesn't produce a
+    // doubly-prefixed path that LittleFS.remove silently rejects,
+    // leaving the cache never actually cleared.
+    const char* base = name.c_str();
+    const char* slash = strrchr(base, '/');
+    if (slash) base = slash + 1;
+
     char path[64];
-    snprintf(path, sizeof(path), "%s/%s", CACHE_DIR, name.c_str());
+    snprintf(path, sizeof(path), "%s/%s", CACHE_DIR, base);
     if (LittleFS.remove(path)) {
       removed++;
     }

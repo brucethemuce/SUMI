@@ -13,6 +13,11 @@ struct DeviceSettingsView {
   static constexpr const char* const TOGGLE_VALUES[] = {"OFF", "ON"};
   static constexpr const char* const FRONT_BUTTON_VALUES[] = {"B/C/L/R", "L/R/B/C"};
   static constexpr const char* const SIDE_BUTTON_VALUES[] = {"Prev/Next", "Next/Prev"};
+  static constexpr const char* const LANGUAGE_VALUES[] = {
+    "English", "Espanol", "Francais", "Deutsch", "Portugues",
+    "Italiano", "Russkij", "Polski", "Nederlands",
+    "Nihongo", "Zhongwen", "Hangugeo", "Arabiy"
+  };
 
   struct SettingDef {
     const char* label;
@@ -20,7 +25,7 @@ struct DeviceSettingsView {
     uint8_t valueCount;
   };
 
-  static constexpr int SETTING_COUNT = 8;
+  static constexpr int SETTING_COUNT = 9;
   static const SettingDef DEFS[SETTING_COUNT];
 
   uint8_t values[SETTING_COUNT] = {0};
@@ -48,19 +53,21 @@ constexpr const char* const DeviceSettingsView::PAGES_REFRESH_VALUES[];
 constexpr const char* const DeviceSettingsView::TOGGLE_VALUES[];
 constexpr const char* const DeviceSettingsView::FRONT_BUTTON_VALUES[];
 constexpr const char* const DeviceSettingsView::SIDE_BUTTON_VALUES[];
+constexpr const char* const DeviceSettingsView::LANGUAGE_VALUES[];
 
 const DeviceSettingsView::SettingDef DeviceSettingsView::DEFS[SETTING_COUNT] = {
     {"Auto Sleep Timeout", SLEEP_TIMEOUT_VALUES, 5}, {"Sleep Screen", SLEEP_SCREEN_VALUES, 4},
     {"Startup Behavior", STARTUP_VALUES, 2},         {"Short Power Button", SHORT_PWR_VALUES, 3},
     {"Pages Per Refresh", PAGES_REFRESH_VALUES, 5},  {"Sunlight Fading Fix", TOGGLE_VALUES, 2},
     {"Front Buttons", FRONT_BUTTON_VALUES, 2},       {"Side Buttons", SIDE_BUTTON_VALUES, 2},
+    {"Language", LANGUAGE_VALUES, 13},
 };
 
 int main() {
   TestUtils::TestRunner runner("SettingsViewTest");
 
-  // SETTING_COUNT is 8
-  runner.expectEq(8, DeviceSettingsView::SETTING_COUNT, "SETTING_COUNT is 8");
+  // SETTING_COUNT is 9 (8 original + Language)
+  runner.expectEq(9, DeviceSettingsView::SETTING_COUNT, "SETTING_COUNT is 9");
 
   // DEFS entries for Front Buttons (index 6)
   runner.expectTrue(strcmp(DeviceSettingsView::DEFS[6].label, "Front Buttons") == 0, "DEFS[6] label is Front Buttons");

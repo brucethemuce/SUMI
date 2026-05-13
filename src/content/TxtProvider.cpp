@@ -1,5 +1,7 @@
 #include "TxtProvider.h"
 
+#include <Utf8.h>
+
 #include <cstring>
 
 namespace sumi {
@@ -18,20 +20,11 @@ Result<void> TxtProvider::open(const char* path, const char* cacheDir) {
   meta.clear();
   meta.type = ContentType::Txt;
 
-  const std::string& title = txt->getTitle();
-  strncpy(meta.title, title.c_str(), sizeof(meta.title) - 1);
-  meta.title[sizeof(meta.title) - 1] = '\0';
-
+  // UTF-8 safe copy — see EpubProvider for rationale.
+  utf8SafeCopy(meta.title, txt->getTitle().c_str(), sizeof(meta.title));
   meta.author[0] = '\0';  // TXT doesn't have author
-
-  const std::string& cachePath = txt->getCachePath();
-  strncpy(meta.cachePath, cachePath.c_str(), sizeof(meta.cachePath) - 1);
-  meta.cachePath[sizeof(meta.cachePath) - 1] = '\0';
-
-  // Cover path
-  std::string coverPath = txt->getCoverBmpPath();
-  strncpy(meta.coverPath, coverPath.c_str(), sizeof(meta.coverPath) - 1);
-  meta.coverPath[sizeof(meta.coverPath) - 1] = '\0';
+  utf8SafeCopy(meta.cachePath, txt->getCachePath().c_str(), sizeof(meta.cachePath));
+  utf8SafeCopy(meta.coverPath, txt->getCoverBmpPath().c_str(), sizeof(meta.coverPath));
 
   // TXT uses file size, not pages (pages calculated during rendering)
   meta.totalPages = 1;  // Will be updated by reader

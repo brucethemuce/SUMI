@@ -168,22 +168,19 @@ void XMLCALL ContentOpfParser::startElement(void* userData, const XML_Char* name
 
   if (self->state == IN_PACKAGE && (strcmp(name, "spine") == 0 || strcmp(name, "opf:spine") == 0)) {
     self->state = IN_SPINE;
+    // Open the temp items file for on-demand streaming lookup during the
+    // spine walk. The older design built an in-memory unordered_map of
+    // every manifest entry, which blew bad_alloc on huge EPUBs like War
+    // and Peace (500+ manifest items = ~35 KB of hash nodes + strings +
+    // rehash buckets on a fragmented heap). Streaming means we re-seek
+    // to offset 0 for each spine idref and scan linearly for the match.
+    // O(N*M) but both N and M are bounded; one full spine parse of W&P
+    // does ~100K byte reads, ~0.5 s on SD — invisible vs the full EPUB
+    // cache-build phase.
     if (!SdMan.openFileForRead("COF", self->cachePath + itemCacheFile, self->tempItemStore)) {
       Serial.printf(
-          "[%lu] [COF] Couldn't open temp items file for reading. This is probably going to be a fatal error.\n",
+          "[%lu] [COF] Couldn't open temp items file. Spine will have no hrefs.\n",
           millis());
-    } else {
-      std::string itemId;
-      std::string href;
-      while (self->tempItemStore.available()) {
-        if (!serialization::readString(self->tempItemStore, itemId) ||
-            !serialization::readString(self->tempItemStore, href)) {
-          Serial.printf("[%lu] [COF] Failed to read manifest item from temp store\n", millis());
-          break;
-        }
-        self->manifestIndex[itemId] = href;
-      }
-      self->tempItemStore.close();
     }
     return;
   }
@@ -279,9 +276,23 @@ void XMLCALL ContentOpfParser::startElement(void* userData, const XML_Char* name
       for (int i = 0; atts[i]; i += 2) {
         if (strcmp(atts[i], "idref") == 0) {
           const std::string idref = atts[i + 1];
-          auto it = self->manifestIndex.find(idref);
-          if (it != self->manifestIndex.end()) {
-            self->cache->createSpineEntry(it->second);
+          // Streaming lookup: rewind the temp items file and scan for a
+          // matching id. We don't hold a 500-entry hash map in RAM —
+          // trades ~0.5 s of SD reads for being able to open 1000-item
+          // EPUBs on a 63 KB heap. See the spine-open site above.
+          if (!self->tempItemStore) break;
+          self->tempItemStore.seek(0);
+          std::string candidateId;
+          std::string candidateHref;
+          while (self->tempItemStore.available()) {
+            if (!serialization::readString(self->tempItemStore, candidateId) ||
+                !serialization::readString(self->tempItemStore, candidateHref)) {
+              break;
+            }
+            if (candidateId == idref) {
+              self->cache->createSpineEntry(candidateHref);
+              break;
+            }
           }
         }
       }
@@ -371,6 +382,10 @@ void XMLCALL ContentOpfParser::endElement(void* userData, const XML_Char* name) 
 
   if (self->state == IN_SPINE && (strcmp(name, "spine") == 0 || strcmp(name, "opf:spine") == 0)) {
     self->state = IN_PACKAGE;
+    // Release the temp items file handle now that spine walking is done.
+    if (self->tempItemStore) {
+      self->tempItemStore.close();
+    }
     return;
   }
 
@@ -381,7 +396,13 @@ void XMLCALL ContentOpfParser::endElement(void* userData, const XML_Char* name) 
 
   if (self->state == IN_MANIFEST && (strcmp(name, "manifest") == 0 || strcmp(name, "opf:manifest") == 0)) {
     self->state = IN_PACKAGE;
-    self->tempItemStore.close();
+    // syncAndClose: the temp items file is re-opened a few calls later
+    // (when we hit the spine) and scanned through to build manifestIndex.
+    // Without sync, SdFat can drop the tail sectors of the just-written
+    // manifest, which would silently return an empty index and cascade
+    // into an empty spine — the reader then fails to open the book
+    // with a confusing "No content" error.
+    SdMan.syncAndClose(self->tempItemStore);
     return;
   }
 

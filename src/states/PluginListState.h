@@ -48,9 +48,18 @@ class PluginListState : public State {
   // Get a reference to the host state for launching
   void setHostState(PluginHostState* host) { hostState_ = host; }
 
-  // Storage for Lua plugin paths and names (static so factory functions can reference them)
+  // Storage for Lua plugin paths and names (static so factory functions
+  // can reference them).
+  //
+  // luaPaths_ width bumped from 64 → 96 in Batch 9: the formatted path
+  // is "/custom/" (8 chars) + filename (FAT LFN allows up to 255). With
+  // a 64-char buffer, filenames longer than 55 chars truncated silently
+  // and `LuaPlugin::loadScript` failed to open the file even though it
+  // appeared in the plugin list. 96 covers the common long-filename
+  // case (64-char filenames are realistic; 255 is an edge case the
+  // user can rename around). Audit #53.
   static constexpr int MAX_LUA_PLUGINS = 8;
-  static char luaPaths_[MAX_LUA_PLUGINS][64];
+  static char luaPaths_[MAX_LUA_PLUGINS][96];
   static char luaNames_[MAX_LUA_PLUGINS][24];
   static int luaPluginCount_;
   static PluginRenderer* luaRenderer_;
@@ -65,10 +74,23 @@ class PluginListState : public State {
   bool goHome_ = false;
   bool launchPlugin_ = false;
 
-  // Filtered list of visible plugin indices (excludes hidden apps)
+  // Display list: interleaves category headers and plugin entries.
+  // A displayList_ entry with pluginIndex == -1 is a category header;
+  // its categoryName points to the category string.
+  struct DisplayEntry {
+    int8_t pluginIndex;        // -1 = category header
+    const char* categoryName;  // non-null for headers
+  };
+  DisplayEntry displayList_[MAX_PLUGINS + 8];  // plugins + up to 8 category headers
+  int8_t displayCount_ = 0;
+
+  // Legacy visible list (still needed for index mapping)
   int8_t visiblePlugins_[MAX_PLUGINS];
   int8_t visiblePluginCount_ = 0;
   void buildVisibleList(const Settings& settings);
+
+  // Skip to next/prev selectable entry (skips category headers)
+  void moveSelection(int direction);
 
   // How many items fit on screen
   int visibleCount() const;

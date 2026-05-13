@@ -5,11 +5,17 @@
 #include <ThaiCluster.h>
 
 #include <array>
+#include <deque>
 #include <map>
 #include <unordered_map>
 #include <vector>
 
 #include "Bitmap.h"
+
+#ifdef ARDUINO
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
+#endif
 
 // Forward declaration for external CJK font support
 class ExternalFont;
@@ -29,10 +35,14 @@ class GfxRenderer {
   };
 
  private:
-  static constexpr size_t BW_BUFFER_CHUNK_SIZE = 8000;  // 8KB chunks to allow for non-contiguous memory
-  static constexpr size_t BW_BUFFER_NUM_CHUNKS = EInkDisplay::BUFFER_SIZE / BW_BUFFER_CHUNK_SIZE;
-  static_assert(BW_BUFFER_CHUNK_SIZE * BW_BUFFER_NUM_CHUNKS == EInkDisplay::BUFFER_SIZE,
-                "BW buffer chunking does not line up with display buffer size");
+  // 8KB chunks to allow for non-contiguous memory allocation. Sized for
+  // MAX_BUFFER_SIZE (52272 bytes for X3) so one set of chunks works for both
+  // panels. 7 chunks × 8000 = 56000 bytes; X3 uses 52272, X4 uses 48000, the
+  // remainder is wasted but the chunk allocation pattern stays simple.
+  static constexpr size_t BW_BUFFER_CHUNK_SIZE = 8000;
+  static constexpr size_t BW_BUFFER_NUM_CHUNKS = 7;
+  static_assert(BW_BUFFER_CHUNK_SIZE * BW_BUFFER_NUM_CHUNKS >= EInkDisplay::MAX_BUFFER_SIZE,
+                "BW buffer chunks too small for MAX_BUFFER_SIZE");
 
   EInkDisplay& einkDisplay;
   RenderMode renderMode;
@@ -52,10 +62,15 @@ class GfxRenderer {
   mutable FontStyleResolver _fontStyleResolver = nullptr;
   mutable void* _fontStyleResolverCtx = nullptr;
 
-  // Pre-allocated row buffers for bitmap rendering (reduces heap fragmentation)
-  // Sized for max screen dimension (800 pixels): outputRow = 800/4 = 200 bytes, rowBytes = 800*3 = 2400 bytes (24bpp)
-  static constexpr size_t BITMAP_OUTPUT_ROW_SIZE = (EInkDisplay::DISPLAY_WIDTH + 3) / 4;
-  static constexpr size_t BITMAP_ROW_BYTES_SIZE = EInkDisplay::DISPLAY_WIDTH * 4;  // 32-bit max
+  // Pre-allocated row buffers for bitmap rendering (reduces heap fragmentation).
+  // Sized for the LARGER of X4 (800) and X3 (792) panel widths; X3 uses the
+  // buffer but leaves 8 pixels unused per row (negligible).
+  // outputRow = 800/4 = 200 bytes, rowBytes = 800*4 = 3200 bytes (32-bit max).
+  static constexpr size_t BITMAP_MAX_WIDTH =
+      (EInkDisplay::DISPLAY_WIDTH > EInkDisplay::X3_DISPLAY_WIDTH) ? EInkDisplay::DISPLAY_WIDTH
+                                                                  : EInkDisplay::X3_DISPLAY_WIDTH;
+  static constexpr size_t BITMAP_OUTPUT_ROW_SIZE = (BITMAP_MAX_WIDTH + 3) / 4;
+  static constexpr size_t BITMAP_ROW_BYTES_SIZE = BITMAP_MAX_WIDTH * 4;
   uint8_t* bitmapOutputRow_ = nullptr;
   uint8_t* bitmapRowBytes_ = nullptr;
   bool bitmapRowsOwnMemory_ = false;
@@ -71,11 +86,40 @@ class GfxRenderer {
   // Sunlight fading fix — power off display after each refresh
   bool fadingFix_ = false;
 
+  // Text darkness: controls AA intensity for 2-bit font glyphs
+  // 0=Normal (true 4-level), 1=Dark, 2=Extra Dark, 3=Maximum (1-bit, no AA)
+  uint8_t textDarkness_ = 0;
+
   // Word width cache for performance optimization during EPUB section creation.
   // Key: FNV-1a hash of (fontId, text, style). Value: measured width in pixels.
   // Limited to MAX_WIDTH_CACHE_SIZE entries to prevent heap fragmentation.
+  //
+  // Value type was int16_t pre-Batch-7. A long Arabic ligature or a CJK
+  // string with extra-wide AA spacing can measure past 32767 pixels —
+  // the int16_t cast wrapped negative and the cache returned a phantom
+  // negative width that subsequent layout used as an offset, producing
+  // overlapping or off-screen text. int32_t fits any plausible
+  // pixel-width on this hardware (panel max ~800 px, cache holds whole
+  // rendered runs that can be many panels wide). 4-byte values vs 2-byte
+  // cost ~512 B at MAX_WIDTH_CACHE_SIZE=256; that's a worthy trade.
+  // Audit #34.
   static constexpr size_t MAX_WIDTH_CACHE_SIZE = 256;
-  mutable std::unordered_map<uint64_t, int16_t> wordWidthCache;
+  mutable std::unordered_map<uint64_t, int32_t> wordWidthCache;
+  // FIFO insertion order, used for eviction. When the map hits
+  // MAX_WIDTH_CACHE_SIZE the oldest entry (front of deque) is dropped
+  // — instead of the previous `cache.clear()` which trashed all 256
+  // entries on every overflow. EPUB layout regularly measures hundreds
+  // of unique words per page; the bulk-clear meant every page paid the
+  // full measurement cost. FIFO eviction keeps the most recent N
+  // entries warm and the typical hit rate climbs from ~0% to ~30-50%.
+  // Audit #42.
+  //
+  // We use FIFO rather than true LRU: a hit doesn't promote the entry
+  // to the back. The access pattern (a single layout pass walks ~50
+  // words once, then moves on) makes LRU promotion ~free in benefit
+  // for a measurable cost (deque-find on every hit). Pure FIFO is
+  // both cheaper and observationally similar.
+  mutable std::deque<uint64_t> wordWidthOrder;
 
   uint64_t makeWidthCacheKey(int fontId, const char* text, EpdFontFamily::Style style) const {
     // FNV-1a hash
@@ -101,6 +145,12 @@ class GfxRenderer {
   int getExternalGlyphWidth(uint32_t cp) const;
   void freeBwBufferChunks();
 
+  // Concurrency check helper. Logs (rate-limited) when a renderer method
+  // is entered from a task that is not the cacheTask while the cacheTask
+  // is registered as active. See `s_cacheTaskHandle_` above. No-op on
+  // host builds.
+  static void warnIfNonOwner(const char* methodName);
+
  public:
   explicit GfxRenderer(EInkDisplay& einkDisplay)
       : einkDisplay(einkDisplay), renderMode(BW), orientation(Portrait) {
@@ -113,11 +163,38 @@ class GfxRenderer {
   static constexpr int VIEWABLE_MARGIN_BOTTOM = 3;
   static constexpr int VIEWABLE_MARGIN_LEFT = 3;
 
+  // ── Single-task ownership tracking (CONCURRENCY.md C1) ────────────
+  //
+  // The renderer is owned by exactly one task at a time. By convention
+  // (verified at the audit-plan stage and now enforced here), main task
+  // calls `stopBackgroundCaching()` before invoking any renderer method
+  // that mutates shared state (wordWidthCache, framebuffer, etc.). The
+  // cacheTask is allowed to invoke renderer methods while it's running
+  // — it owns the renderer during that window.
+  //
+  // ReaderState publishes the cacheTask's TaskHandle into
+  // `s_cacheTaskHandle_` between `startBackgroundCaching()` and the
+  // matching `stopBackgroundCaching()`. The check at the entry of every
+  // mutating public method warns when a NON-cacheTask caller invokes
+  // a renderer method while the field is non-null — that's main task
+  // forgetting to stop the bg first, the bug pattern from audits #6/#7.
+  //
+  // Set to `nullptr` when no bg task is active; reads/writes are
+  // single-aligned-pointer and safe across the single-core ESP32-C3
+  // pipeline (CONCURRENCY.md C6). On host test builds the field is
+  // unused (no FreeRTOS tasks).
+#ifdef ARDUINO
+  static TaskHandle_t s_cacheTaskHandle_;
+#endif
+
   // Setup
   void begin();
   void insertFont(int fontId, EpdFontFamily font);
   void removeFont(int fontId);
-  void clearWidthCache() { std::unordered_map<uint64_t, int16_t>().swap(wordWidthCache); }
+  void clearWidthCache() {
+    std::unordered_map<uint64_t, int32_t>().swap(wordWidthCache);
+    std::deque<uint64_t>().swap(wordWidthOrder);
+  }
   void setExternalFont(ExternalFont* font) { _externalFont = font; }
   ExternalFont* getExternalFont() const { return _externalFont; }
 
@@ -180,6 +257,8 @@ class GfxRenderer {
   // e-ink fading in direct sunlight. Applied automatically to all displayBuffer
   // calls unless explicitly overridden by passing turnOffScreen=true/false.
   void setFadingFix(bool enabled) { fadingFix_ = enabled; }
+  void setTextDarkness(uint8_t level) { textDarkness_ = level; }
+  uint8_t getTextDarkness() const { return textDarkness_; }
   void clearArea(int x, int y, int width, int height, uint8_t color = 0xFF) const;
 
   // Drawing
@@ -234,7 +313,7 @@ class GfxRenderer {
 
   // Low level functions
   uint8_t* getFrameBuffer() const;
-  static size_t getBufferSize();
+  size_t getBufferSize() const;
   void grayscaleRevert() const;
   void getOrientedViewableTRBL(int* outTop, int* outRight, int* outBottom, int* outLeft) const;
 };

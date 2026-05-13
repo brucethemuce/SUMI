@@ -1,6 +1,7 @@
 #include "ThemeManager.h"
 
 #include <SDCardManager.h>
+#include <Utf8.h>
 
 #include <algorithm>
 #include <cstring>
@@ -13,7 +14,14 @@ ThemeManager& ThemeManager::instance() {
   return instance;
 }
 
-ThemeManager::ThemeManager() : activeTheme(BUILTIN_LIGHT_THEME) { strncpy(themeName, "light", sizeof(themeName)); }
+ThemeManager::ThemeManager() : activeTheme(BUILTIN_LIGHT_THEME) {
+  // strncpy with sizeof-1 + explicit NUL is the only safe pattern; the
+  // pre-Batch-9 version used `sizeof(themeName)` (no -1) which writes
+  // all N bytes and leaves no room for the terminator if a future
+  // contributor changes the literal to N or more chars.
+  strncpy(themeName, "light", sizeof(themeName) - 1);
+  themeName[sizeof(themeName) - 1] = '\0';
+}
 
 bool ThemeManager::loadTheme(const char* name) {
   if (!name || !*name) {
@@ -54,8 +62,9 @@ bool ThemeManager::loadFromFileToTheme(const char* path, Theme& theme) {
     // [theme] section - metadata
     if (strcmp(section, "theme") == 0) {
       if (strcmp(key, "name") == 0) {
-        strncpy(theme.displayName, value, sizeof(theme.displayName) - 1);
-        theme.displayName[sizeof(theme.displayName) - 1] = '\0';
+        // UTF-8 safe so a CJK theme display name isn't sliced in the
+        // settings selector.
+        utf8SafeCopy(theme.displayName, value, sizeof(theme.displayName));
       }
     }
     // [colors] section
@@ -199,7 +208,7 @@ bool ThemeManager::saveToFile(const char* path, const Theme& theme) {
   file.printf("reader_font_medium = %s\n", theme.readerFontFamilyMedium);
   file.printf("reader_font_large = %s\n", theme.readerFontFamilyLarge);
 
-  file.close();
+  SdMan.syncAndClose(file);
   return true;
 }
 

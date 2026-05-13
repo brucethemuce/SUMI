@@ -4,6 +4,7 @@
 #if FEATURE_BLUETOOTH
 
 #include <NimBLEDevice.h>
+#include <Utf8.h>
 
 // HID Service/Characteristic UUIDs
 static NimBLEUUID hidServiceUUID("1812");
@@ -640,7 +641,7 @@ class ScanCallbacks : public NimBLEScanCallbacks {
             if (strcmp(_scanDevices[i].addr, dev->getAddress().toString().c_str()) == 0) {
                 // Update name if we got it now (scan response)
                 if (hasName && _scanDevices[i].name[0] == '\0') {
-                    strncpy(_scanDevices[i].name, n, sizeof(_scanDevices[i].name) - 1);
+                    utf8SafeCopy(_scanDevices[i].name, n, sizeof(_scanDevices[i].name));
                 }
                 if (hasHID || hasNUS || knownPT) _scanDevices[i].hasHID = true;
                 return;
@@ -649,8 +650,8 @@ class ScanCallbacks : public NimBLEScanCallbacks {
 
         BleDevice& d = _scanDevices[_scanCount];
         memset(&d, 0, sizeof(d));
-        strncpy(d.name, n, sizeof(d.name) - 1);
-        strncpy(d.addr, dev->getAddress().toString().c_str(), sizeof(d.addr) - 1);
+        utf8SafeCopy(d.name, n, sizeof(d.name));
+        utf8SafeCopy(d.addr, dev->getAddress().toString().c_str(), sizeof(d.addr));
         d.rssi = dev->getRSSI();
         d.hasHID = hasHID || hasNUS || knownPT;
         _scanAdvDevs[_scanCount] = dev;
@@ -734,8 +735,8 @@ void startScan(int seconds) {
 
             BleDevice& d = _scanDevices[_scanCount];
             memset(&d, 0, sizeof(d));
-            strncpy(d.name, n, sizeof(d.name) - 1);
-            strncpy(d.addr, dev->getAddress().toString().c_str(), sizeof(d.addr) - 1);
+            utf8SafeCopy(d.name, n, sizeof(d.name));
+            utf8SafeCopy(d.addr, dev->getAddress().toString().c_str(), sizeof(d.addr));
             d.rssi = dev->getRSSI();
             d.hasHID = hasHID || hasNUS || knownPT;
             _scanAdvDevs[_scanCount] = dev;
@@ -756,7 +757,7 @@ void startScan(int seconds) {
             memset(&d, 0, sizeof(d));
             snprintf(d.name, sizeof(d.name), "Device %s",
                      dev->getAddress().toString().c_str() + 12);
-            strncpy(d.addr, dev->getAddress().toString().c_str(), sizeof(d.addr) - 1);
+            utf8SafeCopy(d.addr, dev->getAddress().toString().c_str(), sizeof(d.addr));
             d.rssi = dev->getRSSI();
             d.hasHID = false;
             _scanAdvDevs[_scanCount] = dev;
@@ -787,7 +788,7 @@ bool connectTo(int index) {
     if (index < 0 || index >= _scanCount) return false;
     if (_connected) disconnect();
 
-    strncpy(_deviceName, _scanDevices[index].name, sizeof(_deviceName) - 1);
+    utf8SafeCopy(_deviceName, _scanDevices[index].name, sizeof(_deviceName));
     Serial.printf("[BLE] Connecting to [%d] \"%s\" (%s)\n",
                   index, _deviceName, _scanDevices[index].addr);
 
@@ -819,8 +820,8 @@ bool reconnect(const char* addr) {
         const NimBLEAdvertisedDevice* dev = results.getDevice(i);
         if (strcmp(dev->getAddress().toString().c_str(), addr) == 0) {
             std::string nameStr = dev->getName();
-            strncpy(_deviceName, nameStr.c_str(), sizeof(_deviceName) - 1);
-            if (_deviceName[0] == '\0') strncpy(_deviceName, "Saved Device", sizeof(_deviceName) - 1);
+            utf8SafeCopy(_deviceName, nameStr.c_str(), sizeof(_deviceName));
+            if (_deviceName[0] == '\0') utf8SafeCopy(_deviceName, "Saved Device", sizeof(_deviceName));
             return doConnect(dev);
         }
     }

@@ -18,6 +18,7 @@ const int InputManager::ADC_RANGES_1[] = {ADC_NO_BUTTON, 3100, 2090, 750, INT32_
 const int InputManager::ADC_RANGES_2[] = {ADC_NO_BUTTON, 1120, INT32_MIN};
 const char* InputManager::BUTTON_NAMES[] = {"Back", "Confirm", "Left", "Right", "Up", "Down", "Power"};
 
+
 InputManager::InputManager()
     : currentState(0),
       lastState(0),
@@ -61,9 +62,24 @@ uint8_t InputManager::getState() {
     state |= (1 << (button2 + 4));
   }
 
-  // Read power button (digital, active LOW)
-  if (digitalRead(POWER_BUTTON_PIN) == LOW) {
+  // Read power button (digital, active LOW). Cache the read so the
+  // diagnostic log below sees the same value the state computation did
+  // — a re-read 100µs later can disagree, leading to confusing log
+  // lines like "state without BTN_POWER, pwr=0" (audit #44).
+  const int powerPin = digitalRead(POWER_BUTTON_PIN);
+  if (powerPin == LOW) {
     state |= (1 << BTN_POWER);
+  }
+
+  // Diagnostic: log ADC readings on state change so we can debug the
+  // ladder if a button isn't detected. Real hardware doesn't emit
+  // [BTN] events, so this is the only visibility into what the
+  // physical switches look like to the firmware.
+  static uint8_t lastLoggedState = 0xFF;
+  if (state != lastLoggedState) {
+    lastLoggedState = state;
+    if (Serial) Serial.printf("[HW-BTN] state=0x%02x adc1=%d adc2=%d pwr=%d\n",
+                              state, adcValue1, adcValue2, powerPin);
   }
 
   return state;
@@ -120,6 +136,14 @@ unsigned long InputManager::getHeldTime() const {
     return millis() - buttonPressStart;
   }
 
+  // For chord releases (e.g. press Back, press Up, release Back, release
+  // Up), buttonPressStart reflects the FIRST press in the chord and
+  // buttonPressFinish reflects the LAST release. The returned duration
+  // is therefore "first-press to last-release", not "duration of any
+  // single button". For Back+Up screenshots both buttons happen to be
+  // checked while held so this works, but callers expecting "duration
+  // of the most recent button gesture" will be surprised by chord
+  // gestures. Audit #43.
   return buttonPressFinish - buttonPressStart;
 }
 

@@ -25,14 +25,19 @@ struct Settings {
 };
 }  // namespace sumi
 
-// Inline button mapping logic from MappedInputManager
-enum class Button { Back, Confirm, Left, Right, Up, Down, Power, PageBack, PageForward };
+// Inline button mapping logic from MappedInputManager. Must stay in sync
+// with src/MappedInputManager.cpp — if you update one, update the other.
+//
+// The sideButtonLayout swap used to live here for Button::Up/Down and
+// the now-dead Button::PageBack/PageForward. That was moved into
+// ReaderState (reader-only page flipping) so that menus, TOC, and
+// in-reader settings always get a 1:1 Up/Down dispatch regardless of
+// the user's preferred reader page-turn direction.
+enum class Button { Back, Confirm, Left, Right, Up, Down, Power };
 
 int mapButton(Button button, sumi::Settings* settings) {
   const auto frontLayout = settings ? static_cast<sumi::Settings::FrontButtonLayout>(settings->frontButtonLayout)
                                     : sumi::Settings::FrontBCLR;
-  const auto sideLayout = settings ? static_cast<sumi::Settings::SideButtonLayout>(settings->sideButtonLayout)
-                                   : sumi::Settings::PrevNext;
 
   switch (button) {
     case Button::Back:
@@ -68,39 +73,11 @@ int mapButton(Button button, sumi::Settings* settings) {
           return InputManager::BTN_RIGHT;
       }
     case Button::Up:
-      switch (sideLayout) {
-        case sumi::Settings::NextPrev:
-          return InputManager::BTN_DOWN;
-        case sumi::Settings::PrevNext:
-        default:
-          return InputManager::BTN_UP;
-      }
+      return InputManager::BTN_UP;
     case Button::Down:
-      switch (sideLayout) {
-        case sumi::Settings::NextPrev:
-          return InputManager::BTN_UP;
-        case sumi::Settings::PrevNext:
-        default:
-          return InputManager::BTN_DOWN;
-      }
+      return InputManager::BTN_DOWN;
     case Button::Power:
       return InputManager::BTN_POWER;
-    case Button::PageBack:
-      switch (sideLayout) {
-        case sumi::Settings::NextPrev:
-          return InputManager::BTN_DOWN;
-        case sumi::Settings::PrevNext:
-        default:
-          return InputManager::BTN_UP;
-      }
-    case Button::PageForward:
-      switch (sideLayout) {
-        case sumi::Settings::NextPrev:
-          return InputManager::BTN_UP;
-        case sumi::Settings::PrevNext:
-        default:
-          return InputManager::BTN_DOWN;
-      }
   }
   return InputManager::BTN_BACK;
 }
@@ -130,24 +107,22 @@ int main() {
     runner.expectEq(InputManager::BTN_CONFIRM, mapButton(Button::Right, &settings), "LRBC: Right -> BTN_CONFIRM");
   }
 
-  // === Side button mapping: PrevNext (default) ===
+  // === Menu Up/Down are 1:1 regardless of sideButtonLayout ===
+  // Reader page-turn direction is now handled inside ReaderState itself
+  // (see lib/test handled separately); MappedInputManager no longer swaps.
   {
     sumi::Settings settings;
     settings.sideButtonLayout = sumi::Settings::PrevNext;
-
-    runner.expectEq(InputManager::BTN_UP, mapButton(Button::PageBack, &settings), "PrevNext: PageBack -> BTN_UP");
-    runner.expectEq(InputManager::BTN_DOWN, mapButton(Button::PageForward, &settings),
-                    "PrevNext: PageForward -> BTN_DOWN");
+    runner.expectEq(InputManager::BTN_UP, mapButton(Button::Up, &settings), "PrevNext: Up -> BTN_UP");
+    runner.expectEq(InputManager::BTN_DOWN, mapButton(Button::Down, &settings), "PrevNext: Down -> BTN_DOWN");
   }
-
-  // === Side button mapping: NextPrev (swapped) ===
   {
     sumi::Settings settings;
     settings.sideButtonLayout = sumi::Settings::NextPrev;
-
-    runner.expectEq(InputManager::BTN_DOWN, mapButton(Button::PageBack, &settings), "NextPrev: PageBack -> BTN_DOWN");
-    runner.expectEq(InputManager::BTN_UP, mapButton(Button::PageForward, &settings),
-                    "NextPrev: PageForward -> BTN_UP");
+    runner.expectEq(InputManager::BTN_UP, mapButton(Button::Up, &settings),
+                    "NextPrev: Up still -> BTN_UP (menus never swap)");
+    runner.expectEq(InputManager::BTN_DOWN, mapButton(Button::Down, &settings),
+                    "NextPrev: Down still -> BTN_DOWN (menus never swap)");
   }
 
   // === Combined: LRBC front + NextPrev side ===
@@ -157,25 +132,8 @@ int main() {
     settings.sideButtonLayout = sumi::Settings::NextPrev;
 
     runner.expectEq(InputManager::BTN_LEFT, mapButton(Button::Back, &settings), "Combined: Back -> BTN_LEFT");
-    runner.expectEq(InputManager::BTN_DOWN, mapButton(Button::PageBack, &settings),
-                    "Combined: PageBack -> BTN_DOWN");
-  }
-
-  // === Up/Down remapped by sideLayout ===
-  {
-    sumi::Settings settings;
-    settings.sideButtonLayout = sumi::Settings::PrevNext;
-
-    runner.expectEq(InputManager::BTN_UP, mapButton(Button::Up, &settings), "PrevNext: Up -> BTN_UP");
-    runner.expectEq(InputManager::BTN_DOWN, mapButton(Button::Down, &settings), "PrevNext: Down -> BTN_DOWN");
-  }
-
-  {
-    sumi::Settings settings;
-    settings.sideButtonLayout = sumi::Settings::NextPrev;
-
-    runner.expectEq(InputManager::BTN_DOWN, mapButton(Button::Up, &settings), "NextPrev: Up -> BTN_DOWN");
-    runner.expectEq(InputManager::BTN_UP, mapButton(Button::Down, &settings), "NextPrev: Down -> BTN_UP");
+    runner.expectEq(InputManager::BTN_UP, mapButton(Button::Up, &settings),
+                    "Combined: Up still -> BTN_UP (sideLayout no longer swaps menu)");
   }
 
   // === Non-remapped buttons are unaffected ===
@@ -187,16 +145,13 @@ int main() {
     runner.expectEq(InputManager::BTN_POWER, mapButton(Button::Power, &settings), "Power always -> BTN_POWER");
   }
 
-  // === nullptr settings defaults to BCLR/PrevNext ===
+  // === nullptr settings defaults to BCLR front + 1:1 side mapping ===
   {
     runner.expectEq(InputManager::BTN_BACK, mapButton(Button::Back, nullptr), "nullptr: Back -> BTN_BACK");
     runner.expectEq(InputManager::BTN_CONFIRM, mapButton(Button::Confirm, nullptr),
                     "nullptr: Confirm -> BTN_CONFIRM");
     runner.expectEq(InputManager::BTN_UP, mapButton(Button::Up, nullptr), "nullptr: Up -> BTN_UP");
     runner.expectEq(InputManager::BTN_DOWN, mapButton(Button::Down, nullptr), "nullptr: Down -> BTN_DOWN");
-    runner.expectEq(InputManager::BTN_UP, mapButton(Button::PageBack, nullptr), "nullptr: PageBack -> BTN_UP");
-    runner.expectEq(InputManager::BTN_DOWN, mapButton(Button::PageForward, nullptr),
-                    "nullptr: PageForward -> BTN_DOWN");
   }
 
   runner.printSummary();

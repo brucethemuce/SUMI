@@ -112,7 +112,21 @@ FontManager::LoadedFont FontManager::loadSingleFont(const char* path) {
   result.bitmap = loaded.bitmap;
   result.glyphs = loaded.glyphs;
   result.intervals = loaded.intervals;
-  result.font = new EpdFont(result.data);
+  // -fno-exceptions means a failing `new` aborts the process. Use
+  // std::nothrow + null check so a heap-exhaustion font load fails
+  // gracefully (matches the streaming variant on line 74). Without
+  // this the device hard-aborted on low-heap font loads — recoverable
+  // via boot-loop guard but the user lost their reading session.
+  result.font = new (std::nothrow) EpdFont(result.data);
+  if (!result.font) {
+    Serial.printf("[FONT] EpdFont alloc failed for %s\n", path);
+    delete result.data;
+    delete[] result.bitmap;
+    delete[] result.glyphs;
+    delete[] result.intervals;
+    LoadedFont empty = {};
+    return empty;
+  }
 
   // Store sizes for memory profiling
   result.bitmapSize = loaded.bitmapSize;
@@ -354,9 +368,14 @@ bool FontManager::loadExternalFont(const char* filename) {
   char path[80];
   snprintf(path, sizeof(path), "%s/%s", CONFIG_FONTS_DIR, filename);
 
-  // Allocate if needed
+  // Allocate if needed. nothrow keeps a heap-exhausted external font
+  // load from aborting the device (see loadSingleFont above).
   if (!_externalFont) {
-    _externalFont = new ExternalFont();
+    _externalFont = new (std::nothrow) ExternalFont();
+    if (!_externalFont) {
+      Serial.printf("[FONT] ExternalFont alloc failed for %s\n", path);
+      return false;
+    }
   }
 
   if (!_externalFont->load(path)) {
@@ -394,8 +413,18 @@ void FontManager::unloadReaderFonts() {
     _activeReaderFontId = 0;
   }
 
-  // Unload external CJK font
-  unloadExternalFont();
+  // IMPORTANT: we do NOT unload the external CJK font here. User feedback
+  // ("CJK fonts that were converted using sumi.page/ are not working ...
+  //   with flash cards or a converted epub") revealed that flashcards
+  // and other plugins rely on the same external-font fallback path, but
+  // only the Reader ever loaded one. Exiting the Reader used to throw it
+  // away, leaving the rest of the app without CJK glyphs. Keeping the
+  // external font alive beyond Reader exit costs ~13 KB of RAM (one 64
+  // entry cache) but gives every state CJK fallback for free.
+  //
+  // Callers that explicitly want to unload the external font — e.g.
+  // switching to a completely non-CJK book — should call
+  // unloadExternalFont() directly.
 }
 
 size_t FontManager::getCustomFontMemoryUsage() const {

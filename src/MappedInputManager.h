@@ -8,7 +8,7 @@ struct Settings;
 
 class MappedInputManager {
  public:
-  enum class Button { Back, Confirm, Left, Right, Up, Down, Power, PageBack, PageForward };
+  enum class Button { Back, Confirm, Left, Right, Up, Down, Power };
 
   explicit MappedInputManager(InputManager& inputManager) : inputManager(inputManager), settings_(nullptr) {}
 

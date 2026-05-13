@@ -47,6 +47,14 @@ void Input::poll() {
   checkButton(Button::Center, 1 << 4);
   checkButton(Button::Back, 1 << 5);
   checkButton(Button::Power, 1 << 6);
+
+  // Diagnostic: log state changes so we can see what the ADC ladder is
+  // reading on real hardware (where [BTN] logs don't fire). Only
+  // logs on transitions so a held button doesn't spam the serial.
+  if (currButtonState_ != prevButtonState_ && Serial) {
+    Serial.printf("[INPUT] state: 0x%02x -> 0x%02x\n",
+                  prevButtonState_, currButtonState_);
+  }
 }
 
 void Input::checkButton(Button btn, uint8_t mask) {
@@ -114,6 +122,8 @@ void Input::checkButton(Button btn, uint8_t mask) {
 }
 
 uint32_t Input::idleTimeMs() const { return millis() - lastActivityMs_; }
+
+void Input::markActivity() { lastActivityMs_ = millis(); }
 
 bool Input::isPressed(Button btn) const {
   MappedInputManager::Button mappedBtn;

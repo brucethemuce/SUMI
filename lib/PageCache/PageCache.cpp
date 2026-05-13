@@ -98,6 +98,24 @@ bool PageCache::loadLut(std::vector<uint32_t>& lut) {
   file_.seek(HEADER_SIZE - 4 - 1 - 2);
   serialization::readPod(file_, pageCount_);
 
+  // Sanity-check pageCount before reserving. uint16_t max is 65535 which
+  // would reserve 256 KB for the LUT alone — enough to OOM on the
+  // ESP32-C3's 380 KB heap if the cache header is corrupted.
+  // A real book never has more than a few thousand pages per section.
+  constexpr uint16_t kMaxReasonablePageCount = 8192;
+  if (pageCount_ > kMaxReasonablePageCount) {
+    Serial.printf("[CACHE] Implausible pageCount %u, discarding cache\n", pageCount_);
+    file_.close();
+    return false;
+  }
+  // Also ensure the LUT fits inside the file — a truncated file would
+  // otherwise trigger (pageCount_ * 4) reads past EOF.
+  if (lutOffset_ + static_cast<size_t>(pageCount_) * 4 > fileSize) {
+    Serial.printf("[CACHE] LUT extends past EOF (count=%u), discarding cache\n", pageCount_);
+    file_.close();
+    return false;
+  }
+
   // Read existing LUT entries
   file_.seek(lutOffset_);
   lut.reserve(pageCount_);
@@ -146,6 +164,13 @@ bool PageCache::load(const RenderConfig& config) {
   }
 
   serialization::readPod(file_, pageCount_);
+  // Same plausibility cap as loadLut(): reject a wildly out-of-range count.
+  if (pageCount_ > 8192) {
+    Serial.printf("[CACHE] Implausible pageCount %u in load(), discarding cache\n", pageCount_);
+    file_.close();
+    clear();
+    return false;
+  }
   uint8_t partial;
   serialization::readPod(file_, partial);
   isPartial_ = (partial != 0);
@@ -236,8 +261,7 @@ bool PageCache::create(ContentParser& parser, const RenderConfig& config, uint16
   }
 
   if ((!success && pageCount_ == 0) || aborted) {
-    file_.close();
-    // Remove file to prevent corrupt/incomplete cache
+    file_.close();  // discarding — no sync needed
     SdMan.remove(cachePath_.c_str());
     Serial.printf("[CACHE] Parsing failed or aborted with %d pages\n", pageCount_);
     return false;
@@ -251,7 +275,13 @@ bool PageCache::create(ContentParser& parser, const RenderConfig& config, uint16
     return false;
   }
 
-  file_.close();
+  // syncAndClose: PageCache files are the largest writers in the firmware
+  // (a full EPUB can produce a multi-MB cache spanning thousands of
+  // sectors). SdFat's close() alone has been observed to drop the last
+  // few sectors on the emulator's virtual SD and is a data-loss risk under real
+  // power-off on hardware SD cards too. sync() forces all dirty blocks
+  // (including the header we just wrote via writeLut) to land.
+  SdMan.syncAndClose(file_);
   Serial.printf("[CACHE] Created in %lu ms: %d pages, partial=%d\n", millis() - startMs, pageCount_, isPartial_);
   return true;
 }
@@ -311,7 +341,10 @@ bool PageCache::extend(ContentParser& parser, uint16_t additionalPages, const Ab
       return false;
     }
 
-    file_.close();
+    // syncAndClose — see create() above. The hot extend path appends
+    // new pages AND rewrites the LUT/header, so all three writes need
+    // to land on disk before we say "done".
+    SdMan.syncAndClose(file_);
     Serial.printf("[CACHE] Hot extend done: %d pages, partial=%d\n", pageCount_, isPartial_);
     return true;
   }
@@ -323,11 +356,22 @@ bool PageCache::extend(ContentParser& parser, uint16_t additionalPages, const Ab
   parser.reset();
   bool result = create(parser, config_, targetPages, currentPages, shouldAbort);
 
-  // No forward progress AND parser has no more content → content is truly finished.
-  // Without the hasMoreContent() check, an aborted extend (timeout/memory pressure)
-  // would permanently mark the chapter as complete, truncating it.
-  if (result && pageCount_ <= currentPages && !parser.hasMoreContent()) {
-    Serial.printf("[CACHE] No progress during extend (%d pages), marking complete\n", pageCount_);
+  // No forward progress: either the parser truly finished the chapter,
+  // or it bailed early (heap pressure, timeout, etc.). In both cases we
+  // mark the cache complete IN MEMORY ONLY for this session — that's
+  // enough for navigation to advance to the next spine on a forward
+  // press instead of looping on a doomed re-extend.
+  //
+  // We do NOT persist this to disk: create() already wrote the on-disk
+  // header with isPartial_ = parser.hasMoreContent() (true if bailed).
+  // So next session reload reads partial=true and gets a fresh chance
+  // to extend under different heap conditions (e.g. BLE off, more
+  // memory available). The session-local lie unblocks the user
+  // without permanently truncating the chapter.
+  if (result && pageCount_ <= currentPages) {
+    Serial.printf("[CACHE] No progress during extend (%d pages), marking session-complete "
+                  "(parser hasMoreContent=%d; on-disk header unchanged)\n",
+                  pageCount_, parser.hasMoreContent() ? 1 : 0);
     isPartial_ = false;
   }
 

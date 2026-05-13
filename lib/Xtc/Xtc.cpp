@@ -14,8 +14,14 @@
 bool Xtc::load() {
   Serial.printf("[%lu] [XTC] Loading XTC: %s\n", millis(), filepath.c_str());
 
-  // Initialize parser
-  parser.reset(new xtc::XtcParser());
+  // Initialize parser. nothrow: under -fno-exceptions a failing `new`
+  // would abort the device when the user opens an XTC book on tight
+  // heap. Null return is handled here as a load failure.
+  parser.reset(new (std::nothrow) xtc::XtcParser());
+  if (!parser) {
+    Serial.printf("[%lu] [XTC] XtcParser alloc failed\n", millis());
+    return false;
+  }
 
   // Open XTC file
   xtc::XtcError err = parser->open(filepath.c_str());
@@ -302,7 +308,7 @@ bool Xtc::generateCoverBmp() const {
     }
   }
 
-  coverBmp.close();
+  SdMan.syncAndClose(coverBmp);  // multi-KB BMP — sync before close
   free(pageBuffer);
 
   Serial.printf("[%lu] [XTC] Generated cover BMP: %s\n", millis(), getCoverBmpPath().c_str());
