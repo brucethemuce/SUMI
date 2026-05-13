@@ -27,7 +27,11 @@ constexpr uint8_t CACHE_FILE_VERSION = 20;  // v20: persist showTables (operator
 // - pageCount (2 bytes)
 // - isPartial (1 byte)
 // - lutOffset (4 bytes)
-constexpr uint32_t HEADER_SIZE = 1 + 4 + 4 + 1 + 1 + 1 + 1 + 1 + 1 + 2 + 2 + 2 + 1 + 4;
+// version(1) + fontId(4) + lineCompression(4) + indentLevel(1) + spacingLevel(1)
+//   + paragraphAlignment(1) + hyphenation(1) + showImages(1) + showTables(1)
+//   + allowTallImages(1) + viewportWidth(2) + viewportHeight(2)
+//   + pageCount(2) + isPartial(1) + lutOffset(4)  = 27
+constexpr uint32_t HEADER_SIZE = 1 + 4 + 4 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 2 + 2 + 2 + 1 + 4;
 }  // namespace
 
 PageCache::PageCache(std::string cachePath) : cachePath_(std::move(cachePath)) {}

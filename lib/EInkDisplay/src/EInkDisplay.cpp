@@ -330,7 +330,18 @@ void EInkDisplay::begin() {
   pinMode(_cs, OUTPUT);
   pinMode(_dc, OUTPUT);
   pinMode(_rst, OUTPUT);
+#ifdef SUMI_WOKWI
+  // Wokwi-specific: GPIO 6 is shared between EPD_BUSY and the Power button
+  // on the virtual device because there aren't enough free GPIOs on the
+  // ESP32-C3 DevKitM-1. Without pull-up, the "floating" BUSY pin reads LOW
+  // whenever the simulator isn't driving it, and InputManager interprets
+  // that as a Power-button long-press — triggering sleep mid-test after
+  // ~10 seconds. INPUT_PULLUP keeps the pin sane and costs nothing on real
+  // hardware (guarded by the Wokwi flag).
+  pinMode(_busy, INPUT_PULLUP);
+#else
   pinMode(_busy, INPUT);
+#endif
 
   digitalWrite(_cs, HIGH);
   digitalWrite(_dc, HIGH);
@@ -400,6 +411,12 @@ void EInkDisplay::sendData(const uint8_t* data, uint16_t length) {
 }
 
 void EInkDisplay::waitWhileBusy(const char* comment) {
+#ifdef SUMI_WOKWI
+  // No physical SSD1677 in the emulator — BUSY pin is not real. Pretend the
+  // display is always ready immediately.
+  (void)comment;
+  return;
+#else
   unsigned long start = millis();
   if (!_x3Mode) {
     // X4: BUSY is HIGH while busy, LOW when ready.
@@ -434,6 +451,7 @@ void EInkDisplay::waitWhileBusy(const char* comment) {
   if (comment) {
     if (Serial) Serial.printf("[%lu]   Wait complete: %s (%lu ms)\n", millis(), comment, millis() - start);
   }
+#endif
 }
 
 void EInkDisplay::initDisplayController() {
@@ -696,8 +714,42 @@ void EInkDisplay::cleanupGrayscaleBuffers(const uint8_t* bwBuffer) {
 }
 #endif
 
+#ifdef SUMI_WOKWI
+// Dump the current framebuffer to serial as a hex blob framed with
+// [FB-BEGIN size] ... hex ... [FB-END]. Python-side tools/wokwi/fb_to_png.py
+// parses these out of wokwi-full.log and writes PNG files. Rate-limited to
+// once every DUMP_INTERVAL_MS to avoid flooding the log.
+static void dumpFramebufferToSerial(const uint8_t* buf, uint32_t size) {
+  static uint32_t lastDumpMs = 0;
+  static uint32_t dumpCounter = 0;
+  const uint32_t now = millis();
+  // Always dump at boot; afterwards at most every 250 ms
+  if (lastDumpMs != 0 && (now - lastDumpMs) < 250) return;
+  lastDumpMs = now;
+
+  if (!Serial) return;
+  Serial.printf("[FB-BEGIN %u size %u]\n", dumpCounter++, size);
+  // Hex-encode; newlines every 64 bytes to keep lines manageable.
+  char line[129];
+  static const char hexChars[] = "0123456789abcdef";
+  for (uint32_t i = 0; i < size; i++) {
+    uint8_t b = buf[i];
+    uint32_t pos = (i & 63) * 2;
+    line[pos    ] = hexChars[b >> 4];
+    line[pos + 1] = hexChars[b & 0x0f];
+    if ((i & 63) == 63 || i == size - 1) {
+      line[pos + 2] = '\0';
+      Serial.println(line);
+    }
+  }
+  Serial.println("[FB-END]");
+}
+#endif
 
 void EInkDisplay::displayBuffer(RefreshMode mode, bool turnOffScreen) {
+#ifdef SUMI_WOKWI
+  dumpFramebufferToSerial(frameBuffer, bufferSize);
+#endif
   if (!isScreenOn && mode == FAST_REFRESH) {
     // Force half refresh if screen is off - FAST_REFRESH requires valid
     // previous frame data in RED RAM which may be stale after power-off

@@ -2,6 +2,18 @@
 
 Built on [Papyrix](https://github.com/pliashkou/papyrix) by Pavel Liashkov (@bigbag), itself based on CrossPoint Reader by Dave Allie.
 
+## [0.6.1] — May 2026
+
+Two-fix hotfix on top of 0.6.0.
+
+**Books no longer reset to page 5 on every wake** — two coupled bugs in `PageCache`:
+1. `RenderConfig::operator==` compared `showTables` but `PageCache::writeHeader` / `PageCache::load` never wrote or read it. The deserialized `fileConfig.showTables` always read back as its default (`true`), so any user with `settings.showTables = false` (Settings → Display → Show Tables off) hit a permanent config-mismatch on every cache load.
+2. Fixing (1) by serializing `showTables` between `showImages` and `allowTallImages` revealed a second bug: `HEADER_SIZE` was calculated by summing the per-field sizes, and adding the new byte without updating that constant put `writeLut`'s `pageCount` write one byte too early — clobbering the high byte of `viewportHeight` on disk. On reload, `viewportHeight` read back wrong (low byte intact, high byte = pageCount-low-byte ≈ 10) and `Config mismatch` fired for every user, not just those with Show Tables off.
+
+The visible effect of both was identical: `[CACHE] Config mismatch, invalidating cache` → section file deleted → fresh 5-page parse → reader clamped to the last cached page → user landed on "page 5" on every wake. Fix: serialize `showTables`; bump `HEADER_SIZE` 26 → 27; bump `CACHE_FILE_VERSION` 19 → 20 so existing caches do one clean rebuild on first wake post-upgrade. Reported by AbuMaia01 on 0.5.x; root cause caught with per-field diagnostic instrumentation that pinpointed the byte-offset corruption.
+
+**Comic page washout fix** — 0.6.0's source-cleanup pass over-stripped `lib/EInkDisplay/src/EInkDisplay.cpp`, removing code paths that affected the grayscale render on real hardware. Visible symptom: comic pages rendered crisp for ~1 second then washed out to a grey haze (the v0.5.0 grayscale-washout bug re-introduced). EInkDisplay.cpp reverted to its 0.5.1 / 0.6.0-original state; comic rendering is back to smooth.
+
 ## [0.6.0-ramfix] — May 2026
 
 The memory-rework release. The 0.5.1 firmware shipped a working reader for everyone with modest books, but heavy chapters + Bluetooth page-turners exposed a hard memory ceiling: the EPUB parser would either crash or get permanently stuck mid-book when NimBLE's ~48 KB resident allocation collided with chapter-parse heap demand. This release rebuilds the memory model from the bottom up — single-block linker-placed arena, glyph cache trimmed, dead allocation paths removed — then layers on surgical fixes to the reader's hot paths so BLE-active reading stays stable across long chapters. Ships a new on-device EPUB indexer that pre-builds every chapter's page cache for guaranteed instant loads (no parser at read-time), a multi-dictionary union lookup so installed dictionaries are searched in parallel, a format-aware in-reader settings overlay, and the largest audit pass to date (batches 1-10, ~70 hardening items landed).
