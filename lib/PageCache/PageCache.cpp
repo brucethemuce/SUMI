@@ -10,7 +10,7 @@
 #include <esp_heap_caps.h>
 
 namespace {
-constexpr uint8_t CACHE_FILE_VERSION = 19;  // v19: add allowTallImages for landscape scroll
+constexpr uint8_t CACHE_FILE_VERSION = 20;  // v20: persist showTables (operator== compared it but neither side wrote/read it, causing Config mismatch on every wake for users with showTables=false)
 
 // Header layout:
 // - version (1 byte)
@@ -42,6 +42,7 @@ bool PageCache::writeHeader(bool isPartial) {
   serialization::writePod(file_, config_.paragraphAlignment);
   serialization::writePod(file_, config_.hyphenation);
   serialization::writePod(file_, config_.showImages);
+  serialization::writePod(file_, config_.showTables);
   serialization::writePod(file_, config_.allowTallImages);
   serialization::writePod(file_, config_.viewportWidth);
   serialization::writePod(file_, config_.viewportHeight);
@@ -152,6 +153,7 @@ bool PageCache::load(const RenderConfig& config) {
   serialization::readPod(file_, fileConfig.paragraphAlignment);
   serialization::readPod(file_, fileConfig.hyphenation);
   serialization::readPod(file_, fileConfig.showImages);
+  serialization::readPod(file_, fileConfig.showTables);
   serialization::readPod(file_, fileConfig.allowTallImages);
   serialization::readPod(file_, fileConfig.viewportWidth);
   serialization::readPod(file_, fileConfig.viewportHeight);
@@ -278,7 +280,7 @@ bool PageCache::create(ContentParser& parser, const RenderConfig& config, uint16
   // syncAndClose: PageCache files are the largest writers in the firmware
   // (a full EPUB can produce a multi-MB cache spanning thousands of
   // sectors). SdFat's close() alone has been observed to drop the last
-  // few sectors on the emulator's virtual SD and is a data-loss risk under real
+  // few sectors on Wokwi's virtual SD and is a data-loss risk under real
   // power-off on hardware SD cards too. sync() forces all dirty blocks
   // (including the header we just wrote via writeLut) to land.
   SdMan.syncAndClose(file_);
