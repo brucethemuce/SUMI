@@ -1041,8 +1041,26 @@ void GfxRenderer::renderExternalGlyph(const uint32_t cp, int* x, const int y, co
   const int screenHeight = getScreenHeight();
   const int screenWidth = getScreenWidth();
 
+  // Align the .bin glyph to the line's baseline (passed in as `y`).
+  // .bin fonts have no explicit baseline metadata; the SUMI/CrossPoint
+  // filename convention is `Name_size_WxH.bin` where `size` is the font's
+  // ascent (cap height in pixels) and `H` is the total bitmap height with
+  // padding for descender / accent area. So the glyph's top row sits at
+  // `y - ascent` and the bitmap continues `H` pixels below, with the
+  // baseline naturally landing at row `ascent`. Pre-0.6.3 we drew the
+  // glyph at `y + glyphY`, which planted the whole thing below the
+  // baseline — visually CJK characters sank well under any neighbouring
+  // Latin glyphs from the main font (yyowls's mixed-content screenshots).
+  //
+  // If the filename didn't parse a font size, fall back to assuming the
+  // baseline is at the bitmap's bottom (the safer default — glyph at
+  // worst sits a bit too high, which is still readable, vs. all-below
+  // which produces obvious misalignment).
+  const int ascent = _externalFont->getFontSize() > 0 ? _externalFont->getFontSize() : h;
+  const int glyphTopY = y - ascent;
+
   for (int glyphY = 0; glyphY < h; glyphY++) {
-    const int screenY = y + glyphY;
+    const int screenY = glyphTopY + glyphY;
     if (screenY < 0 || screenY >= screenHeight) continue;
 
     for (int glyphX = minX; glyphX < w; glyphX++) {

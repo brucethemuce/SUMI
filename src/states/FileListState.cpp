@@ -564,16 +564,22 @@ StateTransition FileListState::update(Core& core) {
               }
               break;
             case Button::Right:
-              // Straight to delete-confirm (pre-0.6.0 behavior). The
-              // file-action popup that briefly hosted "Index for faster
-              // reading" was retired in 0.6.2 — on-device cold-extend
-              // indexing was too inconsistent on long books under heap
-              // pressure (Issue #23), and the right path is to pre-build
-              // the cache off-device via sumi.page/process. The popup
-              // code (promptFileAction / FileActionMenuView / Screen::
-              // FileAction handler) is intentionally left in place but
-              // unreachable from UI; a follow-up sweep can remove it.
-              promptDelete(core);
+              // Right-press = delete confirm, but ONLY for files. Folders
+              // are off-limits: at root level every entry is a folder
+              // (/books, /comics, /custom, /config, etc.) and a stray
+              // right-press there would offer to nuke the entire books
+              // library or the dictionary directory. Inside a subfolder
+              // we still keep folders un-deletable for the same reason —
+              // accidental directory rm is the wrong default. If the
+              // current selection is a folder, this button does nothing;
+              // the user can still navigate with Center or Back.
+              //
+              // The 0.6.0 file-action popup ("Index for faster reading")
+              // was retired in 0.6.2; the popup-handling code stays
+              // compiled but unreachable. A follow-up sweep can remove it.
+              if (selectedIndex_ < files_.size() && !files_[selectedIndex_].isDir) {
+                promptDelete(core);
+              }
               break;
             case Button::Center:
               openSelected(core);

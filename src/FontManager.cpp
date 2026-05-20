@@ -25,6 +25,8 @@ void FontManager::init(GfxRenderer& r) { renderer = &r; }
 
 bool FontManager::loadFontFamily(const char* familyName, int fontId) {
   if (!renderer || !familyName || !*familyName) {
+    Serial.printf("[FONT-DIAG] loadFontFamily bailed: renderer=%p familyName=%s\n",
+                  renderer, familyName ? familyName : "(null)");
     return false;
   }
 
@@ -32,8 +34,11 @@ bool FontManager::loadFontFamily(const char* familyName, int fontId) {
   char basePath[64];
   snprintf(basePath, sizeof(basePath), "%s/%s", CONFIG_FONTS_DIR, familyName);
 
+  Serial.printf("[FONT-DIAG] loadFontFamily('%s', %d): checking %s\n", familyName, fontId, basePath);
+
   // Check if directory exists
   if (!SdMan.exists(basePath)) {
+    Serial.printf("[FONT-DIAG] family dir missing: %s\n", basePath);
     return false;
   }
 
@@ -52,6 +57,7 @@ bool FontManager::loadFontFamily(const char* familyName, int fontId) {
 
     if (!SdMan.exists(fontPath)) {
       if (s.style == EpdFontFamily::REGULAR) {
+        Serial.printf("[FONT-DIAG] regular.epdfont missing: %s\n", fontPath);
         return false;  // Regular is required
       }
       continue;
@@ -63,11 +69,14 @@ bool FontManager::loadFontFamily(const char* familyName, int fontId) {
       continue;
     }
 
+    Serial.printf("[FONT-DIAG] loading %s (streaming=%d)\n", fontPath, _useStreamingFonts ? 1 : 0);
     LoadedFont loaded = _useStreamingFonts ? loadStreamingFont(fontPath) : loadSingleFont(fontPath);
 
     if (!loaded.font && !loaded.streamingFont) {
+      Serial.printf("[FONT-DIAG] load failed (font=%p streamingFont=%p)\n", loaded.font, loaded.streamingFont);
       return false;  // Regular is required
     }
+    Serial.printf("[FONT-DIAG] %s loaded ok\n", fontPath);
 
     // Create EpdFont wrapper if streaming
     if (loaded.streamingFont) {
@@ -317,6 +326,12 @@ bool FontManager::isBinFont(const char* familyName) {
 }
 
 int FontManager::getReaderFontId(const char* familyName, int builtinFontId) {
+  static const char* lastLogged = nullptr;
+  if (familyName != lastLogged) {
+    Serial.printf("[FONT-DIAG] getReaderFontId(familyName='%s', builtinFontId=%d)\n",
+                  familyName ? familyName : "(empty)", builtinFontId);
+    lastLogged = familyName;
+  }
   if (!familyName || !*familyName) {
     // Using built-in font - unload any custom reader font and external font
     if (_activeReaderFontId != 0 && _activeReaderFontId != builtinFontId) {
@@ -365,6 +380,21 @@ bool FontManager::loadExternalFont(const char* filename) {
     return false;
   }
 
+  // Idempotent short-circuit. getReaderFontId('.bin') calls this on
+  // every render-time font lookup, and the bg cache task also calls it
+  // from getRenderConfig at task start. Without this check, the same
+  // file gets opened/parsed/loaded by both tasks concurrently, which
+  // races on _externalFont->load(path) and corrupts the SdFat file
+  // handle (the SD operations then trip xQueueGenericSend queue.c:832
+  // when the SPI bus mutex's holder pointer ends up stale). Once a
+  // .bin is loaded at a given path, all subsequent calls with the same
+  // filename just re-publish to the renderer (cheap pointer write) and
+  // return — no SD I/O, no race.
+  if (_externalFont && _externalFont->isLoaded() && _externalFontPath == filename) {
+    renderer->setExternalFont(_externalFont);
+    return true;
+  }
+
   char path[80];
   snprintf(path, sizeof(path), "%s/%s", CONFIG_FONTS_DIR, filename);
 
@@ -381,9 +411,11 @@ bool FontManager::loadExternalFont(const char* filename) {
   if (!_externalFont->load(path)) {
     delete _externalFont;
     _externalFont = nullptr;
+    _externalFontPath.clear();
     return false;
   }
 
+  _externalFontPath = filename;
   renderer->setExternalFont(_externalFont);
   return true;
 }
@@ -396,6 +428,7 @@ void FontManager::unloadExternalFont() {
     delete _externalFont;
     _externalFont = nullptr;
   }
+  _externalFontPath.clear();
 }
 
 void FontManager::logFontInfo() const {

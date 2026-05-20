@@ -131,6 +131,29 @@ void HomeState::loadLastBook(Core& core) {
     return;
   }
 
+  // Reader-crash guard: if the previous session crashed while opening a
+  // book, main.cpp's boot logic routes us to Home instead of auto-
+  // resuming Reader (see "Reader crash guard: going Home"). But if we
+  // then turn around and open the SAME EPUB here just to grab metadata
+  // for the home card, we re-hit the parser bug and loop. Skip the
+  // open and show the filename — exactly what the heap-tight fallback
+  // above does. The user can still navigate to a different book; the
+  // bad one will only get re-attempted when they explicitly open it
+  // from the file browser. Aozora-derived EPUBs (こころ #00773 and
+  // friends) reliably trip this — their content.opf takes 67+ seconds
+  // and the nav.xhtml TOC parse throws bad_alloc.
+  if (core.settings.readerLoadAttempts > 0) {
+    Serial.printf("[HOME] Previous session crashed (attempts=%d) — skipping EPUB pre-load for %s\n",
+                  core.settings.readerLoadAttempts, savedPath);
+    const char* filename = strrchr(savedPath, '/');
+    filename = filename ? filename + 1 : savedPath;
+    view_.setBook(filename, "", savedPath);
+    utf8SafeCopy(core.buf.path, savedPath, sizeof(core.buf.path));
+    currentBookHash_ = LibraryIndex::hashPath(savedPath);
+    view_.hasCoverBmp = false;
+    return;
+  }
+
   auto result = core.content.open(savedPath, SUMI_CACHE_DIR);
   if (result.ok()) {
     const auto& meta = core.content.metadata();

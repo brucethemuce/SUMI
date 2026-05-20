@@ -211,6 +211,15 @@ class FontManager {
 
   // External font for CJK fallback (pointer to avoid 54KB allocation when unused)
   ExternalFont* _externalFont = nullptr;
+  // Path of the currently-loaded external font (filename only, without
+  // /config/fonts/ prefix). Used by loadExternalFont() to short-circuit
+  // repeat calls with the same filename — without this, getReaderFontId()
+  // on a .bin pick re-loads the file every call, and concurrent calls
+  // from the main task (render) and the bg cache task (getRenderConfig
+  // at task start) race on _externalFont->load(path), corrupting the
+  // SdFat file handle and tripping the FreeRTOS xQueueGenericSend
+  // mutex-holder assertion.
+  std::string _externalFontPath;
 
   LoadedFont loadSingleFont(const char* path);
   LoadedFont loadStreamingFont(const char* path);

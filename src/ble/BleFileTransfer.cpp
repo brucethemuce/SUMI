@@ -406,6 +406,20 @@ class MetadataCallbacks : public NimBLECharacteristicCallbacks {
                 folderValid = true;
             }
         }
+        // Allow custom/<name>_data/ subfolders so the site can sync data
+        // files into a Lua plugin's sandbox (sumi.readFile / writeFile look
+        // there). The "_data" suffix is required: it matches the firmware's
+        // Lua sandbox path convention exactly (custom/<plugin>_data/) so a
+        // misrouted upload can't land in arbitrary /custom/ subfolders and
+        // can't shadow the .lua scripts themselves. Reported by kamil428.
+        if (!folderValid && strncmp(_folder, "custom/", 7) == 0) {
+            const char* sub = _folder + 7;
+            const size_t subLen = strlen(sub);
+            const bool endsWithData = (subLen > 5 && strcmp(sub + subLen - 5, "_data") == 0);
+            if (subLen > 5 && subLen < 32 && endsWithData && !strchr(sub, '/') && !strstr(sub, "..")) {
+                folderValid = true;
+            }
+        }
         if (!folderValid) {
             Serial.printf("[BLE-FT] ERROR: Invalid folder\n");
             sendStatus("{\"state\":\"error\",\"msg\":\"Invalid folder\"}");

@@ -1678,6 +1678,41 @@ void ReaderState::startBackgroundCaching(Core& core) {
     return;
   }
 
+  // EMERGENCY DISABLE — 0.6.3 ships with the bg cache task DOA.
+  //
+  // Background:
+  //   The bg cache task does SD I/O (page-cache builds, external-font
+  //   load) on a separate FreeRTOS task. The e-ink display also has its
+  //   own async refresh task that drives SPI directly. The main task
+  //   meanwhile renders + handles input. All three share the SPI bus.
+  //   SPIClass's bus mutex serialises between SPIClass callers but
+  //   doesn't cover the window where one task holds the bus mid-
+  //   transaction while another tries to take it through a different
+  //   code path. With the specific combination of a `.bin` CJK font
+  //   selected as reader font + a fresh chapter cache + a button press
+  //   landing inside the cover→cache-build window, FreeRTOS trips
+  //   `xQueueGenericSend queue.c:832` (mutex give from non-holder) and
+  //   the device aborts.
+  //
+  // Earlier 0.6.3 stopgaps (waitForRefresh barrier at task start,
+  // idempotent loadExternalFont, vTaskDelay in stopBackgroundCaching)
+  // each narrowed the race but didn't close it. CrossPoint Reader 1.3.0
+  // has no concurrent SD task at all — all cache builds run inline on
+  // the main task during page render — and they don't see this assert.
+  // Disabling the bg cache task altogether matches that architecture.
+  //
+  // Cost: first-page-load after a chapter boundary becomes synchronous.
+  // The user sees a brief "Loading..." while the parser runs on main
+  // instead of pre-fetched on a side task. For a normal-sized chapter
+  // the parse is ~200ms — acceptable. No crashes.
+  //
+  // Re-enabling is the next firmware project: needs a proper SPI bus
+  // mutex spanning SdFat, the async refresh task, and main-task SPI
+  // ops. Tracked separately.
+  Serial.println("[READER] Background cache task DISABLED — synchronous-only mode (0.6.3 stopgap)");
+  thumbnailDone_ = true;
+  return;
+
   // BackgroundTask handles safe restart via CAS loop
   if (cacheTask_.isRunning()) {
     Serial.println("[READER] Warning: Previous cache task still running, stopping first");
@@ -1691,6 +1726,14 @@ void ReaderState::startBackgroundCaching(Core& core) {
     Serial.printf("[READER] Skipping background cache — low heap (%zu bytes)\n", ESP.getFreeHeap());
     return;
   }
+
+  // (Dead code from here down — kept for the re-enable diff so the
+  // history of the workarounds stays attached to the bg-task code.)
+
+  // Wait for any in-flight e-ink refresh to finish before spawning the bg
+  // cache task. Closes the SPI-bus window that the SPIClass mutex doesn't
+  // cover when async refresh and SDFat both go through it.
+  core.display.raw().waitForRefresh();
 
   Serial.println("[READER] Starting background page cache task");
   coreForCacheTask_ = &core;
