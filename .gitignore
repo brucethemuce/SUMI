@@ -20,3 +20,4 @@ Thumbs.db
 # Windows Python Install Manager stray install
 Python/
 python_install_*.log
+.vscode/settings.json
