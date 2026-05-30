@@ -19,6 +19,7 @@ namespace sumi {
 // Designed for BLE keyboard input. When connected, user gets a clean wide
 // writing surface with minimal chrome. Physical buttons handle navigation
 // when no keyboard is present.
+// Contains shortcuts for common markdown syntax: bold, italics, headings
 // =============================================================================
 
 class NotesApp;
@@ -82,7 +83,7 @@ private:
   int marginY_ = 8;
   int lineH_ = 22;
   int charW_ = 10;
-  int charsPerLine_ = 76;
+  int maxLineWidth_ = 768;  // pixel width available for text
   int linesVisible_ = 18;
   int editTop_ = 36;
   int editBottom_ = 450;
@@ -107,10 +108,22 @@ private:
   void deleteCharForward();
   void moveCursorUp();
   void moveCursorDown();
+  void moveCursorHome();      // Ctrl+A / Home
+  void moveCursorEnd();       // Ctrl+E / End
+  void deleteLine();          // Ctrl+K
   void ensureCursorVisible();
   int cursorToLine() const;
   int cursorToCol() const;
   int lineColToPos(int line, int col) const;
+
+  // Pixel-accurate line wrapping
+  struct WrapLine { int start; int len; };  // byte-offset, byte-length
+  static constexpr int MAX_WRAP_LINES = 256;
+  WrapLine wrapLines_[MAX_WRAP_LINES];
+  int wrapLineCount_ = 0;
+  void buildWrapLines();
+  int cursorWrapLine() const;
+  int cursorWrapCol() const;  // pixel offset within wrap line
 
   // Drawing
   void drawFileList();
@@ -149,6 +162,7 @@ void NotesApp::reset() {
   listCursor_ = 0;
   listScroll_ = 0;
   viewScrollLine_ = 0;
+  wrapLineCount_ = 0;
 }
 
 void NotesApp::init(int screenW, int screenH) {
@@ -157,8 +171,8 @@ void NotesApp::init(int screenW, int screenH) {
   computeLayout();
   scanNotes();
   screen_ = SCREEN_FILE_LIST;
-  Serial.printf("[NOTES] Init %dx%d, %d chars/line, %d lines visible\n",
-                W_, H_, charsPerLine_, linesVisible_);
+  Serial.printf("[NOTES] Init %dx%d, maxLineWidth=%d, linesVisible=%d\n",
+                W_, H_, maxLineWidth_, linesVisible_);
 }
 
 void NotesApp::computeLayout() {
@@ -170,14 +184,14 @@ void NotesApp::computeLayout() {
   statusBarH_ = lineH_ + 8;
   editTop_ = statusBarH_ + marginY_;
   editBottom_ = H_ - marginY_ - 4;
-  charsPerLine_ = (W_ - 2 * marginX_ - 8) / charW_;  // -8 for scroll indicator
+  maxLineWidth_ = W_ - 2 * marginX_ - 8;  // -8 for scroll indicator
   linesVisible_ = (editBottom_ - editTop_) / lineH_;
 
   itemH_ = lineH_ + 14;
   itemsPerPage_ = (H_ - statusBarH_ - 40) / itemH_;
 
-  Serial.printf("[NOTES] Layout: charW=%d lineH=%d cpl=%d linesVis=%d\n",
-                charW_, lineH_, charsPerLine_, linesVisible_);
+  Serial.printf("[NOTES] Layout: charW=%d lineH=%d maxLineWidth=%d linesVis=%d\n",
+                charW_, lineH_, maxLineWidth_, linesVisible_);
 }
 
 void NotesApp::cleanup() {
@@ -203,7 +217,6 @@ void NotesApp::scanNotes() {
 
     int len = strlen(fname);
     if (len > 4 && strcasecmp(fname + len - 4, ".txt") == 0) {
-      // UTF-8 safe so CJK note filenames aren't sliced mid-codepoint.
       utf8SafeCopy(notes_[noteCount_], fname, MAX_NAME_LEN);
       noteCount_++;
     }
@@ -224,32 +237,154 @@ int NotesApp::countWords() const {
 }
 
 int NotesApp::countLines() const {
-  if (bufLen_ == 0) return 1;
-  int lines = 1;
-  int col = 0;
-  // Walk by UTF-8 codepoint so a CJK note isn't counted as 3x its real
-  // column width. Previously every continuation byte (0x80..0xBF) of a
-  // 3-byte character incremented col, so a Japanese note with CJK text
-  // wrapped far earlier than its visible width and the footer "lines"
-  // counter was off by a factor of ~3.
-  for (int i = 0; i < bufLen_;) {
-    const unsigned char c = static_cast<unsigned char>(buf_[i]);
-    if (c == '\n') {
-      lines++;
-      col = 0;
+  // Use the wrap line table for accuracy
+  buildWrapLines();
+  return wrapLineCount_ > 0 ? wrapLineCount_ : 1;
+}
+
+// =============================================================================
+// Pixel-accurate line wrapping
+// =============================================================================
+
+// Helper: length in bytes of the UTF-8 codepoint starting at buf[pos].
+static int notesCodepointLen(const char* buf, int pos, int bufLen) {
+  if (pos >= bufLen) return 1;
+  const unsigned char c = static_cast<unsigned char>(buf[pos]);
+  if ((c & 0xE0) == 0xC0) return 2;
+  if ((c & 0xF0) == 0xE0) return 3;
+  if ((c & 0xF8) == 0xF0) return 4;
+  return 1;
+}
+
+void NotesApp::buildWrapLines() {
+  wrapLineCount_ = 0;
+  if (bufLen_ == 0) {
+    wrapLines_[0] = {0, 0};
+    wrapLineCount_ = 1;
+    return;
+  }
+
+  int lineStart = 0;   // byte offset where current visual line begins
+  int pixelW = 0;       // accumulated pixel width of current visual line
+  int wordStart = -1;   // byte offset of current word (for word-wrap)
+  int wordPixelW = 0;   // pixel width of current word
+
+  int i = 0;
+  while (i <= bufLen_) {
+    // Hard line break
+    if (i < bufLen_ && buf_[i] == '\n') {
+      // Emit line up to the newline
+      if (wrapLineCount_ < MAX_WRAP_LINES) {
+        wrapLines_[wrapLineCount_++] = {lineStart, i - lineStart};
+      }
       i++;
+      lineStart = i;
+      pixelW = 0;
+      wordStart = -1;
       continue;
     }
-    // Advance past the full codepoint
-    int step = 1;
-    if ((c & 0xE0) == 0xC0) step = 2;
-    else if ((c & 0xF0) == 0xE0) step = 3;
-    else if ((c & 0xF8) == 0xF0) step = 4;
-    i += step;
-    col++;
-    if (col >= charsPerLine_) { lines++; col = 0; }
+
+    // End of buffer — emit final line
+    if (i >= bufLen_) {
+      if (wrapLineCount_ < MAX_WRAP_LINES) {
+        wrapLines_[wrapLineCount_++] = {lineStart, i - lineStart};
+      }
+      break;
+    }
+
+    // Measure one codepoint
+    int cpLen = notesCodepointLen(buf_, i, bufLen_);
+    if (i + cpLen > bufLen_) cpLen = bufLen_ - i;
+
+    // Temporarily null-terminate to measure with the renderer
+    char saved = buf_[i + cpLen];
+    buf_[i + cpLen] = '\0';
+    int cpW = d_.getTextWidth(&buf_[i]);
+    buf_[i + cpLen] = saved;
+    if (cpW < 1) cpW = charW_;  // fallback for unprintable
+
+    // Track word boundaries for word-wrap
+    bool isSpace = (buf_[i] == ' ' || buf_[i] == '\t');
+
+    if (isSpace) {
+      wordStart = -1;
+      wordPixelW = 0;
+    } else if (wordStart < 0) {
+      wordStart = i;
+      wordPixelW = 0;
+    }
+
+    // Would this codepoint overflow the line?
+    if (pixelW + cpW > maxLineWidth_ && i > lineStart) {
+      // Word-wrap: break at the start of the current word if possible
+      if (wordStart > lineStart && wordStart != i) {
+        if (wrapLineCount_ < MAX_WRAP_LINES) {
+          wrapLines_[wrapLineCount_++] = {lineStart, wordStart - lineStart};
+        }
+        lineStart = wordStart;
+        // Recompute pixelW from lineStart to i
+        pixelW = 0;
+        for (int j = lineStart; j < i; ) {
+          int jl = notesCodepointLen(buf_, j, bufLen_);
+          if (j + jl > bufLen_) jl = bufLen_ - j;
+          char sv = buf_[j + jl];
+          buf_[j + jl] = '\0';
+          pixelW += d_.getTextWidth(&buf_[j]);
+          buf_[j + jl] = sv;
+          j += jl;
+        }
+        pixelW += cpW;
+        wordStart = lineStart;  // current word is now at line start
+        wordPixelW = pixelW;
+      } else {
+        // No word boundary to break at — character-wrap
+        if (wrapLineCount_ < MAX_WRAP_LINES) {
+          wrapLines_[wrapLineCount_++] = {lineStart, i - lineStart};
+        }
+        lineStart = i;
+        pixelW = cpW;
+        wordStart = isSpace ? -1 : i;
+        wordPixelW = isSpace ? 0 : cpW;
+      }
+    } else {
+      pixelW += cpW;
+      if (!isSpace && wordStart >= 0) {
+        wordPixelW += cpW;
+      }
+    }
+
+    i += cpLen;
   }
-  return lines;
+
+  if (wrapLineCount_ == 0) {
+    wrapLines_[0] = {0, 0};
+    wrapLineCount_ = 1;
+  }
+}
+
+int NotesApp::cursorWrapLine() const {
+  for (int l = 0; l < wrapLineCount_; l++) {
+    int end = wrapLines_[l].start + wrapLines_[l].len;
+    if (cursorPos_ <= end) return l;
+  }
+  return wrapLineCount_ - 1;
+}
+
+int NotesApp::cursorWrapCol() const {
+  int l = cursorWrapLine();
+  int start = wrapLines_[l].start;
+  // Measure pixel width from line start to cursor
+  int px = 0;
+  for (int i = start; i < cursorPos_ && i < bufLen_; ) {
+    int cpLen = notesCodepointLen(buf_, i, bufLen_);
+    if (i + cpLen > bufLen_) cpLen = bufLen_ - i;
+    char saved = buf_[i + cpLen];
+    buf_[i + cpLen] = '\0';
+    px += d_.getTextWidth(&buf_[i]);
+    buf_[i + cpLen] = saved;
+    i += cpLen;
+  }
+  return px;
 }
 
 // =============================================================================
@@ -270,12 +405,6 @@ void NotesApp::insertChar(char c) {
 
 void NotesApp::deleteCharBack() {
   if (cursorPos_ <= 0) return;
-  // Walk back past any trailing UTF-8 continuation bytes so the delete
-  // removes a whole codepoint at once. This is only relevant when a note
-  // was loaded with CJK/accented content from an existing .txt file (the
-  // on-screen keyboard only enters ASCII). Without this, backspacing
-  // through CJK would strip one byte at a time and leave a broken
-  // half-character rendered as '?'.
   int del = 1;
   while (del < cursorPos_
          && (static_cast<unsigned char>(buf_[cursorPos_ - del]) & 0xC0) == 0x80) {
@@ -292,8 +421,6 @@ void NotesApp::deleteCharBack() {
 
 void NotesApp::deleteCharForward() {
   if (cursorPos_ >= bufLen_) return;
-  // Same rationale as deleteCharBack: step forward past the whole
-  // codepoint rather than one byte so CJK content edits cleanly.
   int del = 1;
   const unsigned char lead = static_cast<unsigned char>(buf_[cursorPos_]);
   if (lead >= 0xC0) {
@@ -309,81 +436,131 @@ void NotesApp::deleteCharForward() {
   lastKeystroke_ = millis();
 }
 
-void NotesApp::moveCursorUp() {
-  int line = cursorToLine();
-  int col = cursorToCol();
-  if (line > 0) {
-    cursorPos_ = lineColToPos(line - 1, col);
-    ensureCursorVisible();
+void NotesApp::moveCursorHome() {
+  // Move to start of current visual line
+  int l = cursorWrapLine();
+  cursorPos_ = wrapLines_[l].start;
+  ensureCursorVisible();
+}
+
+void NotesApp::moveCursorEnd() {
+  // Move to end of current visual line (before newline if any)
+  int l = cursorWrapLine();
+  int end = wrapLines_[l].start + wrapLines_[l].len;
+  // If the line ends with a newline, stop before it
+  if (end > 0 && end <= bufLen_ && buf_[end - 1] == '\n') end--;
+  cursorPos_ = end;
+  ensureCursorVisible();
+}
+
+void NotesApp::deleteLine() {
+  // Delete from cursor to end of visual line
+  int l = cursorWrapLine();
+  int lineEnd = wrapLines_[l].start + wrapLines_[l].len;
+  // Include the newline if present
+  if (lineEnd < bufLen_ && buf_[lineEnd - 1] == '\n') {
+    // already included in len
   }
+  int delStart = wrapLines_[l].start;
+  int delCount = lineEnd - delStart;
+  if (delCount <= 0) return;
+  memmove(buf_ + delStart, buf_ + lineEnd, bufLen_ - lineEnd);
+  bufLen_ -= delCount;
+  buf_[bufLen_] = '\0';
+  cursorPos_ = delStart;
+  if (cursorPos_ > bufLen_) cursorPos_ = bufLen_;
+  modified_ = true;
+  lastKeystroke_ = millis();
+  ensureCursorVisible();
+}
+
+void NotesApp::moveCursorUp() {
+  int l = cursorWrapLine();
+  if (l <= 0) return;
+  int targetPx = cursorWrapCol();
+  // Move to previous wrap line, find closest position by pixel
+  int prevLine = l - 1;
+  int start = wrapLines_[prevLine].start;
+  int end = start + wrapLines_[prevLine].len;
+  // Walk forward measuring pixels until we reach targetPx or line end
+  int px = 0;
+  int bestPos = start;
+  int bestDist = abs(targetPx);
+  for (int i = start; i < end && i < bufLen_; ) {
+    if (buf_[i] == '\n') break;
+    int cpLen = notesCodepointLen(buf_, i, bufLen_);
+    if (i + cpLen > bufLen_) cpLen = bufLen_ - i;
+    char saved = buf_[i + cpLen];
+    buf_[i + cpLen] = '\0';
+    px += d_.getTextWidth(&buf_[i]);
+    buf_[i + cpLen] = saved;
+    int dist = abs(px - targetPx);
+    if (dist < bestDist) { bestDist = dist; bestPos = i + cpLen; }
+    i += cpLen;
+  }
+  cursorPos_ = bestPos;
+  ensureCursorVisible();
 }
 
 void NotesApp::moveCursorDown() {
-  int line = cursorToLine();
-  int col = cursorToCol();
-  int totalLines = countLines();
-  if (line < totalLines - 1) {
-    cursorPos_ = lineColToPos(line + 1, col);
-    ensureCursorVisible();
+  int l = cursorWrapLine();
+  if (l >= wrapLineCount_ - 1) return;
+  int targetPx = cursorWrapCol();
+  int nextLine = l + 1;
+  int start = wrapLines_[nextLine].start;
+  int end = start + wrapLines_[nextLine].len;
+  int px = 0;
+  int bestPos = start;
+  int bestDist = abs(targetPx);
+  for (int i = start; i < end && i < bufLen_; ) {
+    if (buf_[i] == '\n') break;
+    int cpLen = notesCodepointLen(buf_, i, bufLen_);
+    if (i + cpLen > bufLen_) cpLen = bufLen_ - i;
+    char saved = buf_[i + cpLen];
+    buf_[i + cpLen] = '\0';
+    px += d_.getTextWidth(&buf_[i]);
+    buf_[i + cpLen] = saved;
+    int dist = abs(px - targetPx);
+    if (dist < bestDist) { bestDist = dist; bestPos = i + cpLen; }
+    i += cpLen;
   }
-}
-
-// Helper: length in bytes of the UTF-8 codepoint starting at buf[pos].
-// Returns 1 for ASCII or invalid lead bytes so callers always make progress.
-static int notesCodepointLen(const char* buf, int pos) {
-  const unsigned char c = static_cast<unsigned char>(buf[pos]);
-  if ((c & 0xE0) == 0xC0) return 2;
-  if ((c & 0xF0) == 0xE0) return 3;
-  if ((c & 0xF8) == 0xF0) return 4;
-  return 1;
+  cursorPos_ = bestPos;
+  ensureCursorVisible();
 }
 
 int NotesApp::cursorToLine() const {
-  int line = 0, col = 0;
-  int i = 0;
-  while (i < cursorPos_ && i < bufLen_) {
-    if (buf_[i] == '\n') { line++; col = 0; i++; continue; }
-    i += notesCodepointLen(buf_, i);
-    col++;
-    if (col >= charsPerLine_) { line++; col = 0; }
-  }
-  return line;
+  return cursorWrapLine();
 }
 
 int NotesApp::cursorToCol() const {
-  // Find the start of the current line, then walk forward counting codepoints.
-  int lineStart = cursorPos_;
-  while (lineStart > 0 && buf_[lineStart - 1] != '\n') lineStart--;
-  int col = 0;
-  int i = lineStart;
-  while (i < cursorPos_) {
-    i += notesCodepointLen(buf_, i);
-    col++;
-    if (col >= charsPerLine_) break;
-  }
-  return col;
+  return cursorWrapCol() / charW_;  // approximate column for compat
 }
 
-int NotesApp::lineColToPos(int targetLine, int targetCol) const {
-  int line = 0, col = 0, pos = 0;
-  while (pos < bufLen_ && line < targetLine) {
-    if (buf_[pos] == '\n') { line++; col = 0; pos++; continue; }
-    pos += notesCodepointLen(buf_, pos);
-    col++;
-    if (col >= charsPerLine_) { line++; col = 0; }
+int NotesApp::lineColToPos(int line, int col) const {
+  if (line >= wrapLineCount_) line = wrapLineCount_ - 1;
+  if (line < 0) line = 0;
+  int start = wrapLines_[line].start;
+  int targetPx = col * charW_;
+  int px = 0;
+  int i = start;
+  int end = start + wrapLines_[line].len;
+  while (i < end && i < bufLen_) {
+    if (buf_[i] == '\n') break;
+    int cpLen = notesCodepointLen(buf_, i, bufLen_);
+    if (i + cpLen > bufLen_) cpLen = bufLen_ - i;
+    char saved = buf_[i + cpLen];
+    buf_[i + cpLen] = '\0';
+    px += d_.getTextWidth(&buf_[i]);
+    buf_[i + cpLen] = saved;
+    if (px > targetPx) break;
+    i += cpLen;
   }
-  // Advance to targetCol within this line
-  while (pos < bufLen_ && col < targetCol) {
-    if (buf_[pos] == '\n') break;
-    pos += notesCodepointLen(buf_, pos);
-    col++;
-    if (col >= charsPerLine_) break;
-  }
-  return pos;
+  return i;
 }
 
 void NotesApp::ensureCursorVisible() {
-  int curLine = cursorToLine();
+  buildWrapLines();
+  int curLine = cursorWrapLine();
   if (curLine < viewScrollLine_) {
     viewScrollLine_ = curLine;
   } else if (curLine >= viewScrollLine_ + linesVisible_) {
@@ -420,10 +597,6 @@ void NotesApp::openNote(int idx) {
 void NotesApp::createNote(const char* noteName) {
   snprintf(currentFile_, sizeof(currentFile_), "/notes/%s.txt", noteName);
 
-  // Touch an empty file atomically so an interrupted createNote doesn't
-  // leave a half-existent path. The recovery scan in
-  // SDCardManager::recoverAtomicWrites covers /notes at level 0 since
-  // the post-Batch-9 audit pass.
   FsFile f;
   if (SdMan.atomicOpenWrite("NOTES", currentFile_, f)) {
     if (!SdMan.atomicCommit(f, currentFile_)) {
@@ -446,9 +619,6 @@ void NotesApp::createNote(const char* noteName) {
 void NotesApp::saveNote() {
   if (currentFile_[0] == '\0') return;
 
-  // Atomic — power loss mid-save would otherwise truncate the user's
-  // note to empty. Notes are user-typed content; this is one of the
-  // highest-stakes plugin save paths. See docs/ATOMIC_WRITE_DESIGN.md.
   FsFile f;
   if (!SdMan.atomicOpenWrite("NOTES", currentFile_, f)) return;
   f.write((uint8_t*)buf_, bufLen_);
@@ -461,15 +631,97 @@ void NotesApp::saveNote() {
 }
 
 // =============================================================================
-// Input handling
+// Input handling — now with BLE keyboard shortcuts
 // =============================================================================
 
 bool NotesApp::handleChar(char c) {
   if (screen_ == SCREEN_EDITOR) {
+    // Ctrl+key shortcuts (BLE keyboards send ctrl chars as 0x01..0x1A)
+    if (c == 1) {  // Ctrl+A → Home
+      moveCursorHome();
+      needsFullRedraw = true;
+      return true;
+    }
+    if (c == 5) {  // Ctrl+E → End
+      moveCursorEnd();
+      needsFullRedraw = true;
+      return true;
+    }
+    if (c == 11) { // Ctrl+K → Delete to end of line
+      deleteLine();
+      needsFullRedraw = true;
+      return true;
+    }
+    if (c == 19) { // Ctrl+S → Save
+      saveNote();
+      needsFullRedraw = true;
+      return true;
+    }
+    if (c == 21) { // Ctrl+U → Delete to start of line
+      {
+        int l = cursorWrapLine();
+        int lineStart = wrapLines_[l].start;
+        int delCount = cursorPos_ - lineStart;
+        if (delCount > 0) {
+          memmove(buf_ + lineStart, buf_ + cursorPos_, bufLen_ - cursorPos_);
+          bufLen_ -= delCount;
+          buf_[bufLen_] = '\0';
+          cursorPos_ = lineStart;
+          modified_ = true;
+          lastKeystroke_ = millis();
+          ensureCursorVisible();
+        }
+      }
+      needsFullRedraw = true;
+      return true;
+    }
+    if (c == 16) { // Ctrl+P → Up
+      moveCursorUp();
+      needsFullRedraw = true;
+      return true;
+    }
+    if (c == 14) { // Ctrl+N → Down
+      moveCursorDown();
+      needsFullRedraw = true;
+      return true;
+    }
+    if (c == 2) {  // Ctrl+B → Left
+      if (cursorPos_ > 0) {
+        cursorPos_--;
+        while (cursorPos_ > 0
+               && (static_cast<unsigned char>(buf_[cursorPos_]) & 0xC0) == 0x80) {
+          cursorPos_--;
+        }
+        ensureCursorVisible();
+      }
+      needsFullRedraw = true;
+      return true;
+    }
+    if (c == 6) {  // Ctrl+F → Right
+      if (cursorPos_ < bufLen_) {
+        const unsigned char lead = static_cast<unsigned char>(buf_[cursorPos_]);
+        int step = 1;
+        if ((lead & 0xE0) == 0xC0) step = 2;
+        else if ((lead & 0xF0) == 0xE0) step = 3;
+        else if ((lead & 0xF8) == 0xF0) step = 4;
+        cursorPos_ += step;
+        if (cursorPos_ > bufLen_) cursorPos_ = bufLen_;
+        ensureCursorVisible();
+      }
+      needsFullRedraw = true;
+      return true;
+    }
+
+    // Standard characters
     if (c == '\b') {
       deleteCharBack();
     } else if (c == 127) {
       deleteCharForward();
+    } else if (c == 27) {
+      // ESC → back to file list
+      if (modified_) saveNote();
+      screen_ = SCREEN_FILE_LIST;
+      scanNotes();
     } else if (c >= 32 || c == '\n' || c == '\t') {
       if (c == '\t') {
         insertChar(' ');
@@ -493,6 +745,8 @@ bool NotesApp::handleChar(char c) {
         createNote(newName_);
         screen_ = SCREEN_EDITOR;
       }
+    } else if (c == 27) {
+      screen_ = SCREEN_FILE_LIST;
     } else if (c >= 32 && c < 127 && newNameLen_ < MAX_NAME_LEN - 5) {
       newName_[newNameLen_++] = c;
       newName_[newNameLen_] = '\0';
@@ -554,8 +808,6 @@ bool NotesApp::handleInput(PluginButton btn) {
       case PluginButton::Up:    moveCursorUp(); return true;
       case PluginButton::Down:  moveCursorDown(); return true;
       case PluginButton::Left: {
-        // Step left by a full codepoint so the cursor doesn't land inside
-        // a multi-byte UTF-8 sequence in a pre-existing CJK note.
         if (cursorPos_ > 0) {
           cursorPos_--;
           while (cursorPos_ > 0
@@ -567,7 +819,6 @@ bool NotesApp::handleInput(PluginButton btn) {
         return true;
       }
       case PluginButton::Right: {
-        // Step right past the current codepoint's continuation bytes.
         if (cursorPos_ < bufLen_) {
           const unsigned char lead = static_cast<unsigned char>(buf_[cursorPos_]);
           int step = 1;
@@ -717,13 +968,15 @@ void NotesApp::drawFileList() {
     y += itemH_;
   }
 
-  // Bottom hint
   d_.setCursor(marginX_, H_ - 20);
   d_.print("OK: Open    Back: Exit");
 }
 
 void NotesApp::drawEditor() {
-  // Build status strings
+  // Build wrap lines for accurate rendering
+  buildWrapLines();
+
+  // Status bar
   const char* fname = strrchr(currentFile_, '/');
   fname = fname ? fname + 1 : currentFile_;
   char titleBuf[48];
@@ -739,63 +992,62 @@ void NotesApp::drawEditor() {
 
   drawStatusBar(titleBuf, rightStatus);
 
-  // Draw text
-  int x = marginX_;
+  // Draw wrapped text lines
   int y = editTop_;
-  int line = 0;
-  int col = 0;
   int cursorScreenX = -1, cursorScreenY = -1;
 
-  // Walk UTF-8 codepoint-by-codepoint. The editor column grid was built
-  // for fixed-width ASCII (charW_ per cell), so CJK still won't align
-  // perfectly, but at least each codepoint renders as the correct glyph
-  // via print(const char*) instead of the previous per-byte
-  // print(char c) which shipped each continuation byte through the '?'
-  // glyph fallback.
-  int i = 0;
-  while (i <= bufLen_) {
-    if (i == cursorPos_) {
-      if (line >= viewScrollLine_ && line < viewScrollLine_ + linesVisible_) {
-        cursorScreenX = x + col * charW_;
-        cursorScreenY = y + (line - viewScrollLine_) * lineH_;
+  for (int l = viewScrollLine_; l < wrapLineCount_ && l < viewScrollLine_ + linesVisible_; l++) {
+    int screenY = y + (l - viewScrollLine_) * lineH_;
+    if (screenY >= editBottom_) break;
+
+    int lineStart = wrapLines_[l].start;
+    int lineLen = wrapLines_[l].len;
+    int screenX = marginX_;
+    int px = 0;  // accumulated pixel offset
+
+    for (int i = lineStart; i < lineStart + lineLen && i < bufLen_; ) {
+      // Check if cursor is at this position
+      if (i == cursorPos_) {
+        cursorScreenX = screenX + px;
+        cursorScreenY = screenY;
       }
-    }
 
-    if (i >= bufLen_) break;
-    const unsigned char lead = static_cast<unsigned char>(buf_[i]);
+      const unsigned char lead = static_cast<unsigned char>(buf_[i]);
 
-    if (lead == '\n') {
-      line++;
-      col = 0;
-      i++;
-      continue;
-    }
-
-    // Determine codepoint length and assemble as a null-terminated string.
-    int cpLen = 1;
-    if ((lead & 0xE0) == 0xC0) cpLen = 2;
-    else if ((lead & 0xF0) == 0xE0) cpLen = 3;
-    else if ((lead & 0xF8) == 0xF0) cpLen = 4;
-    if (i + cpLen > bufLen_) cpLen = 1;  // defensive: don't read past end
-
-    char cpBuf[5] = {};
-    for (int b = 0; b < cpLen; b++) cpBuf[b] = buf_[i + b];
-
-    if (line >= viewScrollLine_ && line < viewScrollLine_ + linesVisible_) {
-      int screenY = y + (line - viewScrollLine_) * lineH_;
-      int screenX = x + col * charW_;
-
-      if (screenY < editBottom_) {
-        d_.setCursor(screenX, screenY + lineH_ - 4);
-        d_.print(cpBuf);
+      // Skip newlines in rendering (they cause line breaks, not glyphs)
+      if (lead == '\n') {
+        if (i == cursorPos_) {
+          cursorScreenX = screenX + px;
+          cursorScreenY = screenY;
+        }
+        i++;
+        continue;
       }
+
+      // Measure and render one codepoint
+      int cpLen = notesCodepointLen(buf_, i, bufLen_);
+      if (i + cpLen > bufLen_) cpLen = bufLen_ - i;
+
+      char saved = buf_[i + cpLen];
+      buf_[i + cpLen] = '\0';
+      int cpW = d_.getTextWidth(&buf_[i]);
+      if (cpW < 1) cpW = charW_;
+
+      // Render at pixel-accurate position
+      d_.setCursor(screenX + px, screenY + lineH_ - 4);
+      d_.print(&buf_[i]);
+
+      buf_[i + cpLen] = saved;
+      px += cpW;
+      i += cpLen;
     }
 
-    i += cpLen;
-    col++;
-    if (col >= charsPerLine_) {
-      line++;
-      col = 0;
+    // Cursor at end of line
+    if (cursorPos_ >= lineStart && cursorPos_ <= lineStart + lineLen) {
+      if (cursorScreenX < 0) {
+        cursorScreenX = screenX + px;
+        cursorScreenY = screenY;
+      }
     }
   }
 
@@ -805,7 +1057,7 @@ void NotesApp::drawEditor() {
   }
 
   // Scroll indicator
-  int totalLines = countLines();
+  int totalLines = wrapLineCount_;
   if (totalLines > linesVisible_) {
     int trackH = editBottom_ - editTop_ - 20;
     int thumbH = (trackH * linesVisible_) / totalLines;
@@ -835,7 +1087,7 @@ void NotesApp::drawNewNote() {
   if (newNameLen_ > 0) {
     d_.print(newName_);
   }
-  int curX = fieldX + 6 + newNameLen_ * charW_;
+  int curX = fieldX + 6 + d_.getTextWidth(newName_);
   d_.fillRect(curX, fieldY + 4, 2, fieldH - 8, GxEPD_BLACK);
 
   d_.setCursor(marginX_, centerY + 40);
