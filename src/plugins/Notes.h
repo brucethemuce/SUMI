@@ -75,6 +75,10 @@ private:
   int listCursor_ = 0;
   int listScroll_ = 0;
   int viewScrollLine_ = 0;
+  // ANSI escape sequence state for arrow keys
+  // BLE keyboards send arrows as ESC [ A/B/C/D (3 bytes)
+  enum EscState { ESC_NONE = 0, ESC_GOT_ESC = 1, ESC_GOT_BRACKET = 2 };
+  EscState escState_ = ESC_NONE;
 
   // Layout (computed in init)
   int W_ = 800, H_ = 480;
@@ -162,6 +166,7 @@ void NotesApp::reset() {
   listCursor_ = 0;
   listScroll_ = 0;
   viewScrollLine_ = 0;
+  escState_ = ESC_NONE;
   wrapLineCount_ = 0;
 }
 
@@ -624,6 +629,68 @@ void NotesApp::saveNote() {
 // =============================================================================
 
 bool NotesApp::handleChar(char c) {
+  // ---- ANSI escape sequence handling (arrow keys from BLE keyboard) ----
+  // BLE HID keyboards send arrow keys as: ESC (0x1B) [ (0x5B) A/B/C/D
+  // We track the sequence across handleChar calls.
+  if (escState_ == ESC_GOT_BRACKET) {
+    escState_ = ESC_NONE;
+    if (screen_ == SCREEN_EDITOR) {
+      switch (c) {
+        case 'A':  // Up
+          moveCursorUp();
+          needsFullRedraw = true;
+          return true;
+        case 'B':  // Down
+          moveCursorDown();
+          needsFullRedraw = true;
+          return true;
+        case 'C':  // Right
+          if (cursorPos_ < bufLen_) {
+            const unsigned char lead = static_cast<unsigned char>(buf_[cursorPos_]);
+            int step = 1;
+            if ((lead & 0xE0) == 0xC0) step = 2;
+            else if ((lead & 0xF0) == 0xE0) step = 3;
+            else if ((lead & 0xF8) == 0xF0) step = 4;
+            cursorPos_ += step;
+            if (cursorPos_ > bufLen_) cursorPos_ = bufLen_;
+            ensureCursorVisible();
+          }
+          needsFullRedraw = true;
+          return true;
+        case 'D':  // Left
+          if (cursorPos_ > 0) {
+            cursorPos_--;
+            while (cursorPos_ > 0
+                   && (static_cast<unsigned char>(buf_[cursorPos_]) & 0xC0) == 0x80) {
+              cursorPos_--;
+            }
+            ensureCursorVisible();
+          }
+          needsFullRedraw = true;
+          return true;
+        default:
+          break;  // unknown CSI sequence, discard
+      }
+    }
+    return false;
+  }
+
+  if (escState_ == ESC_GOT_ESC) {
+    if (c == '[') {
+      escState_ = ESC_GOT_BRACKET;
+      return true;  // waiting for final byte
+    }
+    // Not a bracket — it's a standalone ESC press
+    escState_ = ESC_NONE;
+    // Fall through to handle ESC below
+  }
+
+  // Start of escape sequence?
+  if (c == 27) {
+    escState_ = ESC_GOT_ESC;
+    return true;  // waiting for '[' or standalone ESC timeout
+  }
+
   if (screen_ == SCREEN_EDITOR) {
     // Ctrl+key shortcuts (BLE keyboards send ctrl chars as 0x01..0x1A)
     if (c == 1) {  // Ctrl+A → Home
@@ -664,53 +731,12 @@ bool NotesApp::handleChar(char c) {
       needsFullRedraw = true;
       return true;
     }
-    if (c == 16) { // Ctrl+P → Up
-      moveCursorUp();
-      needsFullRedraw = true;
-      return true;
-    }
-    if (c == 14) { // Ctrl+N → Down
-      moveCursorDown();
-      needsFullRedraw = true;
-      return true;
-    }
-    if (c == 2) {  // Ctrl+B → Left
-      if (cursorPos_ > 0) {
-        cursorPos_--;
-        while (cursorPos_ > 0
-               && (static_cast<unsigned char>(buf_[cursorPos_]) & 0xC0) == 0x80) {
-          cursorPos_--;
-        }
-        ensureCursorVisible();
-      }
-      needsFullRedraw = true;
-      return true;
-    }
-    if (c == 6) {  // Ctrl+F → Right
-      if (cursorPos_ < bufLen_) {
-        const unsigned char lead = static_cast<unsigned char>(buf_[cursorPos_]);
-        int step = 1;
-        if ((lead & 0xE0) == 0xC0) step = 2;
-        else if ((lead & 0xF0) == 0xE0) step = 3;
-        else if ((lead & 0xF8) == 0xF0) step = 4;
-        cursorPos_ += step;
-        if (cursorPos_ > bufLen_) cursorPos_ = bufLen_;
-        ensureCursorVisible();
-      }
-      needsFullRedraw = true;
-      return true;
-    }
 
     // Standard characters
     if (c == '\b') {
       deleteCharBack();
     } else if (c == 127) {
       deleteCharForward();
-    } else if (c == 27) {
-      // ESC → back to file list
-      if (modified_) saveNote();
-      screen_ = SCREEN_FILE_LIST;
-      scanNotes();
     } else if (c >= 32 || c == '\n' || c == '\t') {
       if (c == '\t') {
         insertChar(' ');
