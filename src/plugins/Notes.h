@@ -116,12 +116,12 @@ private:
   int cursorToCol() const;
   int lineColToPos(int line, int col) const;
 
-  // Pixel-accurate line wrapping
+ // Pixel-accurate line wrapping (mutable: computed cache, not logical state)
   struct WrapLine { int start; int len; };  // byte-offset, byte-length
   static constexpr int MAX_WRAP_LINES = 256;
-  WrapLine wrapLines_[MAX_WRAP_LINES];
-  int wrapLineCount_ = 0;
-  void buildWrapLines();
+  mutable WrapLine wrapLines_[MAX_WRAP_LINES];
+  mutable int wrapLineCount_ = 0;
+  void buildWrapLines() const;
   int cursorWrapLine() const;
   int cursorWrapCol() const;  // pixel offset within wrap line
 
@@ -256,7 +256,7 @@ static int notesCodepointLen(const char* buf, int pos, int bufLen) {
   return 1;
 }
 
-void NotesApp::buildWrapLines() {
+void NotesApp::buildWrapLines() const {
   wrapLineCount_ = 0;
   if (bufLen_ == 0) {
     wrapLines_[0] = {0, 0};
@@ -264,16 +264,14 @@ void NotesApp::buildWrapLines() {
     return;
   }
 
-  int lineStart = 0;   // byte offset where current visual line begins
-  int pixelW = 0;       // accumulated pixel width of current visual line
-  int wordStart = -1;   // byte offset of current word (for word-wrap)
-  int wordPixelW = 0;   // pixel width of current word
+  int lineStart = 0;
+  int pixelW = 0;
+  int wordStart = -1;
+  int wordPixelW = 0;
 
   int i = 0;
   while (i <= bufLen_) {
-    // Hard line break
     if (i < bufLen_ && buf_[i] == '\n') {
-      // Emit line up to the newline
       if (wrapLineCount_ < MAX_WRAP_LINES) {
         wrapLines_[wrapLineCount_++] = {lineStart, i - lineStart};
       }
@@ -284,7 +282,6 @@ void NotesApp::buildWrapLines() {
       continue;
     }
 
-    // End of buffer — emit final line
     if (i >= bufLen_) {
       if (wrapLineCount_ < MAX_WRAP_LINES) {
         wrapLines_[wrapLineCount_++] = {lineStart, i - lineStart};
@@ -292,18 +289,15 @@ void NotesApp::buildWrapLines() {
       break;
     }
 
-    // Measure one codepoint
     int cpLen = notesCodepointLen(buf_, i, bufLen_);
     if (i + cpLen > bufLen_) cpLen = bufLen_ - i;
 
-    // Temporarily null-terminate to measure with the renderer
-    char saved = buf_[i + cpLen];
-    buf_[i + cpLen] = '\0';
-    int cpW = d_.getTextWidth(&buf_[i]);
-    buf_[i + cpLen] = saved;
-    if (cpW < 1) cpW = charW_;  // fallback for unprintable
+    // Copy codepoint to temp buffer instead of mutating buf_
+    char tmp[5] = {};
+    for (int k = 0; k < cpLen && k < 4; k++) tmp[k] = buf_[i + k];
+    int cpW = d_.getTextWidth(tmp);
+    if (cpW < 1) cpW = charW_;
 
-    // Track word boundaries for word-wrap
     bool isSpace = (buf_[i] == ' ' || buf_[i] == '\t');
 
     if (isSpace) {
@@ -314,9 +308,7 @@ void NotesApp::buildWrapLines() {
       wordPixelW = 0;
     }
 
-    // Would this codepoint overflow the line?
     if (pixelW + cpW > maxLineWidth_ && i > lineStart) {
-      // Word-wrap: break at the start of the current word if possible
       if (wordStart > lineStart && wordStart != i) {
         if (wrapLineCount_ < MAX_WRAP_LINES) {
           wrapLines_[wrapLineCount_++] = {lineStart, wordStart - lineStart};
@@ -327,17 +319,15 @@ void NotesApp::buildWrapLines() {
         for (int j = lineStart; j < i; ) {
           int jl = notesCodepointLen(buf_, j, bufLen_);
           if (j + jl > bufLen_) jl = bufLen_ - j;
-          char sv = buf_[j + jl];
-          buf_[j + jl] = '\0';
-          pixelW += d_.getTextWidth(&buf_[j]);
-          buf_[j + jl] = sv;
+          char tmp2[5] = {};
+          for (int k = 0; k < jl && k < 4; k++) tmp2[k] = buf_[j + k];
+          pixelW += d_.getTextWidth(tmp2);
           j += jl;
         }
         pixelW += cpW;
-        wordStart = lineStart;  // current word is now at line start
+        wordStart = lineStart;
         wordPixelW = pixelW;
       } else {
-        // No word boundary to break at — character-wrap
         if (wrapLineCount_ < MAX_WRAP_LINES) {
           wrapLines_[wrapLineCount_++] = {lineStart, i - lineStart};
         }
@@ -373,15 +363,14 @@ int NotesApp::cursorWrapLine() const {
 int NotesApp::cursorWrapCol() const {
   int l = cursorWrapLine();
   int start = wrapLines_[l].start;
-  // Measure pixel width from line start to cursor
   int px = 0;
   for (int i = start; i < cursorPos_ && i < bufLen_; ) {
     int cpLen = notesCodepointLen(buf_, i, bufLen_);
     if (i + cpLen > bufLen_) cpLen = bufLen_ - i;
-    char saved = buf_[i + cpLen];
-    buf_[i + cpLen] = '\0';
-    px += d_.getTextWidth(&buf_[i]);
-    buf_[i + cpLen] = saved;
+    // Copy codepoint to temp buffer instead of mutating buf_
+    char tmp[5] = {};
+    for (int k = 0; k < cpLen && k < 4; k++) tmp[k] = buf_[i + k];
+    px += d_.getTextWidth(tmp);
     i += cpLen;
   }
   return px;
@@ -548,15 +537,15 @@ int NotesApp::lineColToPos(int line, int col) const {
     if (buf_[i] == '\n') break;
     int cpLen = notesCodepointLen(buf_, i, bufLen_);
     if (i + cpLen > bufLen_) cpLen = bufLen_ - i;
-    char saved = buf_[i + cpLen];
-    buf_[i + cpLen] = '\0';
-    px += d_.getTextWidth(&buf_[i]);
-    buf_[i + cpLen] = saved;
+    char tmp[5] = {};
+    for (int k = 0; k < cpLen && k < 4; k++) tmp[k] = buf_[i + k];
+    px += d_.getTextWidth(tmp);
     if (px > targetPx) break;
     i += cpLen;
   }
   return i;
 }
+
 
 void NotesApp::ensureCursorVisible() {
   buildWrapLines();
