@@ -992,7 +992,10 @@ void SettingsState::loadDeviceSettings() {
   // Index 2: Startup Behavior (Last Document=0, Home=1)
   deviceView_.values[2] = settings.startupBehavior;
 
-  // Index 3: Short Power Button (Ignore=0, Sleep=1, Page Turn=2)
+  // Index 3: Short Power Button (Ignore=0, Sleep=1, Page Turn=2, Refresh=3)
+  // "Refresh" gives a manual full-refresh on a short power tap; the in-reader
+  // dictionary stays reachable via long-press Center (Look up Word), so the
+  // two don't actually conflict.
   deviceView_.values[3] = settings.shortPwrBtn;
 
   // Index 4: Pages Per Refresh (1=0, 5=1, 10=2, 15=3, 30=4)

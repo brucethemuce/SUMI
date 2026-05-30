@@ -469,9 +469,22 @@ void HomeState::drawBackgroundFromSD(const char* themeName) {
         // Get pixel from BMP row
         uint8_t pixel = (rowBuf[bmpByteX] >> bmpBitX) & 1;
         if (needsInvert) pixel = !pixel;
-        
-        // Write to framebuffer - BMP x becomes FB y
-        int fbY = bmpX;
+
+        // Write to framebuffer - BMP x becomes FB y (mirrored).
+        //
+        // The rest of the UI reaches the panel through
+        // GfxRenderer::drawPixel(), whose Portrait mapping is
+        // (sx,sy) -> panel(col=sy, row=panelHeight-1-sx). This hand-rolled
+        // loader was instead writing image column bmpX straight to FB row
+        // bmpX, i.e. panel row = bmpX rather than (479 - bmpX). Worked back
+        // through the display mapping that lands image pixel (ix,iy) at
+        // screen (479-ix, iy) — a pure horizontal mirror. That's why custom
+        // /config/themes art (and the Sumi theme) showed up flipped
+        // left-for-right versus how it was authored, while UI text was fine.
+        // Mirroring bmpX here aligns the art with the same convention the UI
+        // uses, so it renders the way the artist drew it. (X4 path: FB is
+        // 800x480, 480 rows; bmpX spans 0..479.)
+        int fbY = 479 - bmpX;
         uint8_t* fbByte = fb + fbY * fbRowBytes + fbByteX;
         if (pixel) {
           *fbByte |= (1 << fbBitX);

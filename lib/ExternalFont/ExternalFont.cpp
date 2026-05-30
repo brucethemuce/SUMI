@@ -21,6 +21,8 @@ void ExternalFont::unload() {
   _bytesPerRow = 0;
   _bytesPerChar = 0;
   _accessCounter = 0;
+  _glyphCapacity = 0;
+  _loggedTruncation = false;
 
   // Clear cache and hash table
   for (int i = 0; i < CACHE_SIZE; i++) {
@@ -146,8 +148,25 @@ bool ExternalFont::load(const char* filepath) {
     return false;
   }
 
+  // How many codepoints can this file actually serve? glyph for codepoint
+  // cp lives at [cp * bytesPerChar, cp * bytesPerChar + bytesPerChar). Any
+  // cp >= _glyphCapacity is past EOF and will zero-fill (render as '?').
+  _glyphCapacity = (_bytesPerChar > 0) ? (fileSize / _bytesPerChar) : 0;
+
   _isLoaded = true;
-  Serial.printf("[EXT_FONT] Loaded: %s\n", filepath);
+  Serial.printf("[EXT_FONT] Loaded: %s (%u bytes, holds glyphs up to U+%04X)\n", filepath, fileSize,
+                _glyphCapacity > 0 ? _glyphCapacity - 1 : 0);
+  // A complete CJK font reaches well past the kana/kanji blocks. If the
+  // file can't even cover U+9FFF (end of CJK Unified Ideographs) it was
+  // almost certainly truncated in transfer — flag it up front so the
+  // "Latin works, CJK is '?'" reports are obvious at a glance.
+  if (_glyphCapacity <= 0x9FFF) {
+    Serial.printf(
+        "[EXT_FONT] NOTE: file only covers up to U+%04X — too short for full CJK (need >= U+9FFF). "
+        "If Japanese/Chinese shows as '?', the .bin was likely transferred incompletely; re-copy it to "
+        "/config/fonts/ via SD card rather than BLE.\n",
+        _glyphCapacity > 0 ? _glyphCapacity - 1 : 0);
+  }
   return true;
 }
 
@@ -192,6 +211,22 @@ int ExternalFont::getLruSlot() {
 bool ExternalFont::readGlyphFromSD(uint32_t codepoint, uint8_t* buffer) {
   if (!_fontFile) {
     return false;
+  }
+
+  // Codepoint past what the file length can hold => the glyph data was
+  // never in the file (most often a truncated transfer of a multi-MB CJK
+  // font). Zero-fill as before, but shout once so it's diagnosable.
+  if (_glyphCapacity > 0 && codepoint >= _glyphCapacity) {
+    if (!_loggedTruncation && codepoint > 0x7F) {
+      Serial.printf(
+          "[EXT_FONT] TRUNCATED: glyph U+%04X needed but file only holds up to U+%04X. "
+          "Font file is incomplete — re-copy '%s' to /config/fonts/ via SD (BLE transfer of large CJK "
+          "fonts often cuts off, leaving Latin OK but CJK as '?').\n",
+          codepoint, _glyphCapacity - 1, _fontName);
+      _loggedTruncation = true;
+    }
+    memset(buffer, 0, _bytesPerChar);
+    return true;
   }
 
   // Calculate offset
