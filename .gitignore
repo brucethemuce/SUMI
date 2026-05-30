@@ -21,3 +21,4 @@ Thumbs.db
 Python/
 python_install_*.log
 .vscode/settings.json
+.vscode/extensions.json
