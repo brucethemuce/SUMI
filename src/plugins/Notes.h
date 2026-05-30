@@ -663,10 +663,9 @@ void NotesApp::moveCursorUp() {
     if (buf_[i] == '\n') break;
     int cpLen = notesCodepointLen(buf_, i, bufLen_);
     if (i + cpLen > bufLen_) cpLen = bufLen_ - i;
-    char saved = buf_[i + cpLen];
-    buf_[i + cpLen] = '\0';
-    px += d_.getTextWidth(&buf_[i]);
-    buf_[i + cpLen] = saved;
+    char tmp[5] = {};
+    for (int k = 0; k < cpLen && k < 4; k++) tmp[k] = buf_[i + k];
+    px += d_.getTextWidth(tmp);
     int dist = abs(px - targetPx);
     if (dist < bestDist) { bestDist = dist; bestPos = i + cpLen; }
     i += cpLen;
@@ -689,10 +688,9 @@ void NotesApp::moveCursorDown() {
     if (buf_[i] == '\n') break;
     int cpLen = notesCodepointLen(buf_, i, bufLen_);
     if (i + cpLen > bufLen_) cpLen = bufLen_ - i;
-    char saved = buf_[i + cpLen];
-    buf_[i + cpLen] = '\0';
-    px += d_.getTextWidth(&buf_[i]);
-    buf_[i + cpLen] = saved;
+    char tmp[5] = {};
+    for (int k = 0; k < cpLen && k < 4; k++) tmp[k] = buf_[i + k];
+    px += d_.getTextWidth(tmp);
     int dist = abs(px - targetPx);
     if (dist < bestDist) { bestDist = dist; bestPos = i + cpLen; }
     i += cpLen;
@@ -1236,16 +1234,15 @@ void NotesApp::drawEditor() {
       int cpLen = notesCodepointLen(buf_, i, bufLen_);
       if (i + cpLen > bufLen_) cpLen = bufLen_ - i;
 
-      char saved = buf_[i + cpLen];
-      buf_[i + cpLen] = '\0';
-      int cpW = d_.getTextWidth(&buf_[i]);
+      char tmp[5] = {};
+      for (int k = 0; k < cpLen && k < 4; k++) tmp[k] = buf_[i + k];
+      int cpW = d_.getTextWidth(tmp);
       if (cpW < 1) cpW = charW_;
 
       // Render at pixel-accurate position
       d_.setCursor(screenX + px, screenY + lineH_ - 4);
-      d_.print(&buf_[i]);
+      d_.print(tmp);
 
-      buf_[i + cpLen] = saved;
       px += cpW;
       i += cpLen;
     }
