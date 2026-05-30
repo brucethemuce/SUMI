@@ -137,7 +137,7 @@ private:
   int lineColToPos(int line, int col) const;
 
  // Pixel-accurate line wrapping (mutable: computed cache, not logical state)
-  struct WrapLine { int start; int len; };  // byte-offset, byte-length
+  struct WrapLine { int start; int len; };  // byte-offset, byte-length. could use int16 and save ~1kB
   static constexpr int MAX_WRAP_LINES = 256;
   mutable WrapLine wrapLines_[MAX_WRAP_LINES];
   mutable int wrapLineCount_ = 0;
