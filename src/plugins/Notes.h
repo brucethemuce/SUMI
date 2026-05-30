@@ -264,10 +264,10 @@ void NotesApp::buildWrapLines() const {
     return;
   }
 
-  int lineStart = 0;
-  int pixelW = 0;
-  int wordStart = -1;
-  int wordPixelW = 0;
+  int lineStart = 0;   // byte offset where current visual line begins
+  int pixelW = 0;       // accumulated pixel width of current visual line
+  int wordStart = -1;   // byte offset of current word (for word-wrap)
+  int wordPixelW = 0;   // pixel width of current word
 
   int i = 0;
   while (i <= bufLen_) {
