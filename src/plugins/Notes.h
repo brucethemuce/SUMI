@@ -21,6 +21,18 @@ namespace sumi {
 // when no keyboard is present.
 // Contains shortcuts for common markdown syntax: bold, italics, headings
 // =============================================================================
+// Shortcut table
+// Key 	    Code 	Action
+// Ctrl+A 	0x01 	Home (start of line)
+// Ctrl+B 	0x02 	Bold — wrap word in **...** (toggle)
+// Ctrl+E 	0x05 	End (end of line)
+// Ctrl+H 	0x08 	Heading — add/increment # at line start (up to H6)
+// Ctrl+I 	0x09 	Italic — wrap word in *...* (toggle)
+// Ctrl+K 	0x0B 	Delete to end of line
+// Ctrl+S 	0x13 	Save
+// Ctrl+U 	0x15 	Delete to start of line
+// ← → ↑ ↓ 	ANSI ESC 	Cursor movement (3-byte escape sequence)
+// =============================================================================
 
 class NotesApp;
 extern NotesApp* g_notesInstance;
@@ -115,6 +127,10 @@ private:
   void moveCursorHome();      // Ctrl+A / Home
   void moveCursorEnd();       // Ctrl+E / End
   void deleteLine();          // Ctrl+K
+  void toggleBold();          // Ctrl+B, wrap with **
+  void toggleItalic();        // Ctrl+I, wrap with *
+  void addHeading();          // Ctrl+H, prepend line with #
+
   void ensureCursorVisible();
   int cursorToLine() const;
   int cursorToCol() const;
@@ -468,6 +484,169 @@ void NotesApp::deleteLine() {
   ensureCursorVisible();
 }
 
+void NotesApp::toggleBold() {
+  // Find word boundaries around cursor
+  int wordStart = cursorPos_;
+  int wordEnd = cursorPos_;
+
+  // Backtrack to start of word
+  while (wordStart > 0 && buf_[wordStart - 1] != ' '
+         && buf_[wordStart - 1] != '\n' && buf_[wordStart - 1] != '*') {
+    wordStart--;
+  }
+  // Forward to end of word
+  while (wordEnd < bufLen_ && buf_[wordEnd] != ' '
+         && buf_[wordEnd] != '\n' && buf_[wordEnd] != '*') {
+    wordEnd++;
+  }
+
+  // Check if word is already wrapped in **
+  bool alreadyBold = false;
+  if (wordEnd + 2 <= bufLen_ && wordStart >= 2) {
+    if (buf_[wordStart - 2] == '*' && buf_[wordStart - 1] == '*'
+        && buf_[wordEnd] == '*' && buf_[wordEnd + 1] == '*') {
+      alreadyBold = true;
+    }
+  }
+
+  if (alreadyBold) {
+    // Remove trailing **
+    memmove(buf_ + wordEnd, buf_ + wordEnd + 2, bufLen_ - wordEnd - 1);
+    bufLen_ -= 2;
+    // Remove leading ** (positions shifted by -2)
+    int adjStart = wordStart - 2;
+    memmove(buf_ + adjStart, buf_ + adjStart + 2, bufLen_ - adjStart - 1);
+    bufLen_ -= 2;
+    buf_[bufLen_] = '\0';
+    cursorPos_ = adjStart + (wordEnd - wordStart);
+    if (cursorPos_ > bufLen_) cursorPos_ = bufLen_;
+  } else {
+    if (bufLen_ + 4 < BUFFER_SIZE) {
+      // Insert trailing ** first (so wordStart doesn't shift)
+      memmove(buf_ + wordEnd + 2, buf_ + wordEnd, bufLen_ - wordEnd + 1);
+      buf_[wordEnd] = '*';
+      buf_[wordEnd + 1] = '*';
+      bufLen_ += 2;
+      // Insert leading **
+      memmove(buf_ + wordStart + 2, buf_ + wordStart, bufLen_ - wordStart + 1);
+      buf_[wordStart] = '*';
+      buf_[wordStart + 1] = '*';
+      bufLen_ += 2;
+      buf_[bufLen_] = '\0';
+      cursorPos_ = wordEnd + 4;
+      if (cursorPos_ > bufLen_) cursorPos_ = bufLen_;
+    }
+  }
+
+  modified_ = true;
+  lastKeystroke_ = millis();
+  ensureCursorVisible();
+}
+
+void NotesApp::toggleItalic() {
+  int wordStart = cursorPos_;
+  int wordEnd = cursorPos_;
+
+  while (wordStart > 0 && buf_[wordStart - 1] != ' '
+         && buf_[wordStart - 1] != '\n' && buf_[wordStart - 1] != '*') {
+    wordStart--;
+  }
+  while (wordEnd < bufLen_ && buf_[wordEnd] != ' '
+         && buf_[wordEnd] != '\n' && buf_[wordEnd] != '*') {
+    wordEnd++;
+  }
+
+  // Check if already wrapped in single * (not **)
+  bool alreadyItalic = false;
+  if (wordEnd + 1 <= bufLen_ && wordStart >= 1) {
+    if (buf_[wordStart - 1] == '*' && buf_[wordEnd] == '*') {
+      bool leadingDouble = (wordStart >= 2 && buf_[wordStart - 2] == '*');
+      bool trailingDouble = (wordEnd + 1 < bufLen_ && buf_[wordEnd + 1] == '*');
+      if (!leadingDouble && !trailingDouble) {
+        alreadyItalic = true;
+      }
+    }
+  }
+
+  if (alreadyItalic) {
+    // Remove trailing *
+    memmove(buf_ + wordEnd, buf_ + wordEnd + 1, bufLen_ - wordEnd);
+    bufLen_ -= 1;
+    // Remove leading *
+    int adjStart = wordStart - 1;
+    memmove(buf_ + adjStart, buf_ + adjStart + 1, bufLen_ - adjStart);
+    bufLen_ -= 1;
+    buf_[bufLen_] = '\0';
+    cursorPos_ = adjStart + (wordEnd - wordStart);
+    if (cursorPos_ > bufLen_) cursorPos_ = bufLen_;
+  } else {
+    if (bufLen_ + 2 < BUFFER_SIZE) {
+      // Insert trailing * first
+      memmove(buf_ + wordEnd + 1, buf_ + wordEnd, bufLen_ - wordEnd + 1);
+      buf_[wordEnd] = '*';
+      bufLen_ += 1;
+      // Insert leading *
+      memmove(buf_ + wordStart + 1, buf_ + wordStart, bufLen_ - wordStart + 1);
+      buf_[wordStart] = '*';
+      bufLen_ += 1;
+      buf_[bufLen_] = '\0';
+      cursorPos_ = wordEnd + 2;
+      if (cursorPos_ > bufLen_) cursorPos_ = bufLen_;
+    }
+  }
+
+  modified_ = true;
+  lastKeystroke_ = millis();
+  ensureCursorVisible();
+}
+
+void NotesApp::addHeading() {
+  buildWrapLines();
+  int l = cursorWrapLine();
+  int lineStart = wrapLines_[l].start;
+
+  // Count existing # at line start
+  int hashCount = 0;
+  int pos = lineStart;
+  while (pos < bufLen_ && buf_[pos] == '#') {
+    hashCount++;
+    pos++;
+  }
+  // Skip space after hashes if any
+  if (pos < bufLen_ && buf_[pos] == ' ') pos++;
+
+  if (hashCount > 0 && hashCount < 6) {
+    // Increment heading level: add one more #
+    if (bufLen_ + 1 < BUFFER_SIZE) {
+      memmove(buf_ + lineStart + hashCount + 1,
+              buf_ + lineStart + hashCount,
+              bufLen_ - lineStart - hashCount + 1);
+      buf_[lineStart + hashCount] = '#';
+      bufLen_ += 1;
+      buf_[bufLen_] = '\0';
+      cursorPos_ = pos + 1;
+      if (cursorPos_ > bufLen_) cursorPos_ = bufLen_;
+    }
+  } else if (hashCount == 0) {
+    // No heading yet — insert "# " at line start
+    if (bufLen_ + 2 < BUFFER_SIZE) {
+      memmove(buf_ + lineStart + 2, buf_ + lineStart, bufLen_ - lineStart + 1);
+      buf_[lineStart] = '#';
+      buf_[lineStart + 1] = ' ';
+      bufLen_ += 2;
+      buf_[bufLen_] = '\0';
+      cursorPos_ += 2;
+      if (cursorPos_ > bufLen_) cursorPos_ = bufLen_;
+    }
+  }
+  // hashCount == 6: max heading, do nothing
+
+  modified_ = true;
+  lastKeystroke_ = millis();
+  ensureCursorVisible();
+}
+
+
 void NotesApp::moveCursorUp() {
   int l = cursorWrapLine();
   if (l <= 0) return;
@@ -631,7 +810,6 @@ void NotesApp::saveNote() {
 bool NotesApp::handleChar(char c) {
   // ---- ANSI escape sequence handling (arrow keys from BLE keyboard) ----
   // BLE HID keyboards send arrow keys as: ESC (0x1B) [ (0x5B) A/B/C/D
-  // We track the sequence across handleChar calls.
   if (escState_ == ESC_GOT_BRACKET) {
     escState_ = ESC_NONE;
     if (screen_ == SCREEN_EDITOR) {
@@ -688,7 +866,7 @@ bool NotesApp::handleChar(char c) {
   // Start of escape sequence?
   if (c == 27) {
     escState_ = ESC_GOT_ESC;
-    return true;  // waiting for '[' or standalone ESC timeout
+    return true;
   }
 
   if (screen_ == SCREEN_EDITOR) {
@@ -698,8 +876,23 @@ bool NotesApp::handleChar(char c) {
       needsFullRedraw = true;
       return true;
     }
+    if (c == 2) {  // Ctrl+B → Bold **...**
+      toggleBold();
+      needsFullRedraw = true;
+      return true;
+    }
     if (c == 5) {  // Ctrl+E → End
       moveCursorEnd();
+      needsFullRedraw = true;
+      return true;
+    }
+    if (c == 8) {  // Ctrl+H → Add/increment heading #
+      addHeading();
+      needsFullRedraw = true;
+      return true;
+    }
+    if (c == 9) {  // Ctrl+I → Italic *...*
+      toggleItalic();
       needsFullRedraw = true;
       return true;
     }
