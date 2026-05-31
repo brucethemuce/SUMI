@@ -97,7 +97,7 @@ void SolitaireGame::newGame() {
     shuffle();
     deal();
     _state = GameState::Playing;
-    _cursor = 2;  // Start on first tableau pile
+    _cursor = 3;  // Start on first tableau pile (0=stock 1=waste 2=foundation)
     _selected = -1;
     _selectedPile = -1;
     _moves = 0;
@@ -117,15 +117,16 @@ bool SolitaireGame::handleInput(PluginButton btn) {
             if (_cursor > 0) _cursor--;
             return true;
         case PluginButton::Right:
-            if (_cursor < 8) _cursor++;
+            // Cursor row: 0=stock 1=waste 2=foundations 3..9=tableau(7)
+            if (_cursor < 9) _cursor++;
             return true;
         case PluginButton::Up:
-            // Move from tableau to stock/foundation row
-            if (_cursor >= 2) _cursor = 0;
+            // Jump from a tableau pile up to the stock/waste/foundation row
+            if (_cursor >= 3) _cursor = 0;
             return true;
         case PluginButton::Down:
-            // Move from stock/foundation to tableau
-            if (_cursor < 2) _cursor = 2;
+            // Jump from the top row down to the tableau
+            if (_cursor < 3) _cursor = 3;
             return true;
         case PluginButton::Center:
             handleSelect();
@@ -160,22 +161,26 @@ void SolitaireGame::draw() {
     }
     
     if (_wasteTop >= 0) {
-        bool wasteSel = (_cursor == 0 && _selectedPile == -1) || (_selectedPile == -2);
+        // Three-ring highlight only when the waste card is actually picked up
+        bool wasteSel = (_selectedPile == -2);
         drawCard(_waste[_wasteTop], wasteX, startY, wasteSel);
     } else {
         drawEmptyPile(wasteX, startY);
     }
-    
-    // Cursor around stock/waste area
+
+    // Cursor box — stock (0) and waste (1) are now separate slots
     if (_cursor == 0) {
-        d_.drawRect(stockX - 2, startY - 2, pileSpacing * 2 - 4, _cardH + 4, GxEPD_BLACK);
+        d_.drawRect(stockX - 2, startY - 2, _cardW + 4, _cardH + 4, GxEPD_BLACK);
+    }
+    if (_cursor == 1) {
+        d_.drawRect(wasteX - 2, startY - 2, _cardW + 4, _cardH + 4, GxEPD_BLACK);
     }
     
-    // Foundation piles (cursor 1)
+    // Foundation piles (cursor 2)
     for (int i = 0; i < 4; i++) {
         int x = startX + (3 + i) * pileSpacing;
-        bool sel = (_cursor == 1 && _selectedPile == -1);
-        
+        bool sel = (_cursor == 2 && _selectedPile == -1);
+
         if (_foundationTop[i] >= 0) {
             drawCard(_foundation[i][_foundationTop[i]], x, startY, sel && i == 0);
         } else {
@@ -186,17 +191,17 @@ void SolitaireGame::draw() {
                              suitBmp, SUIT_W, SUIT_H, GxEPD_BLACK);
         }
     }
-    
-    if (_cursor == 1) {
+
+    if (_cursor == 2) {
         int fx = startX + 3 * pileSpacing;
         d_.drawRect(fx - 2, startY - 2, 4 * pileSpacing - 4, _cardH + 4, GxEPD_BLACK);
     }
     
-    // Tableau piles (cursor 2-8)
+    // Tableau piles (cursor 3-9)
     int tableauY = startY + _cardH + 15;
     for (int pile = 0; pile < 7; pile++) {
         int x = startX + pile * pileSpacing;
-        bool selected = (pile + 2 == _cursor);
+        bool selected = (pile + 3 == _cursor);
         
         if (_tableauSize[pile] == 0) {
             drawEmptyPile(x, tableauY);
@@ -229,7 +234,7 @@ void SolitaireGame::draw() {
     
     char moveStatus[24];
     snprintf(moveStatus, sizeof(moveStatus), "Moves: %d", _moves);
-    PluginUI::drawFooter(d_, moveStatus, "OK:Select/Move BACK:Cancel", _screenW, _screenH);
+    PluginUI::drawFooter(d_, moveStatus, "OK:Draw/Pick/Move BACK:Cancel", _screenW, _screenH);
     
     if (_state == GameState::Win) {
         PluginUI::drawGameOver(d_, "You Win!", "OK to play again", _screenW, _screenH);
@@ -245,7 +250,7 @@ void SolitaireGame::reset() {
         _tableauFaceDown[i] = 0;
     }
     _state = GameState::Playing;
-    _cursor = 2;
+    _cursor = 3;  // first tableau pile (0=stock 1=waste 2=foundation)
     _selected = -1;
     _selectedPile = -1;
 }
@@ -291,15 +296,16 @@ void SolitaireGame::deal() {
 
 void SolitaireGame::handleSelect() {
     if (_cursor == 0) {
-        // Stock/waste area
+        // Stock pile: deal the next card face-up onto the waste, or, once
+        // the stock is empty, flip the whole waste back to re-deal. This
+        // slot never holds a selection — it's the "draw" action.
         if (_selected == -1) {
-            // Draw from stock or recycle waste
             if (_stockTop >= 0) {
                 _wasteTop++;
                 _waste[_wasteTop] = _stock[_stockTop];
                 _stockTop--;
             } else if (_wasteTop >= 0) {
-                // Recycle waste to stock
+                // Recycle waste back into the stock
                 while (_wasteTop >= 0) {
                     _stockTop++;
                     _stock[_stockTop] = _waste[_wasteTop];
@@ -307,16 +313,31 @@ void SolitaireGame::handleSelect() {
                 }
             }
         } else {
-            // Try to place selected card (shouldn't happen here)
+            // Can't drop a card on the stock — cancel the pickup.
             _selected = -1;
             _selectedPile = -1;
         }
     } else if (_cursor == 1) {
+        // Waste pile: pick up the top card so it can be carried to a
+        // tableau or foundation. Pressing OK again (or BACK) cancels.
+        // Without this slot the drawn cards were unreachable — you could
+        // turn the stock over but never play what came up, which is why
+        // the draw pile felt broken.
+        if (_selected == -1) {
+            if (_wasteTop >= 0) {
+                _selected = _waste[_wasteTop];
+                _selectedPile = -2;
+            }
+        } else {
+            _selected = -1;
+            _selectedPile = -1;
+        }
+    } else if (_cursor == 2) {
         // Foundation area
         if (_selected >= 0) {
             int suit = _selected / 13;
             int rank = _selected % 13;
-            
+
             // Can place if next in sequence
             if (_foundationTop[suit] == rank - 1) {
                 _foundationTop[suit]++;
@@ -329,24 +350,20 @@ void SolitaireGame::handleSelect() {
             _selectedPile = -1;
         }
     } else {
-        // Tableau piles
-        int pile = _cursor - 2;
-        
+        // Tableau piles (cursor 3..9 -> pile 0..6)
+        int pile = _cursor - 3;
+
         if (_selected == -1) {
-            // Select from this pile or waste
+            // Pick up the top face-up card of this pile
             if (_tableauSize[pile] > 0) {
                 int topIdx = _tableauSize[pile] - 1;
                 if (topIdx >= _tableauFaceDown[pile]) {
                     _selected = _tableau[pile][topIdx];
                     _selectedPile = pile;
                 }
-            } else if (_wasteTop >= 0) {
-                // Empty pile - can select from waste
-                _selected = _waste[_wasteTop];
-                _selectedPile = -2;
             }
         } else {
-            // Try to place selected card
+            // Try to place the carried card here
             if (canPlaceOnTableau(_selected, pile)) {
                 _tableauSize[pile]++;
                 _tableau[pile][_tableauSize[pile] - 1] = _selected;

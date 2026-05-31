@@ -106,6 +106,20 @@ class ExternalFont {
   uint8_t _bytesPerRow = 0;
   uint16_t _bytesPerChar = 0;
 
+  // Truncation guard. The .bin is a flat array indexed by codepoint
+  // (offset = cp * bytesPerChar), so a file that was transferred
+  // incompletely — very common for the multi-MB CJK fonts when sent over
+  // BLE instead of copied to SD — is shorter than the high-codepoint CJK
+  // glyphs it should contain. The result is the maddening "Latin renders
+  // fine (low offsets, present) but every Japanese/Chinese char is '?'
+  // (high offsets, past EOF)" symptom. readGlyphFromSD() silently
+  // zero-fills past EOF, which used to make this invisible. We now record
+  // how many codepoints the file can actually hold and log once, loudly,
+  // the first time a CJK glyph is requested beyond that — so a truncated
+  // font is diagnosable from the serial log instead of a day of guessing.
+  uint32_t _glyphCapacity = 0;     // # of codepoints the file length can hold
+  bool _loggedTruncation = false;  // one-shot guard for the warning
+
   // LRU cache configuration for CJK glyph caching
   // Trade-off: larger cache = better performance with CJK text, but more RAM usage
   //
