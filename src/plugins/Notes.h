@@ -137,7 +137,7 @@ private:
   int lineColToPos(int line, int col) const;
 
  // Pixel-accurate line wrapping (mutable: computed cache, not logical state)
-  struct WrapLine { int start; int len; };  // byte-offset, byte-length. could use int16 and save ~1kB
+  struct WrapLine { uint16_t start; uint16_t len; };  // byte-offset, byte-length. uint16_t saves 1KB vs int (256 lines × 4 bytes)
   static constexpr int MAX_WRAP_LINES = 256;
   mutable WrapLine wrapLines_[MAX_WRAP_LINES];
   mutable int wrapLineCount_ = 0;
@@ -285,16 +285,16 @@ void NotesApp::buildWrapLines() const {
     return;
   }
 
-  int lineStart = 0;   // byte offset where current visual line begins
+  uint16_t lineStart = 0;   // byte offset where current visual line begins
   int pixelW = 0;       // accumulated pixel width of current visual line
-  int wordStart = -1;   // byte offset of current word (for word-wrap)
+  int wordStart = -1;   // byte offset of current word (for word-wrap, -1 = not started)
   int wordPixelW = 0;   // pixel width of current word
 
   int i = 0;
   while (i <= bufLen_) {
     if (i < bufLen_ && buf_[i] == '\n') {
       if (wrapLineCount_ < MAX_WRAP_LINES) {
-        wrapLines_[wrapLineCount_++] = {lineStart, i - lineStart};
+        wrapLines_[wrapLineCount_++] = {lineStart, static_cast<uint16_t>(i - lineStart)};
       }
       i++;
       lineStart = i;
@@ -305,7 +305,7 @@ void NotesApp::buildWrapLines() const {
 
     if (i >= bufLen_) {
       if (wrapLineCount_ < MAX_WRAP_LINES) {
-        wrapLines_[wrapLineCount_++] = {lineStart, i - lineStart};
+        wrapLines_[wrapLineCount_++] = {lineStart, static_cast<uint16_t>(i - lineStart)};
       }
       break;
     }
@@ -329,10 +329,10 @@ void NotesApp::buildWrapLines() const {
       wordPixelW = 0;
     }
 
-    if (pixelW + cpW > maxLineWidth_ && i > lineStart) {
-      if (wordStart > lineStart && wordStart != i) {
+    if (pixelW + cpW > maxLineWidth_ && i > static_cast<int>(lineStart)) {
+      if (wordStart > static_cast<int>(lineStart) && wordStart != i) {
         if (wrapLineCount_ < MAX_WRAP_LINES) {
-          wrapLines_[wrapLineCount_++] = {lineStart, wordStart - lineStart};
+          wrapLines_[wrapLineCount_++] = {lineStart, static_cast<uint16_t>(wordStart - lineStart)};
         }
         lineStart = wordStart;
         // Recompute pixelW from lineStart to i
@@ -350,7 +350,7 @@ void NotesApp::buildWrapLines() const {
         wordPixelW = pixelW;
       } else {
         if (wrapLineCount_ < MAX_WRAP_LINES) {
-          wrapLines_[wrapLineCount_++] = {lineStart, i - lineStart};
+          wrapLines_[wrapLineCount_++] = {lineStart, static_cast<uint16_t>(i - lineStart)};
         }
         lineStart = i;
         pixelW = cpW;
