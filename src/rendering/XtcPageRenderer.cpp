@@ -120,26 +120,39 @@ XtcPageRenderer::RenderResult XtcPageRenderer::render(xtc::XtcParser& parser, ui
     render2BitGrayscale(plane1Buffer, plane2Buffer, pageWidth, pageHeight);
     refreshCallback();
 
-    // Grayscale rendering requires additional passes
+    // Grayscale rendering: optimize by pre-computing pixel values line-wise
+    // instead of recalculating bit extraction 4× per pixel (1.5M→384K bit ops)
     const uint8_t* plane1 = plane1Buffer;
     const uint8_t* plane2 = plane2Buffer;
     const size_t colBytes = (pageHeight + 7) / 8;
 
-    auto getPixelValue = [&](uint16_t x, uint16_t y) -> uint8_t {
-      const size_t colIndex = pageWidth - 1 - x;
-      const size_t byteInCol = y / 8;
-      const size_t bitInByte = 7 - (y % 8);
-      const size_t byteOffset = colIndex * colBytes + byteInCol;
-      const uint8_t bit1 = (plane1[byteOffset] >> bitInByte) & 1;
-      const uint8_t bit2 = (plane2[byteOffset] >> bitInByte) & 1;
-      return (bit1 << 1) | bit2;
+    // Line buffer: pre-compute all pixel values for current line (480 bytes max)
+    auto* pixelLine = static_cast<uint8_t*>(malloc(pageWidth));
+    if (!pixelLine) {
+      Serial.printf("[XTC] Failed to allocate line buffer (%u bytes)\n", pageWidth);
+      free(plane1Buffer);
+      free(plane2Buffer);
+      return RenderResult::AllocationFailed;
+    }
+
+    auto computePixelLine = [&](uint16_t y) {
+      for (uint16_t x = 0; x < pageWidth; x++) {
+        const size_t colIndex = pageWidth - 1 - x;
+        const size_t byteInCol = y / 8;
+        const size_t bitInByte = 7 - (y % 8);
+        const size_t byteOffset = colIndex * colBytes + byteInCol;
+        const uint8_t bit1 = (plane1[byteOffset] >> bitInByte) & 1;
+        const uint8_t bit2 = (plane2[byteOffset] >> bitInByte) & 1;
+        pixelLine[x] = (bit1 << 1) | bit2;
+      }
     };
 
     // Pass 2: LSB buffer - mark DARK gray only (value 1)
     renderer_.clearScreen(0x00);
     for (uint16_t y = 0; y < pageHeight; y++) {
+      computePixelLine(y);
       for (uint16_t x = 0; x < pageWidth; x++) {
-        if (getPixelValue(x, y) == 1) {
+        if (pixelLine[x] == 1) {
           renderer_.drawPixel(x, y, false);
         }
       }
@@ -150,8 +163,9 @@ XtcPageRenderer::RenderResult XtcPageRenderer::render(xtc::XtcParser& parser, ui
     // Pass 3: MSB buffer - mark LIGHT AND DARK gray (value 1 or 2)
     renderer_.clearScreen(0x00);
     for (uint16_t y = 0; y < pageHeight; y++) {
+      computePixelLine(y);
       for (uint16_t x = 0; x < pageWidth; x++) {
-        const uint8_t pv = getPixelValue(x, y);
+        const uint8_t pv = pixelLine[x];
         if (pv == 1 || pv == 2) {
           renderer_.drawPixel(x, y, false);
         }
@@ -166,8 +180,9 @@ XtcPageRenderer::RenderResult XtcPageRenderer::render(xtc::XtcParser& parser, ui
     // Pass 4: Re-render BW to framebuffer (restore for next frame)
     renderer_.clearScreen();
     for (uint16_t y = 0; y < pageHeight; y++) {
+      computePixelLine(y);
       for (uint16_t x = 0; x < pageWidth; x++) {
-        if (getPixelValue(x, y) >= 1) {
+        if (pixelLine[x] >= 1) {
           renderer_.drawPixel(x, y, true);
         }
       }
@@ -176,6 +191,7 @@ XtcPageRenderer::RenderResult XtcPageRenderer::render(xtc::XtcParser& parser, ui
 
     renderer_.cleanupGrayscaleWithFrameBuffer();
     Serial.printf("[XTC] Rendered page %u/%u (2-bit grayscale)\n", pageNum + 1, parser.getPageCount());
+    free(pixelLine);
     free(plane2Buffer);
   } else {
     render1Bit(plane1Buffer, pageWidth, pageHeight);
